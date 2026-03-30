@@ -22,7 +22,7 @@ const startServer = async () => {
             console.log(`API server running on http://localhost:${config.port}`);
         })
     } catch (error) {
-        console.log("Failed to load API Server", error.message);
+        console.error("Failed to load API Server", error.message);
         process.exit(1);
     }
 }
