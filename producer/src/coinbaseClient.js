@@ -49,6 +49,9 @@ function startCoinbaseStream() {
     }
   });
 
+  /* Catches any errors with the WebSocket connection and logs them. If the connection is lost, 
+    it will attempt to reconnect after 5 seconds. This ensures that our producer can recover from temporary network issues 
+    or Coinbase WebSocket outages without crashing the application. */ 
   ws.on("error", (error) => {
     console.error("Coinbase WebSocket error:", error.message);
   });
