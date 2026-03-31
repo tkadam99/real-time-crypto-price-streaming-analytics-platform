@@ -5,4 +5,6 @@ module.exports = {
   kafkaTopic: process.env.KAFKA_TOPIC || "crypto-prices",
   mongoUri: process.env.MONGO_URI || "mongodb://localhost:27017",
   dbName: process.env.DB_NAME || "crypto_analytics",
+  alertThresholdPercent: Number(process.env.ALERT_THRESHOLD_PERCENT || 1.5),
+  movingAverageWindow: Number(process.env.MOVING_AVERAGE_WINDOW || 5),
 };
