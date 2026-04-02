@@ -10,7 +10,7 @@ const {
 
 // Creating a Kafka client
 const kafka = new Kafka({
-  clientId: "crypto-price-producer",    // Logical Identifier for app in kafka
+  clientId: "crypto-price-consumer",    // Logical Identifier for app in kafka
   brokers: [config.kafkaBroker],   // Kafka broker address (localhost:9092) this app connects to
 });
 
@@ -30,6 +30,39 @@ async function processMessage(event) {
     timestamp: event.timestamp,
     receivedAt: new Date().toISOString(),
   });
+
+  //------------------------------------------------------------------------------------------------
+
+  // LIMIT HISTORY SIZE PER SYMBOL
+  // Keep only last N events per symbol
+  // Delete older ones
+  
+  const maxEventsPerSymbol = config.maxEventsPerSymbol;
+
+  const totalCount = await priceEventsCollection.countDocuments({
+    symbol: event.symbol,
+  });
+
+  if (totalCount > maxEventsPerSymbol) {
+    const excess = totalCount - maxEventsPerSymbol;
+
+    const oldDocs = await priceEventsCollection
+      .find({ symbol: event.symbol })
+      .sort({ timestamp: 1 }) // oldest first
+      .limit(excess)
+      .project({ _id: 1 })
+      .toArray();
+
+    const idsToDelete = oldDocs.map(doc => doc._id);
+
+    await priceEventsCollection.deleteMany({
+      _id: { $in: idsToDelete },
+    });
+
+    console.log(`Cleaned ${idsToDelete.length} old events for ${event.symbol}`);
+  }
+
+  //------------------------------------------------------------------------------------------------
 
   //Find recent events for same symbol to compute analytics
   const recentEvents = await priceEventsCollection

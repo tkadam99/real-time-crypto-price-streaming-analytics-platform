@@ -7,4 +7,5 @@ module.exports = {
   dbName: process.env.DB_NAME || "crypto_analytics",
   alertThresholdPercent: Number(process.env.ALERT_THRESHOLD_PERCENT || 1.5),
   movingAverageWindow: Number(process.env.MOVING_AVERAGE_WINDOW || 5),
+  maxEventsPerSymbol: Number(process.env.MAX_EVENTS_PER_SYMBOL || 10000),
 };
