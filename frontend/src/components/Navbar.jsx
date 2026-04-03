@@ -1,6 +1,8 @@
-import { Link } from "react-router-dom";
+import { Link, useLocation } from "react-router-dom";
 
 export default function Navbar() {
+  const location = useLocation();
+
   return (
     <nav className="navbar">
       <div className="navbar-container">
@@ -10,15 +12,24 @@ export default function Navbar() {
         </div>
 
         <div className="navbar-links">
-          <Link to="/" className="nav-link active-link">
+          <Link
+            to="/"
+            className={`nav-link ${location.pathname === "/" ? "active-link" : ""}`}
+          >
             Home
           </Link>
-          <a href="#dashboard-preview" className="nav-link">
+
+          <Link
+            to="/dashboard"
+            className={`nav-link ${location.pathname === "/dashboard" ? "active-link" : ""}`}
+          >
             Dashboard
-          </a>
+          </Link>
+
           <a href="#documentation" className="nav-link">
             Documentation
           </a>
+
           <a href="#project-info" className="nav-link">
             Project Info
           </a>

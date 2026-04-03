@@ -1,6 +1,8 @@
+import { useNavigate } from "react-router-dom";
 import Navbar from "../components/Navbar";
 
 export default function Home() {
+    const navigate = useNavigate();
   return (
     <div className="home-page">
       <Navbar />
@@ -24,8 +26,12 @@ export default function Home() {
             </p>
 
             <div className="hero-buttons">
-              <button className="primary-btn">View Dashboard</button>
-              <button className="secondary-btn">Read Documentation</button>
+              <button className="primary-btn" onClick={() => navigate("/dashboard")}>
+                View Dashboard
+            </button>
+              <button className="secondary-btn" onClick={() => navigate("/documentation")}>
+                Read Documentation
+              </button>
             </div>
           </div>
 
@@ -120,26 +126,30 @@ export default function Home() {
 
       {/* TECH STACK */}
       <section className="tech-stack-section">
-        <h2 className="section-title">Tech Stack</h2>
+            <h2 className="section-title">Tech Stack</h2>
 
-        <div className="tech-stack-grid">
-          <span className="tech-pill">React</span>
-          <span className="tech-pill">Node.js</span>
-          <span className="tech-pill">Kafka</span>
-          <span className="tech-pill">MongoDB</span>
-          <span className="tech-pill">Docker</span>
-        </div>
+            <div className="tech-stack-grid">
+                <span className="tech-pill">React</span>
+                <span className="tech-pill">Node.js</span>
+                <span className="tech-pill">Kafka</span>
+                <span className="tech-pill">MongoDB</span>
+                <span className="tech-pill">Docker</span>
+            </div>
       </section>
 
       {/* CTA */}
       <section className="cta-section">
-        <h2>Explore the System</h2>
-        <p>View the live dashboard or read detailed documentation.</p>
+            <h2>Explore the System</h2>
+            <p>View the live dashboard or read detailed documentation.</p>
 
-        <div className="cta-buttons">
-          <button className="primary-btn">Launch Dashboard</button>
-          <button className="secondary-btn">View Docs</button>
-        </div>
+            <div className="cta-buttons">
+                <button className="primary-btn" onClick={() => navigate("/dashboard")}>
+                    Launch Dashboard
+                </button>
+                <button className="secondary-btn" onClick={() => navigate("/documentation")}>
+                    View Docs
+                </button>
+            </div>
       </section>
     </div>
   );
