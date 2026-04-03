@@ -86,7 +86,8 @@ export default function Dashboard() {
 
         {!loading && !error && (
           <>
-            <SummaryCards latestPrices={latestPrices} />
+            {/* <SummaryCards latestPrices={latestPrices} /> */}
+            <SummaryCards latestPrices={latestPrices} metrics={metrics} />
             <MetricsTable metrics={metrics} />
             <div className="dashboard-lower-grid">
               <AlertsPanel alerts={alerts} />

@@ -1,4 +1,10 @@
-export default function MetricsTable({ metrics }) {
+import {
+  formatTimestamp,
+  formatPercentChange,
+  getPercentChangeClass,
+} from "../utils/formatters";
+
+export default function MetricsTable({ metrics = [] }) {
   return (
     <section className="dashboard-section">
       <h2 className="dashboard-section-title">Metrics Snapshot</h2>
@@ -22,8 +28,12 @@ export default function MetricsTable({ metrics }) {
                 <td>{item.latestPrice}</td>
                 <td>{item.previousPrice ?? "-"}</td>
                 <td>{item.movingAverage}</td>
-                <td>{item.percentChange}%</td>
-                <td>{item.updatedAt}</td>
+                <td>
+                  <span className={getPercentChangeClass(item.percentChange)}>
+                    {formatPercentChange(item.percentChange)}
+                  </span>
+                </td>
+                <td>{formatTimestamp(item.updatedAt)}</td>
               </tr>
             ))}
           </tbody>
