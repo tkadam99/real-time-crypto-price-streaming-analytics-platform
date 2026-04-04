@@ -19,20 +19,27 @@ export default function Navbar() {
             Home
           </Link>
 
+            <Link
+              to="/dashboard"
+              className={`nav-link ${location.pathname === "/dashboard" ? "active-link" : ""}`}
+            >
+              Dashboard
+            </Link>
+
           <Link
-            to="/dashboard"
-            className={`nav-link ${location.pathname === "/dashboard" ? "active-link" : ""}`}
+            to="/documentation"
+            className={`nav-link ${location.pathname === "/documentation" ? "active-link" : ""}`}
           >
-            Dashboard
+            Documentation
           </Link>
 
-          <a href="#documentation" className="nav-link">
-            Documentation
-          </a>
 
-          <a href="#project-info" className="nav-link">
+          <Link
+            to="/project-info"
+            className={`nav-link ${location.pathname === "/project-info" ? "active-link" : ""}`}
+          >
             Project Info
-          </a>
+          </Link>
         </div>
       </div>
     </nav>
