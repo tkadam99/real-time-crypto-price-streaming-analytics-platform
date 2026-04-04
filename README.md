@@ -184,24 +184,43 @@ http://localhost:5173
 ## 📁 Project Structure
 
 ```
-project-root/
+real-time-crypto-price-streaming-platform/
 │
-├── backend/
-│   ├── routes/
-│   ├── kafka/
-│   ├── analytics/
-│   ├── mongoClient.js
-│   └── server.js
+├── api-server/                 # REST API server (Node.js + Express)
+│   ├── routes/                # API route handlers
+│   ├── src/                   # Core server logic (DB, analytics, utils)
+│   ├── .env                   # Environment variables
+│   ├── package.json
+│   └── package-lock.json
 │
-├── frontend/
-│   ├── components/
-│   ├── pages/
-│   ├── styles/
-│   └── App.jsx
+├── producer/                  # Kafka producer (Coinbase WebSocket ingestion)
+│   ├── src/                   # WebSocket + Kafka publishing logic
+│   ├── .env
+│   ├── package.json
+│   └── package-lock.json
 │
-├── docker-compose.yml
-└── README.md
+├── consumer/                  # Kafka consumer (analytics processing)
+│   ├── src/                   # Processing logic, alerts, metrics computation
+│   ├── .env
+│   ├── package.json
+│   └── package-lock.json
+│
+├── frontend/                  # React frontend (Vite)
+│   ├── public/
+│   ├── src/
+│   │   ├── components/        # Reusable UI components
+│   │   ├── pages/             # Pages (Dashboard, Docs, Project Info)
+│   │   ├── styles/            # CSS files
+│   │   └── utils/             # Helper functions (formatters, etc.)
+│   ├── index.html
+│   ├── vite.config.js
+│   ├── package.json
+│   └── README.md
+│
+├── docker-compose.yml         # Infrastructure (Kafka, MongoDB, etc.)
+└── README.md                  # Project documentation
 ```
+
 
 ---
 
