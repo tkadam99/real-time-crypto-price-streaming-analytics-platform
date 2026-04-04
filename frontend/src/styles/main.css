@@ -1114,3 +1114,17 @@ button {
   box-shadow: 0 8px 20px rgba(0,0,0,0.06);
   transition: all 0.2s ease;
 }
+
+/* Chart */
+
+.chart-section {
+  margin-bottom: 32px;
+}
+
+.chart-card {
+  background: white;
+  border: 1px solid var(--border);
+  border-radius: 18px;
+  padding: 20px 20px 10px;
+  box-shadow: var(--shadow-sm);
+}

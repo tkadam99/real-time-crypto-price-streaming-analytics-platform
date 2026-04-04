@@ -4,6 +4,7 @@ import SummaryCards from "../components/SummaryCards";
 import MetricsTable from "../components/MetricsTable";
 import AlertsPanel from "../components/AlertsPanel";
 import PriceHistory from "../components/PriceHistory";
+import PriceTrendChart from "../components/PriceTrendChart";
 import {
   fetchLatestPrices,
   fetchMetrics,
@@ -89,6 +90,7 @@ export default function Dashboard() {
             {/* <SummaryCards latestPrices={latestPrices} /> */}
             <SummaryCards latestPrices={latestPrices} metrics={metrics} />
             <MetricsTable metrics={metrics} />
+            <PriceTrendChart history={history} selectedSymbol={selectedSymbol} />
             <div className="dashboard-lower-grid">
               <AlertsPanel alerts={alerts} />
               <PriceHistory history={history} selectedSymbol={selectedSymbol} />
