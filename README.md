@@ -244,6 +244,33 @@ real-time-crypto-price-streaming-platform/
 
 ---
 
+## ✅ Testing
+
+### Backend API Testing
+- Jest
+- Supertest
+
+Tested routes:
+- `GET /api/health`
+- `GET /api/metrics`
+- `GET /api/alerts`
+- `GET /api/prices/latest`
+- `GET /api/prices/history/:symbol`
+
+### Consumer Unit Testing
+- Jest
+
+Tested analytics logic:
+- Moving average calculation
+- Percent change calculation
+- Alert threshold behavior
+- Alert object generation
+
+### Manual Testing
+- Postman for API validation and debugging
+
+---
+
 ## 🚀 Future Enhancements
 
 ### Version 2
