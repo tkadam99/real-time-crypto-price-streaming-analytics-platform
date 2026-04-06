@@ -1,27 +1,30 @@
-const express = require("express");
-const app = express();
+// const express = require("express");
 
-const cors = require("cors");
+const app = require("./app");
+
+// const app = express();
+
+// const cors = require("cors");
 const { connectDB } = require("./db");
 const config = require("./config");
 
-const healthRoute = require("../routes/health");
-const pricesRoute = require("../routes/prices");
-const metricsRoute = require("../routes/metrics");
-const alertsRoute = require("../routes/alerts");
+// const healthRoute = require("../routes/health");
+// const pricesRoute = require("../routes/prices");
+// const metricsRoute = require("../routes/metrics");
+// const alertsRoute = require("../routes/alerts");
 
 
 //Middleware
-app.use(cors());
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+// app.use(cors());
+// app.use(express.json());
+// app.use(express.urlencoded({ extended: true }));
 
 //Mount the health router at /api/health
-app.use("/api/health", healthRoute);
+// app.use("/api/health", healthRoute);
 
-app.use("/api/prices", pricesRoute);
-app.use("/api/metrics", metricsRoute);
-app.use("/api/alerts", alertsRoute);
+// app.use("/api/prices", pricesRoute);
+// app.use("/api/metrics", metricsRoute);
+// app.use("/api/alerts", alertsRoute);
 
 const startServer = async () => {
     try {
