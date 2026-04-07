@@ -127,7 +127,7 @@ Coinbase WebSocket
 ### 1. Clone the repository
 
 ```bash
-git clone <your-repo-url>
+git clone <repo url>
 cd project-folder
 ```
 
@@ -145,7 +145,13 @@ docker-compose up -d
 
 ```bash
 # backend
-cd backend
+cd api-server
+npm install
+
+cd ../producer
+npm install
+
+cd ../consumer
 npm install
 
 # frontend
@@ -159,15 +165,19 @@ npm install
 
 ```bash
 # start API
+cd api-server
 npm start
 
 # start producer
-node producer.js
+cd ../producer
+npm start
 
 # start consumer
-node kafkaConsumer.js
+cd ../consumer
+npm start
 
 # start frontend
+cd ../frontend
 npm run dev
 ```
 
