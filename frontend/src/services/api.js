@@ -1,7 +1,9 @@
 const API_BASE_URL = "http://localhost:5000/api";
 
 export async function fetchLatestPrices() {
-  const response = await fetch(`${API_BASE_URL}/prices/latest`);
+  const response = await fetch(`${API_BASE_URL}/prices/latest`, {
+    cache: "no-store",
+  });
   if (!response.ok) {
     throw new Error("Failed to fetch latest prices");
   }
@@ -9,7 +11,9 @@ export async function fetchLatestPrices() {
 }
 
 export async function fetchMetrics() {
-  const response = await fetch(`${API_BASE_URL}/metrics`);
+  const response = await fetch(`${API_BASE_URL}/metrics`, {
+    cache: "no-store",
+  });
   if (!response.ok) {
     throw new Error("Failed to fetch metrics");
   }
@@ -17,7 +21,9 @@ export async function fetchMetrics() {
 }
 
 export async function fetchAlerts(limit = 10) {
-  const response = await fetch(`${API_BASE_URL}/alerts?limit=${limit}`);
+  const response = await fetch(`${API_BASE_URL}/alerts?limit=${limit}`, {
+    cache: "no-store",
+  });
   if (!response.ok) {
     throw new Error("Failed to fetch alerts");
   }
@@ -26,7 +32,8 @@ export async function fetchAlerts(limit = 10) {
 
 export async function fetchPriceHistory(symbol = "BTC-USD", limit = 10) {
   const response = await fetch(
-    `${API_BASE_URL}/prices/history/${symbol}?limit=${limit}`
+    `${API_BASE_URL}/prices/history/${symbol}?limit=${limit}`,
+    { cache: "no-store" }
   );
   if (!response.ok) {
     throw new Error("Failed to fetch price history");

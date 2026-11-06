@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useRef } from "react";
 import Navbar from "../components/Navbar";
 import SummaryCards from "../components/SummaryCards";
 import MetricsTable from "../components/MetricsTable";
@@ -6,43 +6,48 @@ import AlertsPanel from "../components/AlertsPanel";
 import PriceHistory from "../components/PriceHistory";
 import PriceTrendChart from "../components/PriceTrendChart";
 import {
-  fetchLatestPrices,
   fetchMetrics,
   fetchAlerts,
   fetchPriceHistory,
 } from "../services/api";
 
 export default function Dashboard() {
-  const [latestPrices, setLatestPrices] = useState([]);
   const [metrics, setMetrics] = useState([]);
   const [alerts, setAlerts] = useState([]);
   const [history, setHistory] = useState([]);
   const [selectedSymbol, setSelectedSymbol] = useState("BTC-USD");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const latestRequestId = useRef(0);
 
   const loadDashboardData = useCallback(async (symbol = selectedSymbol) => {
-  try {
-    setLoading(true);
-    setError("");
+    const requestId = ++latestRequestId.current;
 
-    const [latestRes, metricsRes, alertsRes, historyRes] = await Promise.all([
-      fetchLatestPrices(),
-      fetchMetrics(),
-      fetchAlerts(10),
-      fetchPriceHistory(symbol, 10),
-    ]);
+    try {
+      setLoading(true);
+      setError("");
 
-    setLatestPrices(latestRes.data || []);
-    setMetrics(metricsRes.data || []);
-    setAlerts(alertsRes.data || []);
-    setHistory(historyRes.data || []);
-  } catch (err) {
-    setError(err.message || "Something went wrong");
-  } finally {
-    setLoading(false);
-  }
-}, [selectedSymbol]);
+      const [metricsRes, alertsRes, historyRes] = await Promise.all([
+        fetchMetrics(),
+        fetchAlerts(10),
+        fetchPriceHistory(symbol, 10),
+      ]);
+
+      if (requestId !== latestRequestId.current) return;
+
+      setMetrics(metricsRes.data || []);
+      setAlerts(alertsRes.data || []);
+      setHistory(historyRes.data || []);
+    } catch (err) {
+      if (requestId === latestRequestId.current) {
+        setError(err.message || "Something went wrong");
+      }
+    } finally {
+      if (requestId === latestRequestId.current) {
+        setLoading(false);
+      }
+    }
+  }, [selectedSymbol]);
 
   useEffect(() => {
     loadDashboardData(selectedSymbol);
@@ -76,8 +81,9 @@ export default function Dashboard() {
             <button
               className="primary-btn"
               onClick={() => loadDashboardData(selectedSymbol)}
+              disabled={loading}
             >
-              Refresh Data
+              {loading ? "Refreshing..." : "Refresh Data"}
             </button>
           </div>
         </div>
@@ -87,8 +93,7 @@ export default function Dashboard() {
 
         {!loading && !error && (
           <>
-            {/* <SummaryCards latestPrices={latestPrices} /> */}
-            <SummaryCards latestPrices={latestPrices} metrics={metrics} />
+            <SummaryCards metrics={metrics} />
             <MetricsTable metrics={metrics} />
             <PriceTrendChart history={history} selectedSymbol={selectedSymbol} />
             <div className="dashboard-lower-grid">
