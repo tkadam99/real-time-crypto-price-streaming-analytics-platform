@@ -10,7 +10,7 @@ import {
 } from "recharts";
 import { formatTimestamp } from "../utils/formatters";
 
-function buildChartData(history, windowSize = 5) {
+function buildChartData(history, windowSize = 50) {
   if (!history || history.length === 0) return [];
 
   // API returns newest first, but charts should usually show oldest -> newest
@@ -30,8 +30,36 @@ function buildChartData(history, windowSize = 5) {
   });
 }
 
+function getChartAxis(chartData) {
+  const values = chartData.flatMap(({ price, movingAverage }) => [
+    price,
+    movingAverage,
+  ]);
+  const dataMin = Math.min(...values);
+  const dataMax = Math.max(...values);
+  const tickInterval = 0.01;
+  const firstTick = Math.floor(dataMin / tickInterval) * tickInterval - tickInterval;
+  const lastTick = Math.ceil(dataMax / tickInterval) * tickInterval + tickInterval;
+  const tickCount = Math.round((lastTick - firstTick) / tickInterval) + 1;
+
+  if (tickCount > 8) {
+    return { domain: ["auto", "auto"] };
+  }
+
+  return {
+    domain: [firstTick, lastTick],
+    ticks: Array.from(
+      { length: tickCount },
+      (_, index) => Number((firstTick + index * tickInterval).toFixed(2))
+    ),
+  };
+}
+
 export default function PriceTrendChart({ history = [], selectedSymbol }) {
-  const chartData = buildChartData(history, 5);
+  const chartData = buildChartData(history, 50);
+  const chartAxis = chartData.length > 0
+    ? getChartAxis(chartData)
+    : { domain: ["auto", "auto"] };
 
   return (
     <section className="dashboard-section chart-section">
@@ -46,11 +74,21 @@ export default function PriceTrendChart({ history = [], selectedSymbol }) {
           <ResponsiveContainer width="100%" height={340}>
             <LineChart
               data={chartData}
-              margin={{ top: 10, right: 20, left: 0, bottom: 10 }}
+              margin={{ top: 10, right: 20, left: 12, bottom: 10 }}
             >
               <CartesianGrid strokeDasharray="3 3" />
               <XAxis dataKey="time" tick={{ fontSize: 12 }} minTickGap={24} />
-              <YAxis tick={{ fontSize: 12 }} domain={["auto", "auto"]} />
+              <YAxis
+                width={100}
+                tick={{ fontSize: 12 }}
+                tickFormatter={(value) =>
+                  Number(value).toLocaleString(undefined, {
+                    maximumFractionDigits: 4,
+                  })
+                }
+                domain={chartAxis.domain}
+                ticks={chartAxis.ticks}
+              />
               <Tooltip />
               <Legend />
               <Line
