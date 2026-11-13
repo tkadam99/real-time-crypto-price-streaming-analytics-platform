@@ -223,7 +223,7 @@ One upserted snapshot per symbol, keyed by `symbol`, containing the latest price
 
 An append-only record for each alert successfully inserted. The collection may not exist until the first alert is written.
 
-The consumer enforces `MAX_EVENTS_PER_SYMBOL` (default `10000`) for raw price events by counting documents and deleting the oldest excess documents by timestamp. This retention process does not apply the same cap to the metrics or alerts collections.
+After computing analytics and updating metrics, the consumer enforces `MAX_EVENTS_PER_SYMBOL` (default `10000`) for raw price events by scanning each symbol in reverse `(timestamp, receivedAt, _id)` order, skipping the newest entries up to the cap, and deleting the remaining IDs for that symbol. It repeats this check on replay so a failed prune can be retried. The read and delete are not atomic across concurrent consumers or other writers, so the exact cap is not guaranteed during concurrent processing. A replay of an already-pruned Kafka record can recreate it before the next prune. This retention process does not apply the same cap to the metrics or alerts collections.
 
 On startup, the consumer ensures a unique `metrics.symbol` index, two non-unique
 `price_events` indexes on `(symbol, timestamp, receivedAt, _id)` for the

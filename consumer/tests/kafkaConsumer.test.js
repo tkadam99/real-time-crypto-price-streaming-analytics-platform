@@ -148,12 +148,20 @@ describe("Kafka consumer message handling", () => {
         recentEventsCursor.limitValue = limit;
         return recentEventsCursor;
       }),
+      skip: jest.fn((skip) => {
+        recentEventsCursor.skipValue = skip;
+        return recentEventsCursor;
+      }),
       toArray: jest.fn(async () => {
+        if (recentEventsCursor.skipValue && options.failRetentionRead) {
+          throw options.failRetentionRead;
+        }
         const filteredEvents = storedPriceEvents.filter((historyEvent) => {
           const timestampFilter = recentEventsCursor.filter?.timestamp;
           return (
-            !timestampFilter?.$lt ||
-            historyEvent.timestamp < timestampFilter.$lt
+            historyEvent.symbol === recentEventsCursor.filter.symbol &&
+            (!timestampFilter?.$lt ||
+              historyEvent.timestamp < timestampFilter.$lt)
           );
         });
         return [...filteredEvents]
@@ -174,7 +182,12 @@ describe("Kafka consumer message handling", () => {
             }
             return 0;
           })
-          .slice(0, recentEventsCursor.limitValue);
+          .slice(
+            recentEventsCursor.skipValue || 0,
+            recentEventsCursor.limitValue === undefined
+              ? undefined
+              : (recentEventsCursor.skipValue || 0) + recentEventsCursor.limitValue
+          );
       }),
       project: jest.fn(() => recentEventsCursor),
     };
@@ -188,9 +201,19 @@ describe("Kafka consumer message handling", () => {
       ),
       find: jest.fn((filter) => {
         recentEventsCursor.filter = filter;
+        recentEventsCursor.skipValue = 0;
+        recentEventsCursor.limitValue = undefined;
         return recentEventsCursor;
       }),
-      deleteMany: jest.fn().mockResolvedValue({ deletedCount: 0 }),
+      deleteMany: options.deleteMany || jest.fn(async ({ symbol, _id }) => {
+        const toDelete = new Set(_id.$in);
+        const retained = storedPriceEvents.filter(
+          (event) => event.symbol !== symbol || !toDelete.has(event._id)
+        );
+        const deletedCount = storedPriceEvents.length - retained.length;
+        storedPriceEvents.splice(0, storedPriceEvents.length, ...retained);
+        return { deletedCount };
+      }),
     };
     if (
       !options.updateOne ||
@@ -410,6 +433,61 @@ describe("Kafka consumer message handling", () => {
       JSON.stringify([testTopic, 0, "42"])
     );
     expect(metricsDocuments.get("BTC-USD").latestPrice).toBe(100);
+  });
+
+  it("uses a bounded retention scan without counting or deleting below the cap", async () => {
+    const database = configureDatabase();
+    const event = {
+      symbol: "ETH-USD",
+      price: 100,
+      timestamp: "2031-01-01T12:00:00.000Z",
+    };
+
+    await eachMessage(kafkaMessage(JSON.stringify(event)));
+
+    expect(database.priceEventsCollection.countDocuments).not.toHaveBeenCalled();
+    expect(database.priceEventsCollection.deleteMany).not.toHaveBeenCalled();
+    expect(database.priceEventsCollection.find).toHaveBeenCalledWith({ symbol: "ETH-USD" });
+  });
+
+  it("propagates a retention read failure after metrics persistence", async () => {
+    const failure = new Error("retention read failed");
+    const database = configureDatabase({ failRetentionRead: failure });
+    const event = {
+      symbol: "SOL-USD",
+      price: 100,
+      timestamp: "2032-01-01T12:00:00.000Z",
+    };
+
+    await expect(eachMessage(kafkaMessage(JSON.stringify(event)))).rejects.toBe(failure);
+    expect(database.storedPriceEvents).toHaveLength(1);
+    expect(database.metricsDocuments.get("SOL-USD").latestPrice).toBe(100);
+    expect(database.priceEventsCollection.deleteMany).not.toHaveBeenCalled();
+  });
+
+  it("propagates a retention delete failure", async () => {
+    const config = require("../src/config");
+    const originalMax = config.maxEventsPerSymbol;
+    config.maxEventsPerSymbol = 1;
+    const failure = new Error("retention delete failed");
+    const database = configureDatabase({
+      deleteMany: jest.fn().mockRejectedValue(failure),
+    });
+    const events = [
+      { symbol: "BTC-USD", price: 100, timestamp: "2033-01-01T12:00:00.000Z" },
+      { symbol: "BTC-USD", price: 101, timestamp: "2033-01-01T12:01:00.000Z" },
+    ];
+
+    try {
+      await eachMessage(kafkaMessage(JSON.stringify(events[0])));
+      await expect(eachMessage(kafkaMessage(JSON.stringify(events[1])))).rejects.toBe(failure);
+      expect(database.priceEventsCollection.deleteMany).toHaveBeenCalledWith({
+        symbol: "BTC-USD",
+        _id: { $in: [expect.any(String)] },
+      });
+    } finally {
+      config.maxEventsPerSymbol = originalMax;
+    }
   });
 
   it("replays the same Kafka record without duplicating raw history or the moving average", async () => {

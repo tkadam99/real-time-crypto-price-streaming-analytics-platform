@@ -29,7 +29,7 @@ describeWithMongo("Kafka consumer MongoDB integration", () => {
     process.env.DB_NAME = testDbName;
 
     const { MongoClient } = require("mongodb");
-    client = new MongoClient(integrationUri);
+    client = new MongoClient(integrationUri, { monitorCommands: true });
     await client.connect();
     db = client.db(testDbName);
     global.__consumerIntegrationDB = db;
@@ -88,6 +88,170 @@ describeWithMongo("Kafka consumer MongoDB integration", () => {
       },
     });
   }
+
+  it("retains the newest events per symbol and checks replay with one retention query", async () => {
+    require("../src/config").maxEventsPerSymbol = 2;
+    const priceEvents = db.collection("price_events");
+    const commands = [];
+    const listener = (command) => {
+      if (command.databaseName === testDbName) commands.push(command);
+    };
+    const event = (symbol, price, timestamp, offset) =>
+      record({ symbol, price, timestamp }, offset);
+    const btcFirst = event("BTC-USD", 100, "2053-01-01T12:00:00.000Z", "501");
+    const btcSecond = event("BTC-USD", 110, "2053-01-01T12:01:00.000Z", "502");
+    const btcThird = event("BTC-USD", 120, "2053-01-01T12:02:00.000Z", "503");
+    const ethFirst = event("ETH-USD", 200, "2053-01-01T12:00:00.000Z", "504");
+    client.on("commandStarted", listener);
+
+    async function processAndMeasure(kafkaRecord) {
+      commands.length = 0;
+      await eachMessage(kafkaRecord);
+      return {
+        scans: commands.filter((entry) =>
+          entry.commandName === "find" &&
+          entry.command.find === "price_events" &&
+          entry.command.skip === 2
+        ).length,
+        counts: commands.filter((entry) =>
+          entry.commandName === "count" ||
+          (entry.commandName === "aggregate" && entry.command.aggregate === "price_events")
+        ).length,
+        deletes: commands.filter((entry) =>
+          entry.commandName === "delete" && entry.command.delete === "price_events"
+        ).length,
+      };
+    }
+
+    try {
+      expect(await processAndMeasure(btcFirst)).toEqual({ scans: 1, counts: 0, deletes: 0 });
+      expect(await processAndMeasure(btcSecond)).toEqual({ scans: 1, counts: 0, deletes: 0 });
+      expect(await processAndMeasure(ethFirst)).toEqual({ scans: 1, counts: 0, deletes: 0 });
+      expect(await processAndMeasure(btcThird)).toEqual({ scans: 1, counts: 0, deletes: 1 });
+      expect(await processAndMeasure(btcThird)).toEqual({ scans: 1, counts: 0, deletes: 0 });
+      expect(await processAndMeasure(btcFirst)).toEqual({ scans: 1, counts: 0, deletes: 1 });
+      expect(await priceEvents.find({ symbol: "BTC-USD" }).sort({ timestamp: 1 }).toArray())
+        .toEqual([
+          expect.objectContaining({ price: 110 }),
+          expect.objectContaining({ price: 120 }),
+        ]);
+      expect(await priceEvents.countDocuments({ symbol: "ETH-USD" })).toBe(1);
+
+      const late = event("BTC-USD", 90, "2053-01-01T11:59:00.000Z", "505");
+      expect(await processAndMeasure(late)).toEqual({ scans: 1, counts: 0, deletes: 1 });
+      expect(await priceEvents.find({ symbol: "BTC-USD" }).sort({ timestamp: 1 }).toArray())
+        .toEqual([
+          expect.objectContaining({ price: 110 }),
+          expect.objectContaining({ price: 120 }),
+        ]);
+      expect(await db.collection("metrics").findOne({ symbol: "BTC-USD" })).toMatchObject({
+        latestPrice: 120,
+        updatedAt: "2053-01-01T12:02:00.000Z",
+      });
+    } finally {
+      client.removeListener("commandStarted", listener);
+    }
+  });
+
+  it("prunes equal timestamps using receivedAt and then _id without touching other symbols", async () => {
+    require("../src/config").maxEventsPerSymbol = 2;
+    const prices = db.collection("price_events");
+    const timestamp = "2054-01-01T12:00:00.000Z";
+    await prices.insertMany([
+      { _id: "tie-a", symbol: "BTC-USD", price: 100, timestamp, receivedAt: "2054-01-01T12:00:01.000Z" },
+      { _id: "tie-b", symbol: "BTC-USD", price: 101, timestamp, receivedAt: "2054-01-01T12:00:01.000Z" },
+      { _id: "tie-c", symbol: "BTC-USD", price: 102, timestamp, receivedAt: "2054-01-01T12:00:02.000Z" },
+      { _id: "other", symbol: "ETH-USD", price: 200, timestamp, receivedAt: "2054-01-01T12:00:00.000Z" },
+    ]);
+
+    await eachMessage(record({
+      symbol: "BTC-USD",
+      price: 90,
+      timestamp: "2054-01-01T11:59:00.000Z",
+    }, "510"));
+
+    expect((await prices.find({ symbol: "BTC-USD" }).sort({ _id: 1 }).toArray())
+      .map((item) => item._id)).toEqual(["tie-b", "tie-c"]);
+    expect(await prices.findOne({ _id: "other" })).toMatchObject({ symbol: "ETH-USD" });
+  });
+
+  it("retries retention after a delete failure without duplicating raw history", async () => {
+    require("../src/config").maxEventsPerSymbol = 1;
+    const first = record({
+      symbol: "BTC-USD", price: 100, timestamp: "2055-01-01T12:00:00.000Z",
+    }, "520");
+    const second = record({
+      symbol: "BTC-USD", price: 110, timestamp: "2055-01-01T12:01:00.000Z",
+    }, "521");
+    await eachMessage(first);
+    const failure = new Error("temporary retention failure");
+    withCollectionOverride("price_events", (collection) =>
+      overrideMethod(collection, "deleteMany", jest.fn().mockRejectedValue(failure))
+    );
+
+    try {
+      await expect(eachMessage(second)).rejects.toBe(failure);
+      expect(await db.collection("price_events").countDocuments({ symbol: "BTC-USD" })).toBe(2);
+      expect(await db.collection("metrics").findOne({ symbol: "BTC-USD" })).toMatchObject({
+        latestPrice: 110, previousPrice: 100, percentChange: 10,
+      });
+    } finally {
+      global.__consumerIntegrationDB = db;
+    }
+
+    await eachMessage(second);
+    expect(await db.collection("price_events").countDocuments({ symbol: "BTC-USD" })).toBe(1);
+    expect(await db.collection("price_events").findOne({ symbol: "BTC-USD" }))
+      .toMatchObject({ price: 110 });
+  });
+
+  it("retries retention after a read failure without duplicating raw history", async () => {
+    require("../src/config").maxEventsPerSymbol = 1;
+    const first = record({
+      symbol: "ETH-USD", price: 100, timestamp: "2056-01-01T12:00:00.000Z",
+    }, "530");
+    const second = record({
+      symbol: "ETH-USD", price: 110, timestamp: "2056-01-01T12:01:00.000Z",
+    }, "531");
+    await eachMessage(first);
+    const failure = new Error("temporary retention read failure");
+    withCollectionOverride("price_events", (collection) =>
+      overrideMethod(collection, "find", (filter) => {
+        const cursor = collection.find(filter);
+        if (filter.symbol && !filter.timestamp) {
+          const skip = cursor.skip.bind(cursor);
+          cursor.skip = (value) => {
+            skip(value);
+            cursor.toArray = jest.fn().mockRejectedValue(failure);
+            return cursor;
+          };
+        }
+        return cursor;
+      })
+    );
+
+    try {
+      await expect(eachMessage(second)).rejects.toBe(failure);
+      expect(await db.collection("price_events").countDocuments({ symbol: "ETH-USD" })).toBe(2);
+      expect(await db.collection("metrics").findOne({ symbol: "ETH-USD" }))
+        .toMatchObject({ latestPrice: 110, previousPrice: 100 });
+    } finally {
+      global.__consumerIntegrationDB = db;
+    }
+
+    await eachMessage(second);
+    expect(await db.collection("price_events").countDocuments({ symbol: "ETH-USD" })).toBe(1);
+    expect(await db.collection("price_events").findOne({ symbol: "ETH-USD" }))
+      .toMatchObject({ price: 110 });
+  });
+
+  it("accepts the largest configured retention cap", async () => {
+    require("../src/config").maxEventsPerSymbol = Number.MAX_SAFE_INTEGER;
+    await eachMessage(record({
+      symbol: "SOL-USD", price: 100, timestamp: "2057-01-01T12:00:00.000Z",
+    }, "540"));
+    expect(await db.collection("price_events").countDocuments({ symbol: "SOL-USD" })).toBe(1);
+  });
 
   it("creates non-unique history and alert indexes and preserves identity uniqueness", async () => {
     const priceIndexes = await db.collection("price_events").listIndexes().toArray();
@@ -190,7 +354,8 @@ describeWithMongo("Kafka consumer MongoDB integration", () => {
       predecessor: await prices.find({ symbol: "BTC-USD", timestamp: { $lt: threshold } })
         .sort({ timestamp: -1, receivedAt: -1, _id: -1 }).limit(1).explain("executionStats"),
       retention: await prices.find({ symbol: "BTC-USD" })
-        .sort({ timestamp: 1, receivedAt: 1, _id: 1 }).limit(5).explain("executionStats"),
+        .sort({ timestamp: -1, receivedAt: -1, _id: -1 })
+        .skip(295).project({ _id: 1 }).explain("executionStats"),
       alerts: await db.collection("alerts").find({}, { projection: { _id: 0 } })
         .sort({ timestamp: -1 }).limit(10).explain("executionStats"),
       metrics: await metrics.find({}, { projection: { _id: 0 } })
@@ -207,6 +372,9 @@ describeWithMongo("Kafka consumer MongoDB integration", () => {
       expect(planSummary(plans[name]).indexes).toContain("price_symbol_timestamp_asc_received_id");
       expect(planSummary(plans[name]).stages).not.toContain("SORT");
     }
+    expect(plans.retention.executionStats.nReturned).toBe(5);
+    expect(plans.retention.executionStats.totalKeysExamined).toBeGreaterThanOrEqual(300);
+    expect(plans.retention.executionStats.totalDocsExamined).toBe(0);
     expect(planSummary(plans.history).stages).not.toContain("SORT");
     expect(planSummary(plans.analytics).stages).not.toContain("SORT");
     expect(planSummary(plans.alerts).indexes).toContain("alerts_timestamp");

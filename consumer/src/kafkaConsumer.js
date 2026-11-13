@@ -385,26 +385,18 @@ async function processMessage(event, kafkaRecord) {
     );
   }
 
-  const maxEventsPerSymbol = config.maxEventsPerSymbol;
-  const totalCount = await priceEventsCollection.countDocuments({
-    symbol: event.symbol,
-  });
-
-  if (totalCount > maxEventsPerSymbol) {
-    const excess = totalCount - maxEventsPerSymbol;
-    const oldDocs = await priceEventsCollection
-      .find({ symbol: event.symbol })
-      .sort({ timestamp: 1, receivedAt: 1, _id: 1 })
-      .limit(excess)
-      .project({ _id: 1 })
-      .toArray();
-    const idsToDelete = oldDocs.map((doc) => doc._id);
-
-    await priceEventsCollection.deleteMany({
-      _id: { $in: idsToDelete },
+  const oldDocs = await priceEventsCollection
+    .find({ symbol: event.symbol })
+    .sort({ timestamp: -1, receivedAt: -1, _id: -1 })
+    .skip(config.maxEventsPerSymbol)
+    .project({ _id: 1 })
+    .toArray();
+  if (oldDocs.length > 0) {
+    const result = await priceEventsCollection.deleteMany({
+      symbol: event.symbol,
+      _id: { $in: oldDocs.map((doc) => doc._id) },
     });
-
-    console.log(`Cleaned ${idsToDelete.length} old events for ${event.symbol}`);
+    console.log(`Cleaned ${result.deletedCount} old events for ${event.symbol}`);
   }
 
   if (alertCandidate) {
