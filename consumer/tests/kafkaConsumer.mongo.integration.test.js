@@ -89,6 +89,60 @@ describeWithMongo("Kafka consumer MongoDB integration", () => {
     });
   }
 
+  it("uses the same baseline decision after restart as an uninterrupted consumer", async () => {
+    const time = "2049-01-01T12:00:00.000Z";
+    await eachMessage(record({ symbol: "BTC-USD", price: 100, timestamp: time }, "400"));
+    await eachMessage(record({ symbol: "ETH-USD", price: 100, timestamp: time }, "401"));
+    await eachMessage(record({
+      symbol: "BTC-USD", price: 102, timestamp: "2049-01-01T12:01:00.000Z",
+    }, "402"));
+    const uninterrupted = await db.collection("alerts").findOne({ symbol: "BTC-USD" });
+    expect(uninterrupted).toMatchObject({ previousPrice: 100, percentChange: 2 });
+    const pricesBefore = await db.collection("price_events").countDocuments();
+    const alertsBefore = await db.collection("alerts").countDocuments();
+
+    jest.resetModules();
+    mockConsumer.run.mockClear();
+    await require("../src/kafkaConsumer").startConsumer();
+    eachMessage = mockConsumer.run.mock.calls[0][0].eachMessage;
+    expect(await db.collection("price_events").countDocuments()).toBe(pricesBefore);
+    expect(await db.collection("alerts").countDocuments()).toBe(alertsBefore);
+
+    await eachMessage(record({
+      symbol: "ETH-USD", price: 102, timestamp: "2049-01-01T12:01:00.000Z",
+    }, "403"));
+    expect(await db.collection("alerts").findOne({ symbol: "ETH-USD" })).toMatchObject({
+      previousPrice: uninterrupted.previousPrice,
+      percentChange: uninterrupted.percentChange,
+      comparisonTimestamp: uninterrupted.comparisonTimestamp,
+    });
+  });
+
+  it("restores out-of-order and equal timestamps deterministically without using future baselines", async () => {
+    const history = [
+      { _id: "late", symbol: "SOL-USD", price: 999, timestamp: "2051-01-01T12:00:30.000Z", receivedAt: "2051-01-01T12:02:00.000Z" },
+      { _id: "second", symbol: "SOL-USD", price: 101, timestamp: "2051-01-01T12:00:00.000Z", receivedAt: "2051-01-01T12:01:01.000Z" },
+      { _id: "first", symbol: "SOL-USD", price: 100, timestamp: "2051-01-01T12:00:00.000Z", receivedAt: "2051-01-01T12:01:00.000Z" },
+    ];
+    await db.collection("price_events").insertMany(history);
+
+    jest.resetModules();
+    mockConsumer.run.mockClear();
+    await require("../src/kafkaConsumer").startConsumer();
+    eachMessage = mockConsumer.run.mock.calls[0][0].eachMessage;
+    expect(await db.collection("alerts").countDocuments()).toBe(0);
+    expect(await db.collection("price_events").countDocuments()).toBe(3);
+
+    await eachMessage(record({
+      symbol: "SOL-USD", price: 103, timestamp: "2051-01-01T12:01:00.000Z",
+    }, "410"));
+    expect(await db.collection("alerts").findOne({ symbol: "SOL-USD" })).toMatchObject({
+      previousPrice: 101,
+      comparisonTimestamp: "2051-01-01T12:00:00.000Z",
+      percentChange: 1.9802,
+    });
+  });
+
   it("restores the latest per-symbol cooldown after restart and ignores an older replay", async () => {
     const btcEvents = [
       { symbol: "BTC-USD", price: 100, timestamp: "2048-01-01T12:00:00.000Z" },

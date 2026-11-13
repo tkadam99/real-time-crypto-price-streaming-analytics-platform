@@ -174,7 +174,7 @@ The alert baseline is not simply the immediately preceding ticker:
 
 Defaults are a 60-second window and a 10-second tolerance. Thus, for an event at 12:01:00, the target is 12:00:00 and an event from 11:59:50 through 12:00:00 can qualify; an event after 12:00:00 cannot be used because it is newer than the target.
 
-The tracker stores timestamped prices separately for each symbol in process memory. It sorts out-of-order arrivals by their event timestamp and prunes history older than the window plus tolerance. It does not load the old `price_events` collection to seed alert baselines, so restarting the consumer resets this comparison history. Cooldown state is restored separately from persisted alerts.
+The tracker stores timestamped prices separately for each symbol in process memory. It sorts out-of-order arrivals by their event timestamp and prunes history older than the window plus tolerance. Before consuming, the consumer restores retained `price_events` within that horizon relative to each symbol's newest persisted event. Events are ordered by event time, then receipt time and identity for ties. If retained history lacks an eligible baseline, startup warns and new events must warm up the tracker; malformed restored history or database errors fail startup. Cooldown state is restored separately from persisted alerts.
 
 ### 5.4 Alert threshold and cooldown
 
@@ -344,7 +344,7 @@ The producer package does not currently have an automated test suite.
 
 - **Dashboard is fetch-based, not push-based.** It does not update continuously without another fetch.
 - **Chart and backend averages differ.** The backend uses five recent stored events by default; the chart uses up to 50 points but currently receives only 10 records.
-- **Alert baseline state is volatile.** The in-memory price history used for alert baselines resets on restart; old MongoDB price events are not used to initialize it. Cooldowns are restored from persisted alert timestamps, but concurrent consumers do not share live cooldown updates.
+- **Alert state depends on retained history.** Startup restores baseline prices and cooldowns from MongoDB, but retention gaps can leave no eligible baseline. Concurrent consumers do not share live tracker or cooldown updates.
 - **Persistence retention is limited to raw events.** `price_events` is capped per symbol; alerts are not pruned by this setting.
 - **Single-broker infrastructure is not highly available.** The provided Compose configuration is for local development.
 - **Local MongoDB selection matters.** A host-installed MongoDB and the Compose MongoDB may be different instances even if both use port 27017 at different times or loopback addresses.

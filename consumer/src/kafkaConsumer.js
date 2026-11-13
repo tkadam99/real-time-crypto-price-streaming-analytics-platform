@@ -87,6 +87,68 @@ async function restoreAlertCooldowns() {
   }
 }
 
+async function restorePriceBaselines() {
+  const collection = getDB().collection("price_events");
+  const eventTime = {
+    $convert: { input: "$timestamp", to: "date", onError: null, onNull: null },
+  };
+  const symbols = await collection.aggregate([
+    { $match: { symbol: { $in: config.symbols } } },
+    { $set: { eventTime } },
+    {
+      $group: {
+        _id: "$symbol",
+        latest: { $max: "$eventTime" },
+        invalidCount: {
+          $sum: { $cond: [{ $eq: ["$eventTime", null] }, 1, 0] },
+        },
+      },
+    },
+  ]).toArray();
+
+  const latestBySymbol = new Map(symbols.map((entry) => [entry._id, entry]));
+  for (const symbol of config.symbols) {
+    const entry = latestBySymbol.get(symbol);
+    if (!entry) {
+      console.warn(`No persisted price history for ${symbol}; alert baselines require new events.`);
+      continue;
+    }
+    if (entry.invalidCount > 0 || !entry.latest) {
+      throw new Error(
+        `Cannot restore price baseline for ${symbol}: persisted event timestamp is invalid.`
+      );
+    }
+
+    const earliest = new Date(Math.max(
+      -8640000000000000,
+      entry.latest.getTime() - config.alertWindowMs - config.alertBaselineToleranceMs
+    ));
+    const history = await collection.aggregate([
+      { $match: { symbol } },
+      { $set: { eventTime } },
+      { $match: { eventTime: { $gte: earliest, $lte: entry.latest } } },
+      { $sort: { eventTime: 1, receivedAt: 1, _id: 1 } },
+      { $project: { symbol: 1, price: 1, timestamp: 1 } },
+    ]).toArray();
+
+    for (const event of history) {
+      const validationError = validateEvent(event);
+      if (validationError) {
+        throw new Error(
+          `Cannot restore price baseline for ${symbol}: ${validationError} in persisted event ${event._id}.`
+        );
+      }
+      livePriceTracker.recordPrice(symbol, event.price, event.timestamp, String(event._id));
+    }
+
+    if (!livePriceTracker.getBaseline(symbol, entry.latest.toISOString())) {
+      console.warn(
+        `Persisted price history for ${symbol} has no eligible baseline for its latest event; further events may be needed.`
+      );
+    }
+  }
+}
+
 function validateEvent(event) {
   if (!event || typeof event !== "object" || Array.isArray(event)) {
     return "event must be an object";
@@ -376,6 +438,7 @@ async function processMessage(event, kafkaRecord) {
 async function startConsumer() {
   await ensureIndexes();
   await restoreAlertCooldowns();
+  await restorePriceBaselines();
   await consumer.connect();
   console.log(`Consumer connected to Kafka at ${config.kafkaBroker}`);
 
