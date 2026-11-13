@@ -2,6 +2,44 @@ const WebSocket = require("ws");
 const config = require("./config");
 const { sendMessage } = require("./kafkaProducer");
 
+function validateTickerMessage(message) {
+  if (
+    typeof message.product_id !== "string" ||
+    !config.symbols.includes(message.product_id)
+  ) {
+    return { error: "unsupported or missing symbol" };
+  }
+
+  const rawPrice = message.price;
+  if (
+    (typeof rawPrice !== "number" && typeof rawPrice !== "string") ||
+    (typeof rawPrice === "string" && rawPrice.trim() === "")
+  ) {
+    return { error: "missing or invalid price" };
+  }
+
+  const price = Number(rawPrice);
+  if (!Number.isFinite(price) || price <= 0) {
+    return { error: "price must be a finite positive number" };
+  }
+
+  if (
+    typeof message.time !== "string" ||
+    message.time.trim() === "" ||
+    !Number.isFinite(Date.parse(message.time))
+  ) {
+    return { error: "missing or invalid timestamp" };
+  }
+
+  return {
+    event: {
+      symbol: message.product_id,
+      price,
+      timestamp: message.time,
+    },
+  };
+}
+
 function startCoinbaseStream() {
   const ws = new WebSocket(config.coinbaseWsUrl);
 
@@ -22,22 +60,30 @@ function startCoinbaseStream() {
 
   // Receiving Live Data from Coinbase WebSocket, processing it, and sending to Kafka
   ws.on("message", async (data) => {
+    let message;
     try {
-      const message = JSON.parse(data.toString());
+      message = JSON.parse(data.toString());
+    } catch (error) {
+      console.warn("Discarding malformed Coinbase message:", error.message);
+      return;
+    }
 
-      // We only care about ticker messages that have the necessary fields (product_id, price, time)
-      // Some messages from Coinbase may be heartbeats or other types, so we filter those out
-      // If any field is missing, skip it, we don't send incomplete data to Kafka
-      if (message.type !== "ticker") return;
-      if (!message.product_id || !message.price || !message.time) return;
+    if (!message || typeof message !== "object" || Array.isArray(message)) {
+      console.warn("Discarding malformed Coinbase message: expected an object");
+      return;
+    }
 
-      // Clean and structure the data into a consistent format before sending to Kafka
-      // We convert price from string to a number and keep only the relevant fields (symbol, price, timestamp)
-      const cleanedEvent = {
-        symbol: message.product_id,
-        price: Number(message.price),
-        timestamp: message.time,
-      };
+    // We only care about ticker messages; other Coinbase message types are expected.
+    if (message.type !== "ticker") return;
+
+    try {
+      const { event, error } = validateTickerMessage(message);
+      if (error) {
+        console.warn("Discarding invalid Coinbase ticker:", error);
+        return;
+      }
+
+      const cleanedEvent = event;
 
       console.log("Received ticker:", cleanedEvent);
 
@@ -49,7 +95,7 @@ function startCoinbaseStream() {
         console.error("Failed to publish ticker to Kafka:", error.message);
       }
     } catch (error) {
-      console.error("Error processing Coinbase message:", error.message);
+      console.error("Error processing Coinbase ticker:", error.message);
     }
   });
 

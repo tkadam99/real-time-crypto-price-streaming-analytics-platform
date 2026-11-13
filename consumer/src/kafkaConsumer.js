@@ -18,6 +18,34 @@ const kafka = new Kafka({
 const consumer = kafka.consumer({ groupId: "crypto-analytics-group" });
 const livePriceTracker = createLivePriceTracker();
 
+function validateEvent(event) {
+  if (!event || typeof event !== "object" || Array.isArray(event)) {
+    return "event must be an object";
+  }
+
+  if (typeof event.symbol !== "string" || !config.symbols.includes(event.symbol)) {
+    return "unsupported or missing symbol";
+  }
+
+  if (
+    typeof event.price !== "number" ||
+    !Number.isFinite(event.price) ||
+    event.price <= 0
+  ) {
+    return "price must be a finite positive number";
+  }
+
+  if (
+    typeof event.timestamp !== "string" ||
+    event.timestamp.trim() === "" ||
+    !Number.isFinite(Date.parse(event.timestamp))
+  ) {
+    return "missing or invalid timestamp";
+  }
+
+  return null;
+}
+
 async function processMessage(event) {
   const db = getDB();
 
@@ -140,11 +168,22 @@ async function startConsumer() {
 
   await consumer.run({
     eachMessage: async ({ message }) => {
+      if (!message.value) {
+        console.warn("Discarding invalid Kafka event: message value is missing");
+        return;
+      }
+
       let event;
       try {
         event = JSON.parse(message.value.toString());
       } catch (error) {
-        console.error("Discarding malformed Kafka message:", error.message);
+        console.error("Discarding malformed Kafka event JSON:", error.message);
+        return;
+      }
+
+      const validationError = validateEvent(event);
+      if (validationError) {
+        console.warn("Discarding invalid Kafka event:", validationError);
         return;
       }
 
