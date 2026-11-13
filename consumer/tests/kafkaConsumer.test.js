@@ -39,20 +39,121 @@ describe("Kafka consumer message handling", () => {
     warnSpy.mockRestore();
   });
 
-  function configureDatabase({ insertOne = jest.fn().mockResolvedValue({}), updateOne } = {}) {
+  function evaluateExpression(expression, document) {
+    if (typeof expression === "string" && expression.startsWith("$")) {
+      return document[expression.slice(1)];
+    }
+
+    if (!expression || typeof expression !== "object" || expression instanceof Date) {
+      return expression;
+    }
+
+    if (Array.isArray(expression)) {
+      return expression.map((item) => evaluateExpression(item, document));
+    }
+
+    if ("$literal" in expression) return expression.$literal;
+    if ("$convert" in expression) {
+      const { input, onError, onNull } = expression.$convert;
+      const value = evaluateExpression(input, document);
+      if (value == null) return onNull;
+      const date = value instanceof Date ? value : new Date(value);
+      return Number.isNaN(date.getTime()) ? onError : date;
+    }
+    if ("$eq" in expression) {
+      const [left, right] = expression.$eq.map((item) =>
+        evaluateExpression(item, document)
+      );
+      return left instanceof Date && right instanceof Date
+        ? left.getTime() === right.getTime()
+        : left === right;
+    }
+    if ("$gt" in expression || "$gte" in expression) {
+      const operator = "$gt" in expression ? "$gt" : "$gte";
+      const [left, right] = expression[operator].map((item) =>
+        evaluateExpression(item, document)
+      );
+      const leftValue = left instanceof Date ? left.getTime() : left;
+      const rightValue = right instanceof Date ? right.getTime() : right;
+      return operator === "$gt" ? leftValue > rightValue : leftValue >= rightValue;
+    }
+    if ("$or" in expression) {
+      return expression.$or.some((item) => evaluateExpression(item, document));
+    }
+    if ("$cond" in expression) {
+      const [condition, whenTrue, whenFalse] = expression.$cond;
+      return evaluateExpression(condition, document)
+        ? evaluateExpression(whenTrue, document)
+        : evaluateExpression(whenFalse, document);
+    }
+
+    return Object.fromEntries(
+      Object.entries(expression).map(([key, value]) => [
+        key,
+        evaluateExpression(value, document),
+      ])
+    );
+  }
+
+  function configureDatabase(options = {}) {
+    const insertOne = options.insertOne || jest.fn().mockResolvedValue({});
+    const updateOne = options.updateOne || jest.fn();
+    const storedPriceEvents = [];
+    const metricsDocuments = new Map();
+    if (!options.insertOne) {
+      insertOne.mockImplementation(async (event) => {
+        storedPriceEvents.push(event);
+        return {};
+      });
+    }
+
     const recentEventsCursor = {
-      sort: jest.fn().mockReturnThis(),
-      limit: jest.fn().mockReturnThis(),
-      toArray: jest.fn().mockResolvedValue([{ price: 100 }]),
+      sort: jest.fn((sortSpec) => {
+        recentEventsCursor.sortSpec = sortSpec;
+        return recentEventsCursor;
+      }),
+      limit: jest.fn((limit) => {
+        recentEventsCursor.limitValue = limit;
+        return recentEventsCursor;
+      }),
+      toArray: jest.fn(async () => {
+        const direction = Object.values(recentEventsCursor.sortSpec)[0];
+        return [...storedPriceEvents]
+          .sort(
+            (left, right) =>
+              direction *
+              (Date.parse(left.timestamp) - Date.parse(right.timestamp))
+          )
+          .slice(0, recentEventsCursor.limitValue);
+      }),
     };
     const priceEventsCollection = {
       insertOne,
       countDocuments: jest.fn().mockResolvedValue(1),
       find: jest.fn(() => recentEventsCursor),
     };
-    const metricsCollection = {
-      updateOne: updateOne || jest.fn().mockResolvedValue({}),
-    };
+    if (!options.updateOne) {
+      updateOne.mockImplementation(async (filter, pipeline, updateOptions) => {
+        let document = metricsDocuments.get(filter.symbol);
+        if (!document && updateOptions.upsert) {
+          document = { symbol: filter.symbol };
+        }
+
+        for (const stage of pipeline) {
+          const assignments = Object.fromEntries(
+            Object.entries(stage.$set).map(([key, expression]) => [
+              key,
+              evaluateExpression(expression, document),
+            ])
+          );
+          document = { ...document, ...assignments };
+        }
+
+        metricsDocuments.set(filter.symbol, document);
+        return {};
+      });
+    }
+    const metricsCollection = { updateOne };
 
     getDB.mockReturnValue({
       collection: jest.fn((name) => {
@@ -62,7 +163,7 @@ describe("Kafka consumer message handling", () => {
       }),
     });
 
-    return { priceEventsCollection, metricsCollection };
+    return { priceEventsCollection, metricsCollection, metricsDocuments };
   }
 
   function kafkaMessage(value) {
@@ -72,7 +173,7 @@ describe("Kafka consumer message handling", () => {
   it.each(["BTC-USD", "ETH-USD", "SOL-USD"])(
     "processes a valid %s event after persistence and metric update",
     async (symbol) => {
-      const { priceEventsCollection, metricsCollection } = configureDatabase();
+      const { priceEventsCollection, metricsDocuments } = configureDatabase();
       const event = {
         symbol,
         price: 100,
@@ -86,16 +187,127 @@ describe("Kafka consumer message handling", () => {
       expect(priceEventsCollection.insertOne).toHaveBeenCalledWith(
         expect.objectContaining(event)
       );
-      expect(metricsCollection.updateOne).toHaveBeenCalledWith(
-        { symbol: event.symbol },
-        expect.objectContaining({
-          $set: expect.objectContaining({ latestPrice: 100 }),
-        }),
-        { upsert: true }
-      );
+      expect(metricsDocuments.get(symbol)).toMatchObject({
+        symbol,
+        latestPrice: 100,
+        movingAverage: 100,
+        percentChange: 0,
+        updatedAt: event.timestamp,
+      });
       expect(errorSpy).not.toHaveBeenCalled();
     }
   );
+
+  it("keeps the normal chronological snapshot and analytics values", async () => {
+    const { metricsDocuments } = configureDatabase();
+    const firstEvent = {
+      symbol: "BTC-USD",
+      price: 100,
+      timestamp: "2030-01-01T12:00:00.000Z",
+    };
+    const secondEvent = {
+      symbol: "BTC-USD",
+      price: 110,
+      timestamp: "2030-01-01T12:01:00.000Z",
+    };
+
+    await eachMessage(kafkaMessage(JSON.stringify(firstEvent)));
+    await eachMessage(kafkaMessage(JSON.stringify(secondEvent)));
+
+    expect(metricsDocuments.get("BTC-USD")).toMatchObject({
+      latestPrice: 110,
+      previousPrice: 100,
+      movingAverage: 105,
+      percentChange: 10,
+      updatedAt: secondEvent.timestamp,
+    });
+  });
+
+  it("does not let a late older event regress snapshot fields and refreshes the affected moving average", async () => {
+    const { metricsDocuments } = configureDatabase();
+    const events = [
+      {
+        symbol: "BTC-USD",
+        price: 100,
+        timestamp: "2031-01-01T12:00:00.000Z",
+      },
+      {
+        symbol: "BTC-USD",
+        price: 110,
+        timestamp: "2031-01-01T12:01:00.000Z",
+      },
+      {
+        symbol: "BTC-USD",
+        price: 105,
+        timestamp: "2031-01-01T12:00:30.000Z",
+      },
+    ];
+
+    for (const event of events) {
+      await eachMessage(kafkaMessage(JSON.stringify(event)));
+    }
+
+    expect(metricsDocuments.get("BTC-USD")).toMatchObject({
+      latestPrice: 110,
+      previousPrice: 100,
+      movingAverage: 105,
+      percentChange: 10,
+      updatedAt: events[1].timestamp,
+    });
+  });
+
+  it("keeps the first snapshot values for equal timestamps while recalculating the moving average", async () => {
+    const { metricsDocuments } = configureDatabase();
+    const events = [
+      {
+        symbol: "BTC-USD",
+        price: 100,
+        timestamp: "2032-01-01T12:00:00.000Z",
+      },
+      {
+        symbol: "BTC-USD",
+        price: 110,
+        timestamp: "2032-01-01T12:01:00.000Z",
+      },
+      {
+        symbol: "BTC-USD",
+        price: 120,
+        timestamp: "2032-01-01T12:01:00.000Z",
+      },
+    ];
+
+    for (const event of events) {
+      await eachMessage(kafkaMessage(JSON.stringify(event)));
+    }
+
+    expect(metricsDocuments.get("BTC-USD")).toMatchObject({
+      latestPrice: 110,
+      previousPrice: 100,
+      movingAverage: 110,
+      percentChange: 10,
+      updatedAt: events[1].timestamp,
+    });
+  });
+
+  it("creates a metrics snapshot for a newly initialized symbol", async () => {
+    const { metricsDocuments } = configureDatabase();
+    const event = {
+      symbol: "ETH-USD",
+      price: 2500,
+      timestamp: "2033-01-01T12:00:00.000Z",
+    };
+
+    await expect(eachMessage(kafkaMessage(JSON.stringify(event)))).resolves.toBeUndefined();
+
+    expect(metricsDocuments.get("ETH-USD")).toMatchObject({
+      symbol: "ETH-USD",
+      latestPrice: 2500,
+      previousPrice: null,
+      movingAverage: 2500,
+      percentChange: 0,
+      updatedAt: event.timestamp,
+    });
+  });
 
   it("logs and discards malformed JSON without processing it", async () => {
     getDB.mockClear();
@@ -239,6 +451,23 @@ describe("Kafka consumer message handling", () => {
 
     await expect(eachMessage(kafkaMessage(JSON.stringify(event)))).rejects.toBe(
       persistenceError
+    );
+    expect(errorSpy).not.toHaveBeenCalled();
+  });
+
+  it("rejects the callback when the atomic metrics update fails", async () => {
+    const updateError = new Error("Metrics update failed");
+    configureDatabase({
+      updateOne: jest.fn().mockRejectedValue(updateError),
+    });
+    const event = {
+      symbol: "BTC-USD",
+      price: 100,
+      timestamp: "2034-01-01T12:00:00.000Z",
+    };
+
+    await expect(eachMessage(kafkaMessage(JSON.stringify(event)))).rejects.toBe(
+      updateError
     );
     expect(errorSpy).not.toHaveBeenCalled();
   });

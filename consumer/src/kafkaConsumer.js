@@ -106,20 +106,70 @@ async function processMessage(event) {
 
   const prices = recentEvents.map((doc) => doc.price);
   const movingAverage = calculateMovingAverage(prices);
+  const eventTime = new Date(Date.parse(event.timestamp));
+  const latestHistoryTime = recentEvents.length
+    ? new Date(Date.parse(recentEvents[0].timestamp))
+    : eventTime;
+  const storedUpdatedAt = {
+    $convert: {
+      input: "$updatedAt",
+      to: "date",
+      onError: null,
+      onNull: null,
+    },
+  };
+  const isNewerSnapshot = {
+    $or: [
+      { $eq: [storedUpdatedAt, null] },
+      { $gt: [{ $literal: eventTime }, storedUpdatedAt] },
+    ],
+  };
+  const shouldUpdateMovingAverage = {
+    $or: [
+      isNewerSnapshot,
+      {
+        $gte: [{ $literal: latestHistoryTime }, storedUpdatedAt],
+      },
+    ],
+  };
 
-  //Upsert latest metrics snapshot
+  // Atomically keep snapshot fields from the newest event timestamp.
   await metricsCollection.updateOne(
     { symbol: event.symbol },
-    {
-      $set: {
-        symbol: event.symbol,
-        latestPrice: event.price,
-        previousPrice,
-        movingAverage: Number(movingAverage.toFixed(4)),
-        percentChange: Number(percentChange.toFixed(4)),
-        updatedAt: event.timestamp,
+    [
+      {
+        $set: {
+          symbol: { $literal: event.symbol },
+          latestPrice: {
+            $cond: [isNewerSnapshot, { $literal: event.price }, "$latestPrice"],
+          },
+          previousPrice: {
+            $cond: [isNewerSnapshot, { $literal: previousPrice }, "$previousPrice"],
+          },
+          movingAverage: {
+            $cond: [
+              shouldUpdateMovingAverage,
+              { $literal: Number(movingAverage.toFixed(4)) },
+              "$movingAverage",
+            ],
+          },
+          percentChange: {
+            $cond: [
+              isNewerSnapshot,
+              { $literal: Number(percentChange.toFixed(4)) },
+              "$percentChange",
+            ],
+          },
+          updatedAt: {
+            $cond: [
+              isNewerSnapshot,
+              { $literal: event.timestamp },
+              "$updatedAt",
+            ],
+          },
+        },
       },
-    },
+    ],
     { upsert: true }
   );
 
