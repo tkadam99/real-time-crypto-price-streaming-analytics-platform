@@ -17,6 +17,19 @@ const kafka = new Kafka({
 
 const consumer = kafka.consumer({ groupId: "crypto-analytics-group" });
 const livePriceTracker = createLivePriceTracker();
+let shuttingDown = false;
+let activeMessages = 0;
+let resolveDrain;
+let processingFailedDuringShutdown = false;
+
+function beginConsumerShutdown() {
+  shuttingDown = true;
+}
+
+function waitForActiveMessages() {
+  if (activeMessages === 0) return Promise.resolve();
+  return new Promise((resolve) => { resolveDrain = resolve; });
+}
 
 async function ensureIndexes() {
   const db = getDB();
@@ -451,44 +464,69 @@ async function processMessage(event, kafkaRecord) {
 
 async function startConsumer() {
   await ensureIndexes();
+  if (shuttingDown) return;
   await restoreAlertCooldowns();
+  if (shuttingDown) return;
   await restorePriceBaselines();
+  if (shuttingDown) return;
   await consumer.connect();
+  if (shuttingDown) return;
   console.log(`Consumer connected to Kafka at ${config.kafkaBroker}`);
 
   await consumer.subscribe({
     topic: config.kafkaTopic,
     fromBeginning: false,
   });
+  if (shuttingDown) return;
 
   console.log(`Consumer subscribed to topic: ${config.kafkaTopic}`);
 
   await consumer.run({
     eachMessage: async ({ topic, partition, message }) => {
-      if (!message.value) {
-        console.warn("Discarding invalid Kafka event: message value is missing");
-        return;
+      if (shuttingDown) {
+        throw new Error("Consumer is shutting down; Kafka record was not processed.");
       }
-
-      let event;
+      activeMessages += 1;
       try {
-        event = JSON.parse(message.value.toString());
+        if (!message.value) {
+          console.warn("Discarding invalid Kafka event: message value is missing");
+          return;
+        }
+
+        let event;
+        try {
+          event = JSON.parse(message.value.toString());
+        } catch (error) {
+          console.error("Discarding malformed Kafka event JSON:", error.message);
+          return;
+        }
+
+        const validationError = validateEvent(event);
+        if (validationError) {
+          console.warn("Discarding invalid Kafka event:", validationError);
+          return;
+        }
+
+        await processMessage(event, { topic, partition, message });
       } catch (error) {
-        console.error("Discarding malformed Kafka event JSON:", error.message);
-        return;
+        if (shuttingDown) processingFailedDuringShutdown = true;
+        throw error;
+      } finally {
+        activeMessages -= 1;
+        if (activeMessages === 0 && resolveDrain) {
+          resolveDrain();
+          resolveDrain = undefined;
+        }
       }
-
-      const validationError = validateEvent(event);
-      if (validationError) {
-        console.warn("Discarding invalid Kafka event:", validationError);
-        return;
-      }
-
-      await processMessage(event, { topic, partition, message });
     },
   });
 }
 
 module.exports = {
   startConsumer,
+  beginConsumerShutdown,
+  stopConsumer: () => consumer.stop(),
+  disconnectConsumer: () => consumer.disconnect(),
+  waitForActiveMessages,
+  hasShutdownProcessingFailure: () => processingFailedDuringShutdown,
 };

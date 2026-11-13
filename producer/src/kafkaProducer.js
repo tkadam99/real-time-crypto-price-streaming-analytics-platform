@@ -11,15 +11,8 @@ const producer = kafka.producer();
 
 // Producer establish connection to Kafka
 const connectProducer = async () => {
-    try {
-        await producer.connect();
-        console.log(`Producer connected to Kafka at ${config.kafkaBroker}`);
-    }
-    catch (err) {
-        console.error("Failed to connect producer to Kafka:", err.message);
-        process.exit(1);
-    }
-    
+    await producer.connect();
+    console.log(`Producer connected to Kafka at ${config.kafkaBroker}`);
 };
 
 // Sends one event to Kafka
@@ -36,5 +29,6 @@ const sendMessage = async (message) => {
 
 module.exports = {
   connectProducer,
+  disconnectProducer: () => producer.disconnect(),
   sendMessage,
 };

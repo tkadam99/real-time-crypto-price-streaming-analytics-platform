@@ -153,6 +153,30 @@ describe("price baseline restoration at startup", () => {
     expect(mockConsumer.run).not.toHaveBeenCalled();
   });
 
+  it("does not connect to Kafka if shutdown starts during restoration", async () => {
+    let release;
+    let notify;
+    const pending = new Promise((resolve) => { release = resolve; });
+    const entered = new Promise((resolve) => { notify = resolve; });
+    priceAggregate.mockImplementation(() => ({
+      toArray: async () => {
+        notify();
+        await pending;
+        return [];
+      },
+    }));
+
+    const startup = startConsumer();
+    await entered;
+    require("../src/kafkaConsumer").beginConsumerShutdown();
+    release();
+    await startup;
+
+    expect(mockConsumer.connect).not.toHaveBeenCalled();
+    expect(mockConsumer.subscribe).not.toHaveBeenCalled();
+    expect(mockConsumer.run).not.toHaveBeenCalled();
+  });
+
   it("does not start consuming if the bounded history query fails", async () => {
     groups = [{
       _id: "BTC-USD",

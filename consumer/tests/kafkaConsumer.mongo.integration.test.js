@@ -2,6 +2,8 @@ const mockConsumer = {
   connect: jest.fn(),
   subscribe: jest.fn(),
   run: jest.fn(),
+  stop: jest.fn(),
+  disconnect: jest.fn(),
 };
 
 jest.mock("kafkajs", () => ({
@@ -50,6 +52,8 @@ describeWithMongo("Kafka consumer MongoDB integration", () => {
     mockConsumer.connect.mockReset().mockResolvedValue();
     mockConsumer.subscribe.mockReset().mockResolvedValue();
     mockConsumer.run.mockReset().mockResolvedValue();
+    mockConsumer.stop.mockReset().mockResolvedValue();
+    mockConsumer.disconnect.mockReset().mockResolvedValue();
 
     const { startConsumer } = require("../src/kafkaConsumer");
     await startConsumer();
@@ -88,6 +92,69 @@ describeWithMongo("Kafka consumer MongoDB integration", () => {
       },
     });
   }
+
+  it.each([false, true])(
+    "drains an active real-MongoDB callback during shutdown (write failure: %s)",
+    async (failWrite) => {
+      const { EventEmitter } = require("events");
+      let releaseWrite;
+      let notifyWrite;
+      const waiting = new Promise((resolve) => { releaseWrite = resolve; });
+      const entered = new Promise((resolve) => { notifyWrite = resolve; });
+      const failure = new Error("shutdown metrics failure");
+      withCollectionOverride("metrics", (collection) =>
+        overrideMethod(collection, "updateOne", async (...args) => {
+          notifyWrite();
+          await waiting;
+          if (failWrite) throw failure;
+          return collection.updateOne(...args);
+        })
+      );
+      const kafkaRecord = record({
+        symbol: "BTC-USD", price: 100, timestamp: "2058-01-01T12:00:00.000Z",
+      }, "550");
+      const processing = eachMessage(kafkaRecord);
+      const result = processing.then(() => null, (error) => error);
+      await entered;
+
+      const processObject = new EventEmitter();
+      let resolveExit;
+      const exited = new Promise((resolve) => { resolveExit = resolve; });
+      processObject.exit = jest.fn(resolveExit);
+      const close = jest.fn().mockResolvedValue();
+      const lifecycle = require("../src/index").createLifecycle({
+        processObject, connect: jest.fn().mockResolvedValue(),
+        startKafka: jest.fn().mockResolvedValue(), close,
+      });
+      await lifecycle.start();
+      processObject.emit("SIGTERM");
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(mockConsumer.stop).toHaveBeenCalledTimes(1);
+      expect(mockConsumer.disconnect).not.toHaveBeenCalled();
+      expect(close).not.toHaveBeenCalled();
+      await expect(eachMessage(record({
+        symbol: "ETH-USD", price: 200, timestamp: "2058-01-01T12:00:00.000Z",
+      }, "551"))).rejects.toThrow("Kafka record was not processed");
+
+      releaseWrite();
+      expect(await result).toBe(failWrite ? failure : null);
+      expect(await exited).toBe(failWrite ? 1 : 0);
+      expect(mockConsumer.disconnect).toHaveBeenCalledTimes(1);
+      expect(close).toHaveBeenCalledTimes(1);
+      expect(await db.collection("price_events").countDocuments({ symbol: "BTC-USD" })).toBe(1);
+
+      global.__consumerIntegrationDB = db;
+      if (failWrite) {
+        jest.resetModules();
+        mockConsumer.run.mockClear();
+        await require("../src/kafkaConsumer").startConsumer();
+        await mockConsumer.run.mock.calls[0][0].eachMessage(kafkaRecord);
+        expect(await db.collection("price_events").countDocuments({ symbol: "BTC-USD" })).toBe(1);
+        expect(await db.collection("metrics").findOne({ symbol: "BTC-USD" }))
+          .toMatchObject({ latestPrice: 100 });
+      }
+    }
+  );
 
   it("retains the newest events per symbol and checks replay with one retention query", async () => {
     require("../src/config").maxEventsPerSymbol = 2;

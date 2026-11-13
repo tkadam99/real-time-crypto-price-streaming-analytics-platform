@@ -7,20 +7,15 @@ let client;
 const connectDB = async () => {
   if (db) return db;
 
-  try {
-    client = new MongoClient(config.mongoUri);
+  client = new MongoClient(config.mongoUri);
 
-    await client.connect();
+  await client.connect();
 
-    db = client.db(config.dbName);
+  db = client.db(config.dbName);
 
-    console.log(`Consumer connected to MongoDB: ${config.dbName}`);
+  console.log(`Consumer connected to MongoDB: ${config.dbName}`);
 
-    return db;
-  } catch (err) {
-    console.error("Consumer failed to connect to MongoDB:", err.message);
-    process.exit(1);
-  }
+  return db;
 };
 
 const getDB = () => {
@@ -30,4 +25,13 @@ const getDB = () => {
   return db;
 };
 
-module.exports = { connectDB, getDB };
+const closeDB = async () => {
+  if (client) {
+    await client.close();
+    db = undefined;
+    client = undefined;
+    console.log("Consumer MongoDB connection closed");
+  }
+};
+
+module.exports = { connectDB, getDB, closeDB };

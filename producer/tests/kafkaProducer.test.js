@@ -1,20 +1,25 @@
 const mockSend = jest.fn();
+const mockConnect = jest.fn();
+const mockDisconnect = jest.fn();
 
 jest.mock("kafkajs", () => ({
   Kafka: jest.fn().mockImplementation(() => ({
     producer: () => ({
-      connect: jest.fn(),
+      connect: mockConnect,
+      disconnect: mockDisconnect,
       send: mockSend,
     }),
   })),
 }));
 
 const config = require("../src/config");
-const { sendMessage } = require("../src/kafkaProducer");
+const { sendMessage, connectProducer, disconnectProducer } = require("../src/kafkaProducer");
 
 describe("sendMessage", () => {
   beforeEach(() => {
     mockSend.mockReset();
+    mockConnect.mockReset();
+    mockDisconnect.mockReset();
   });
 
   it("publishes the message to the configured topic", async () => {
@@ -38,5 +43,18 @@ describe("sendMessage", () => {
     mockSend.mockRejectedValue(error);
 
     await expect(sendMessage({ symbol: "BTC-USD" })).rejects.toBe(error);
+  });
+
+  it("propagates connection failures for startup cleanup", async () => {
+    const error = new Error("Kafka connect failed");
+    mockConnect.mockRejectedValue(error);
+    await expect(connectProducer()).rejects.toBe(error);
+  });
+
+  it("disconnects the shared Kafka producer and propagates errors", async () => {
+    const error = new Error("Kafka disconnect failed");
+    mockDisconnect.mockRejectedValue(error);
+    await expect(disconnectProducer()).rejects.toBe(error);
+    expect(mockDisconnect).toHaveBeenCalledTimes(1);
   });
 });

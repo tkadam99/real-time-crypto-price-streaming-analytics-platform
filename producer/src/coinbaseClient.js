@@ -2,6 +2,57 @@ const WebSocket = require("ws");
 const config = require("./config");
 const { sendMessage } = require("./kafkaProducer");
 
+let shuttingDown = false;
+let socket;
+let reconnectTimer;
+const pendingPublishes = new Set();
+let failedDuringShutdown = false;
+
+function beginCoinbaseShutdown() {
+  shuttingDown = true;
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = undefined;
+  }
+}
+
+function stopCoinbaseStream() {
+  if (!socket || socket.readyState === WebSocket.CLOSED) return Promise.resolve();
+  const ws = socket;
+  return new Promise((resolve, reject) => {
+    const connecting = ws.readyState === WebSocket.CONNECTING;
+    const onClose = () => {
+      ws.removeListener("error", onError);
+      resolve();
+    };
+    const onError = (error) => {
+      if (connecting &&
+          error.message === "WebSocket was closed before the connection was established") {
+        return;
+      }
+      ws.removeListener("close", onClose);
+      reject(error);
+    };
+    ws.once("close", onClose);
+    ws.once("error", onError);
+    try {
+      ws.close();
+    } catch (error) {
+      ws.removeListener("close", onClose);
+      ws.removeListener("error", onError);
+      reject(error);
+    }
+  });
+}
+
+function terminateCoinbaseStream() {
+  if (socket && socket.readyState !== WebSocket.CLOSED) socket.terminate();
+}
+
+async function drainPublishes() {
+  await Promise.all(pendingPublishes);
+}
+
 function validateTickerMessage(message) {
   if (
     typeof message.product_id !== "string" ||
@@ -41,11 +92,14 @@ function validateTickerMessage(message) {
 }
 
 function startCoinbaseStream() {
+  if (shuttingDown) return;
   const ws = new WebSocket(config.coinbaseWsUrl);
+  socket = ws;
 
 
   // Establish the connection to Coinbase WebSocket and subscribe to the ticker feed for the specified symbols
   ws.on("open", () => {
+    if (shuttingDown) return;
     console.log("Connected to Coinbase WebSocket");
 
     const subscribeMessage = {
@@ -60,6 +114,7 @@ function startCoinbaseStream() {
 
   // Receiving Live Data from Coinbase WebSocket, processing it, and sending to Kafka
   ws.on("message", async (data) => {
+    if (shuttingDown) return;
     let message;
     try {
       message = JSON.parse(data.toString());
@@ -88,11 +143,20 @@ function startCoinbaseStream() {
       console.log("Received ticker:", cleanedEvent);
 
       // Send the cleaned event to Kafka topic crypto-prices using the sendMessage function from kafkaProducer.js
+      const publish = (async () => {
+        try {
+          await sendMessage(cleanedEvent);
+          if (!shuttingDown) console.log("Sent to Kafka:", cleanedEvent);
+        } catch (error) {
+          if (shuttingDown) failedDuringShutdown = true;
+          console.error("Failed to publish ticker to Kafka:", error.message);
+        }
+      })();
+      pendingPublishes.add(publish);
       try {
-        await sendMessage(cleanedEvent);
-        console.log("Sent to Kafka:", cleanedEvent);
-      } catch (error) {
-        console.error("Failed to publish ticker to Kafka:", error.message);
+        await publish;
+      } finally {
+        pendingPublishes.delete(publish);
       }
     } catch (error) {
       console.error("Error processing Coinbase ticker:", error.message);
@@ -103,13 +167,32 @@ function startCoinbaseStream() {
     it will attempt to reconnect after 5 seconds. This ensures that our producer can recover from temporary network issues 
     or Coinbase WebSocket outages without crashing the application. */ 
   ws.on("error", (error) => {
+    if (shuttingDown && error.message === "WebSocket was closed before the connection was established") {
+      return;
+    }
+    if (shuttingDown) {
+      console.error("Coinbase WebSocket error during shutdown:", error.message);
+      return;
+    }
     console.error("Coinbase WebSocket error:", error.message);
   });
 
   ws.on("close", () => {
+    if (socket === ws) socket = undefined;
+    if (shuttingDown) return;
     console.warn("Coinbase WebSocket closed. Reconnecting in 5 seconds...");
-    setTimeout(startCoinbaseStream, 5000);
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = undefined;
+      if (!shuttingDown) startCoinbaseStream();
+    }, 5000);
   });
 }
 
-module.exports = { startCoinbaseStream };
+module.exports = {
+  startCoinbaseStream,
+  beginCoinbaseShutdown,
+  stopCoinbaseStream,
+  terminateCoinbaseStream,
+  drainPublishes,
+  hasShutdownPublishFailure: () => failedDuringShutdown,
+};
