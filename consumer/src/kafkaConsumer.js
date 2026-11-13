@@ -140,12 +140,15 @@ async function startConsumer() {
 
   await consumer.run({
     eachMessage: async ({ message }) => {
+      let event;
       try {
-        const event = JSON.parse(message.value.toString());
-        await processMessage(event);
+        event = JSON.parse(message.value.toString());
       } catch (error) {
-        console.error("Error processing Kafka message:", error.message);
+        console.error("Discarding malformed Kafka message:", error.message);
+        return;
       }
+
+      await processMessage(event);
     },
   });
 }
