@@ -333,6 +333,50 @@ describe("Kafka consumer message handling", () => {
     expect(metricsCollection.aggregate).toHaveBeenCalled();
   });
 
+  it("creates history and alert query indexes before consuming", () => {
+    expect(indexCollections.get("price_events").createIndex).toHaveBeenCalledWith(
+      { symbol: 1, timestamp: -1, receivedAt: 1, _id: 1 },
+      { name: "price_symbol_timestamp_received_id" }
+    );
+    expect(indexCollections.get("price_events").createIndex).toHaveBeenCalledWith(
+      { symbol: 1, timestamp: 1, receivedAt: 1, _id: 1 },
+      { name: "price_symbol_timestamp_asc_received_id" }
+    );
+    expect(indexCollections.get("alerts").createIndex).toHaveBeenCalledWith(
+      { timestamp: -1 },
+      { name: "alerts_timestamp" }
+    );
+  });
+
+  it.each(["price_events", "alerts"])(
+    "does not start consuming if the %s index build fails",
+    async (collectionName) => {
+      const failure = new Error(`${collectionName} index conflict`);
+      indexCollections.get(collectionName).createIndex.mockRejectedValueOnce(failure);
+      mockConsumer.connect.mockClear();
+      mockConsumer.subscribe.mockClear();
+      mockConsumer.run.mockClear();
+
+      await expect(startConsumer()).rejects.toBe(failure);
+      expect(mockConsumer.connect).not.toHaveBeenCalled();
+      expect(mockConsumer.subscribe).not.toHaveBeenCalled();
+      expect(mockConsumer.run).not.toHaveBeenCalled();
+    }
+  );
+
+  it("stops startup if the ascending history index build fails", async () => {
+    const failure = new Error("ascending history index conflict");
+    indexCollections.get("price_events").createIndex
+      .mockResolvedValueOnce("index")
+      .mockRejectedValueOnce(failure);
+    mockConsumer.connect.mockClear();
+    mockConsumer.run.mockClear();
+
+    await expect(startConsumer()).rejects.toBe(failure);
+    expect(mockConsumer.connect).not.toHaveBeenCalled();
+    expect(mockConsumer.run).not.toHaveBeenCalled();
+  });
+
   it("refuses startup when duplicate metric symbols already exist", async () => {
     const connectCallCount = mockConsumer.connect.mock.calls.length;
     getDB.mockReturnValue({

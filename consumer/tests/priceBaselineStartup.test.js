@@ -41,6 +41,7 @@ describe("price baseline restoration at startup", () => {
       createIndex: jest.fn().mockResolvedValue("index"),
     };
     const alerts = {
+      createIndex: jest.fn().mockResolvedValue("index"),
       aggregate: jest.fn(() => ({
         toArray: jest.fn().mockResolvedValue([{
           _id: "BTC-USD",
@@ -50,7 +51,10 @@ describe("price baseline restoration at startup", () => {
         }]),
       })),
     };
-    const prices = { aggregate: priceAggregate };
+    const prices = {
+      aggregate: priceAggregate,
+      createIndex: jest.fn().mockResolvedValue("index"),
+    };
     require("../src/mongoClient").getDB.mockReturnValue({
       collection: jest.fn((name) => {
         if (name === "metrics") return metrics;

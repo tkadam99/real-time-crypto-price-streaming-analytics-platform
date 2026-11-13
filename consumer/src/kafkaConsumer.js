@@ -40,6 +40,18 @@ async function ensureIndexes() {
     { symbol: 1 },
     { unique: true, name: "unique_metrics_symbol" }
   );
+  await db.collection("price_events").createIndex(
+    { symbol: 1, timestamp: -1, receivedAt: 1, _id: 1 },
+    { name: "price_symbol_timestamp_received_id" }
+  );
+  await db.collection("price_events").createIndex(
+    { symbol: 1, timestamp: 1, receivedAt: 1, _id: 1 },
+    { name: "price_symbol_timestamp_asc_received_id" }
+  );
+  await db.collection("alerts").createIndex(
+    { timestamp: -1 },
+    { name: "alerts_timestamp" }
+  );
 }
 
 async function restoreAlertCooldowns() {

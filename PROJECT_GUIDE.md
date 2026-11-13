@@ -225,6 +225,14 @@ An append-only record for each alert successfully inserted. The collection may n
 
 The consumer enforces `MAX_EVENTS_PER_SYMBOL` (default `10000`) for raw price events by counting documents and deleting the oldest excess documents by timestamp. This retention process does not apply the same cap to the metrics or alerts collections.
 
+On startup, the consumer ensures a unique `metrics.symbol` index, two non-unique
+`price_events` indexes on `(symbol, timestamp, receivedAt, _id)` for the
+different existing sort directions, and a non-unique descending
+`alerts.timestamp` index. MongoDB's `_id` indexes remain unique for event and
+alert identity. Index creation failures stop consumer startup; the consumer
+does not delete records to resolve conflicts. Computed event-time conversions
+in restoration pipelines still require additional processing and sorting.
+
 ## 7. REST API
 
 All application endpoints use the `/api` prefix and return JSON.

@@ -43,9 +43,13 @@ describe("alert cooldown restoration at startup", () => {
       aggregate: jest.fn(() => ({ toArray: jest.fn().mockResolvedValue([]) })),
       createIndex: jest.fn().mockResolvedValue("unique_metrics_symbol"),
     };
-    const alerts = { aggregate: alertsAggregate };
+    const alerts = {
+      aggregate: alertsAggregate,
+      createIndex: jest.fn().mockResolvedValue("index"),
+    };
     const priceEvents = {
       aggregate: jest.fn(() => ({ toArray: jest.fn().mockResolvedValue([]) })),
+      createIndex: jest.fn().mockResolvedValue("index"),
     };
     require("../src/mongoClient").getDB.mockReturnValue({
       collection: jest.fn((name) => {

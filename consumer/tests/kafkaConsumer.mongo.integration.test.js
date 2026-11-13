@@ -89,6 +89,151 @@ describeWithMongo("Kafka consumer MongoDB integration", () => {
     });
   }
 
+  it("creates non-unique history and alert indexes and preserves identity uniqueness", async () => {
+    const priceIndexes = await db.collection("price_events").listIndexes().toArray();
+    const alertIndexes = await db.collection("alerts").listIndexes().toArray();
+    const metricsIndexes = await db.collection("metrics").listIndexes().toArray();
+
+    expect(priceIndexes).toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: "_id_", key: { _id: 1 } }),
+      expect.objectContaining({
+        name: "price_symbol_timestamp_received_id",
+        key: { symbol: 1, timestamp: -1, receivedAt: 1, _id: 1 },
+      }),
+      expect.objectContaining({
+        name: "price_symbol_timestamp_asc_received_id",
+        key: { symbol: 1, timestamp: 1, receivedAt: 1, _id: 1 },
+      }),
+    ]));
+    expect(priceIndexes.find((index) => index.name === "price_symbol_timestamp_received_id").unique)
+      .not.toBe(true);
+    expect(priceIndexes.find((index) => index.name === "price_symbol_timestamp_asc_received_id").unique)
+      .not.toBe(true);
+    expect(alertIndexes).toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: "_id_", key: { _id: 1 } }),
+      expect.objectContaining({ name: "alerts_timestamp", key: { timestamp: -1 } }),
+    ]));
+    expect(alertIndexes.find((index) => index.name === "alerts_timestamp").unique)
+      .not.toBe(true);
+    expect(metricsIndexes).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        name: "unique_metrics_symbol",
+        key: { symbol: 1 },
+        unique: true,
+      }),
+    ]));
+  });
+
+  it("uses the history and alert indexes for representative query plans", async () => {
+    const priceEvents = Array.from({ length: 600 }, (_, index) => ({
+      _id: `plan-price-${index}`,
+      symbol: index % 2 === 0 ? "BTC-USD" : "ETH-USD",
+      price: 100 + index,
+      timestamp: new Date(Date.UTC(2052, 0, 1, 0, 0, index)).toISOString(),
+      receivedAt: new Date(Date.UTC(2052, 0, 1, 0, 0, index)).toISOString(),
+    }));
+    const alerts = priceEvents.map(({ _id, symbol, timestamp }) => ({
+      _id: `alert-${_id}`,
+      symbol,
+      timestamp,
+    }));
+    await db.collection("price_events").insertMany(priceEvents);
+    await db.collection("alerts").insertMany(alerts);
+
+    function planSummary(explanation) {
+      const stages = [];
+      const indexes = [];
+      function visit(value) {
+        if (!value || typeof value !== "object") return;
+        if (typeof value.stage === "string") stages.push(value.stage);
+        if (typeof value.indexName === "string") indexes.push(value.indexName);
+        for (const child of Object.values(value)) visit(child);
+      }
+      visit(explanation.queryPlanner.winningPlan);
+      return { stages, indexes };
+    }
+
+    const prices = db.collection("price_events");
+    const metrics = db.collection("metrics");
+    const threshold = "2052-01-01T00:05:00.000Z";
+    await metrics.insertOne({ symbol: "BTC-USD", latestPrice: 100 });
+    const config = require("../src/config");
+    const restoredTime = {
+      $convert: { input: "$timestamp", to: "date", onError: null, onNull: null },
+    };
+    const baselinePipeline = [
+      { $match: { symbol: "BTC-USD" } },
+      { $set: { eventTime: restoredTime } },
+      { $match: { eventTime: {
+        $gte: new Date("2052-01-01T00:04:00.000Z"),
+        $lte: new Date("2052-01-01T00:05:00.000Z"),
+      } } },
+      { $sort: { eventTime: 1, receivedAt: 1, _id: 1 } },
+      { $project: { symbol: 1, price: 1, timestamp: 1 } },
+    ];
+    const cooldownPipeline = [
+      { $match: { symbol: { $in: config.symbols } } },
+      { $set: { eventTime: restoredTime } },
+      { $sort: { eventTime: -1, _id: 1 } },
+      { $group: {
+        _id: "$symbol",
+        timestamp: { $first: "$eventTime" },
+        eventId: { $first: "$_id" },
+        invalidCount: { $sum: { $cond: [{ $eq: ["$eventTime", null] }, 1, 0] } },
+      } },
+    ];
+    const plans = {
+      history: await prices.find({ symbol: "BTC-USD" })
+        .sort({ timestamp: -1 }).limit(10).explain("executionStats"),
+      analytics: await prices.find({ symbol: "BTC-USD" })
+        .sort({ timestamp: -1, receivedAt: 1, _id: 1 }).limit(5).explain("executionStats"),
+      predecessor: await prices.find({ symbol: "BTC-USD", timestamp: { $lt: threshold } })
+        .sort({ timestamp: -1, receivedAt: -1, _id: -1 }).limit(1).explain("executionStats"),
+      retention: await prices.find({ symbol: "BTC-USD" })
+        .sort({ timestamp: 1, receivedAt: 1, _id: 1 }).limit(5).explain("executionStats"),
+      alerts: await db.collection("alerts").find({}, { projection: { _id: 0 } })
+        .sort({ timestamp: -1 }).limit(10).explain("executionStats"),
+      metrics: await metrics.find({}, { projection: { _id: 0 } })
+        .sort({ symbol: 1 }).explain("executionStats"),
+    };
+    const baselineExplain = await prices.aggregate(baselinePipeline).explain("executionStats");
+    const cooldownExplain = await db.collection("alerts").aggregate(cooldownPipeline)
+      .explain("executionStats");
+
+    for (const name of ["history", "analytics"]) {
+      expect(planSummary(plans[name]).indexes).toContain("price_symbol_timestamp_received_id");
+    }
+    for (const name of ["predecessor", "retention"]) {
+      expect(planSummary(plans[name]).indexes).toContain("price_symbol_timestamp_asc_received_id");
+      expect(planSummary(plans[name]).stages).not.toContain("SORT");
+    }
+    expect(planSummary(plans.history).stages).not.toContain("SORT");
+    expect(planSummary(plans.analytics).stages).not.toContain("SORT");
+    expect(planSummary(plans.alerts).indexes).toContain("alerts_timestamp");
+    expect(planSummary(plans.alerts).stages).not.toContain("SORT");
+    expect(planSummary(plans.metrics).indexes).toContain("unique_metrics_symbol");
+    console.log("MongoDB query plans:", Object.fromEntries(
+      Object.entries(plans).map(([name, plan]) => [name, {
+        ...planSummary(plan),
+        examinedKeys: plan.executionStats.totalKeysExamined,
+        examinedDocuments: plan.executionStats.totalDocsExamined,
+        returned: plan.executionStats.nReturned,
+      }])
+    ));
+    for (const [name, explanation] of [
+      ["baseline restoration", baselineExplain],
+      ["cooldown restoration", cooldownExplain],
+    ]) {
+      const cursor = explanation.stages.find((stage) => stage.$cursor).$cursor;
+      console.log(`${name} plan:`, {
+        ...planSummary(cursor),
+        pipelineStages: explanation.stages.map((stage) => Object.keys(stage)[0]),
+        examinedKeys: cursor.executionStats.totalKeysExamined,
+        examinedDocuments: cursor.executionStats.totalDocsExamined,
+      });
+    }
+  });
+
   it("uses the same baseline decision after restart as an uninterrupted consumer", async () => {
     const time = "2049-01-01T12:00:00.000Z";
     await eachMessage(record({ symbol: "BTC-USD", price: 100, timestamp: time }, "400"));
