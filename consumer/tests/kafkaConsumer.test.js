@@ -399,6 +399,36 @@ describe("Kafka consumer message handling", () => {
     });
   });
 
+  it("does not let replay of an older alert rewind the consumer cooldown", async () => {
+    const { alerts } = configureDatabase();
+    const events = [
+      { symbol: "BTC-USD", price: 100, timestamp: "2044-01-01T12:00:00.000Z" },
+      { symbol: "BTC-USD", price: 100, timestamp: "2044-01-01T12:01:00.000Z" },
+      { symbol: "BTC-USD", price: 101, timestamp: "2044-01-01T12:02:00.000Z" },
+      { symbol: "BTC-USD", price: 100, timestamp: "2044-01-01T12:06:00.000Z" },
+      { symbol: "BTC-USD", price: 100, timestamp: "2044-01-01T12:07:00.000Z" },
+      { symbol: "BTC-USD", price: 101, timestamp: "2044-01-01T12:08:00.000Z" },
+    ];
+    const records = events.map((event, index) =>
+      kafkaMessage(JSON.stringify(event), { offset: String(index + 1) })
+    );
+
+    for (const record of records) await eachMessage(record);
+    await eachMessage(records[2]);
+    await eachMessage(
+      kafkaMessage(
+        JSON.stringify({
+          symbol: "BTC-USD",
+          price: 102,
+          timestamp: "2044-01-01T12:09:00.000Z",
+        }),
+        { offset: "7" }
+      )
+    );
+
+    expect(alerts.size).toBe(2);
+  });
+
   it("recovers an alert write that failed after raw and metrics persistence", async () => {
     const alertError = new Error("temporary alert persistence failure");
     const alerts = new Map();

@@ -84,6 +84,62 @@ describe("Analytics Unit Tests", () => {
         tracker.isOnCooldown("ETH-USD", "2026-04-04T12:00:01.000Z")
       ).toBe(false);
     });
+
+    it("advances cooldown to a newer alert and keeps the expiry based on that alert", () => {
+      const tracker = createLivePriceTracker(trackerOptions);
+      tracker.recordAlert("BTC-USD", "2026-04-04T12:02:00.000Z", "old-alert");
+      tracker.recordAlert("BTC-USD", "2026-04-04T12:08:00.000Z", "new-alert");
+
+      expect(
+        tracker.isOnCooldown("BTC-USD", "2026-04-04T12:12:59.999Z")
+      ).toBe(true);
+      expect(
+        tracker.isOnCooldown("BTC-USD", "2026-04-04T12:13:00.000Z")
+      ).toBe(false);
+    });
+
+    it("does not rewind cooldown when an older alert is replayed", () => {
+      const tracker = createLivePriceTracker(trackerOptions);
+      const olderAlert = "2026-04-04T12:02:00.000Z";
+      tracker.recordAlert("BTC-USD", olderAlert, "older-alert");
+      tracker.recordAlert("BTC-USD", "2026-04-04T12:08:00.000Z", "newer-alert");
+      tracker.recordAlert("BTC-USD", olderAlert, "older-alert");
+
+      expect(
+        tracker.isOnCooldown("BTC-USD", "2026-04-04T12:09:00.000Z", "next-event")
+      ).toBe(true);
+      expect(
+        tracker.isOnCooldown("BTC-USD", "2026-04-04T12:12:59.999Z", "next-event")
+      ).toBe(true);
+      expect(
+        tracker.isOnCooldown("BTC-USD", "2026-04-04T12:13:00.000Z", "next-event")
+      ).toBe(false);
+    });
+
+    it("does not change cooldown when the same alert is recorded again", () => {
+      const tracker = createLivePriceTracker(trackerOptions);
+      const alertTime = "2026-04-04T12:08:00.000Z";
+      tracker.recordAlert("BTC-USD", alertTime, "same-alert");
+      tracker.recordAlert("BTC-USD", alertTime, "same-alert");
+
+      expect(
+        tracker.isOnCooldown("BTC-USD", "2026-04-04T12:12:59.999Z", "next-event")
+      ).toBe(true);
+      expect(
+        tracker.isOnCooldown("BTC-USD", "2026-04-04T12:13:00.000Z", "next-event")
+      ).toBe(false);
+    });
+
+    it("tracks cooldown independently for BTC, ETH, and SOL", () => {
+      const tracker = createLivePriceTracker(trackerOptions);
+      tracker.recordAlert("BTC-USD", "2026-04-04T12:02:00.000Z");
+      tracker.recordAlert("ETH-USD", "2026-04-04T12:08:00.000Z");
+      tracker.recordAlert("SOL-USD", "2026-04-04T12:09:00.000Z");
+
+      expect(tracker.isOnCooldown("BTC-USD", "2026-04-04T12:07:00.000Z")).toBe(false);
+      expect(tracker.isOnCooldown("ETH-USD", "2026-04-04T12:10:00.000Z")).toBe(true);
+      expect(tracker.isOnCooldown("SOL-USD", "2026-04-04T12:10:00.000Z")).toBe(true);
+    });
   });
 
   describe("calculateMovingAverage", () => {

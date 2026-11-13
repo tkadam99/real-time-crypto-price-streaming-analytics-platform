@@ -226,4 +226,36 @@ describeWithMongo("Kafka consumer MongoDB integration", () => {
     expect(await db.collection("price_events").countDocuments({ symbol: "SOL-USD" })).toBe(2);
   });
 
+  it("does not generate another alert after replaying an older alert record", async () => {
+    const events = [
+      { symbol: "BTC-USD", price: 100, timestamp: "2040-01-01T12:00:00.000Z" },
+      { symbol: "BTC-USD", price: 100, timestamp: "2040-01-01T12:01:00.000Z" },
+      { symbol: "BTC-USD", price: 101, timestamp: "2040-01-01T12:02:00.000Z" },
+      { symbol: "BTC-USD", price: 100, timestamp: "2040-01-01T12:06:00.000Z" },
+      { symbol: "BTC-USD", price: 100, timestamp: "2040-01-01T12:07:00.000Z" },
+      { symbol: "BTC-USD", price: 101, timestamp: "2040-01-01T12:08:00.000Z" },
+    ];
+    const records = events.map((event, index) =>
+      record(event, String(200 + index))
+    );
+
+    for (const kafkaRecord of records) await eachMessage(kafkaRecord);
+    await eachMessage(records[2]);
+    await eachMessage(
+      record(
+        { symbol: "BTC-USD", price: 102, timestamp: "2040-01-01T12:09:00.000Z" },
+        "206"
+      )
+    );
+
+    expect(await db.collection("alerts").countDocuments({ symbol: "BTC-USD" })).toBe(2);
+    expect(await db.collection("alerts").find({ symbol: "BTC-USD" }).sort({ timestamp: 1 }).toArray())
+      .toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ timestamp: events[2].timestamp }),
+          expect.objectContaining({ timestamp: events[5].timestamp }),
+        ])
+      );
+  });
+
 });

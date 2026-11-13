@@ -68,7 +68,11 @@ function createLivePriceTracker({
     },
     recordAlert(symbol, timestamp, eventId) {
       const eventTime = Date.parse(timestamp);
-      if (Number.isFinite(eventTime)) {
+      const lastAlert = lastAlertBySymbol.get(symbol);
+      if (
+        Number.isFinite(eventTime) &&
+        (lastAlert === undefined || eventTime > lastAlert.timestamp)
+      ) {
         lastAlertBySymbol.set(symbol, { timestamp: eventTime, eventId });
       }
     },
