@@ -24,19 +24,14 @@ const connectProducer = async () => {
 
 // Sends one event to Kafka
 const sendMessage = async (message) => {
-    try {
-        await producer.send({
-            topic: config.kafkaTopic,
-            messages: [
-                {
-                    value: JSON.stringify(message), //Kafka expects message value to be strings or buffers so we convert object to string
-                }
-            ],
-        });
-    }
-    catch (err) {
-        console.error("Failed to send message to Kafka:", err.message);
-    }
+    return producer.send({
+        topic: config.kafkaTopic,
+        messages: [
+            {
+                value: JSON.stringify(message), //Kafka expects message value to be strings or buffers so we convert object to string
+            }
+        ],
+    });
 }
 
 module.exports = {

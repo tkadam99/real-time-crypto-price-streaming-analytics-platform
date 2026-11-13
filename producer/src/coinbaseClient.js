@@ -42,8 +42,12 @@ function startCoinbaseStream() {
       console.log("Received ticker:", cleanedEvent);
 
       // Send the cleaned event to Kafka topic crypto-prices using the sendMessage function from kafkaProducer.js
-      await sendMessage(cleanedEvent);
-      console.log("Sent to Kafka:", cleanedEvent);
+      try {
+        await sendMessage(cleanedEvent);
+        console.log("Sent to Kafka:", cleanedEvent);
+      } catch (error) {
+        console.error("Failed to publish ticker to Kafka:", error.message);
+      }
     } catch (error) {
       console.error("Error processing Coinbase message:", error.message);
     }
