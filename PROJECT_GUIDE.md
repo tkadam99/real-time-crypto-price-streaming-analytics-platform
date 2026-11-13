@@ -117,7 +117,7 @@ Main files:
 - `consumer/src/config.js` contains the consumer's defaults and environment overrides.
 - `consumer/src/mongoClient.js` manages the consumer's MongoDB connection.
 
-The consumer uses `fromBeginning: false` when subscribing. For a consumer group with a committed offset, Kafka resumes from that group offset; the setting does not itself mean that every restart begins at the newest message.
+The consumer subscribes with `fromBeginning: true`. When a group has no committed offset for a partition, it starts at the earliest record still retained by Kafka, which can include historical events. Valid committed group offsets remain authoritative and are not rewound on restart. Records already removed by broker retention cannot be replayed.
 
 ### API server
 

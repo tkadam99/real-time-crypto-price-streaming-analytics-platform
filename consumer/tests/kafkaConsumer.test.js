@@ -60,6 +60,13 @@ describe("Kafka consumer message handling", () => {
     warnSpy.mockRestore();
   });
 
+  it("subscribes from the earliest retained offset when a group has no committed offset", () => {
+    expect(mockConsumer.subscribe).toHaveBeenCalledWith({
+      topic: require("../src/config").kafkaTopic,
+      fromBeginning: true,
+    });
+  });
+
   function evaluateExpression(expression, document) {
     if (typeof expression === "string" && expression.startsWith("$")) {
       return document[expression.slice(1)];

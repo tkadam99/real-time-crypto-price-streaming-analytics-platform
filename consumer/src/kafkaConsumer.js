@@ -475,7 +475,7 @@ async function startConsumer() {
 
   await consumer.subscribe({
     topic: config.kafkaTopic,
-    fromBeginning: false,
+    fromBeginning: true,
   });
   if (shuttingDown) return;
 
