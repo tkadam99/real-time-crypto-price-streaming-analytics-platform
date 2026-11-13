@@ -242,13 +242,15 @@ All application endpoints use the `/api` prefix and return JSON.
 
 | Method | Endpoint | Purpose |
 |---|---|---|
-| `GET` | `/api/health` | Returns a service status and current timestamp; it does not verify MongoDB or Kafka health. |
+| `GET` | `/api/health` | Checks API readiness with a MongoDB ping using the shared connection. Returns HTTP 200 when available or 503 when unavailable; it does not check Kafka, Coinbase, the producer, or the consumer. |
 | `GET` | `/api/prices/latest` | Returns latest price and update time from the `metrics` collection. |
 | `GET` | `/api/prices/history/:symbol?limit=20` | Returns recent raw events for a symbol, newest first. |
 | `GET` | `/api/metrics` | Returns the current metrics snapshot for each symbol. |
 | `GET` | `/api/alerts?limit=20` | Returns the newest alert documents first. |
 
 History and alert limits default to 20 when omitted. Explicit limits must contain decimal digits only and be between 1 and 10000 inclusive; invalid or repeated limits return HTTP 400. History accepts only `BTC-USD`, `ETH-USD`, and `SOL-USD`, with unsupported symbols also returning HTTP 400. The dashboard requests 10 history records and 10 alerts. API responses generally include a `success` flag, a `count`, and a `data` array; health uses its own status response.
+
+The health response retains `status`, `service`, and `Timestamp` fields. A successful ping returns `status: "ok"`; a failed or timed-out ping returns `status: "unavailable"` without database error details. The ping has a one-second client-side timeout. The API normally connects to MongoDB before it starts listening, so an initial connection failure can prevent the endpoint from being available at all.
 
 ## 8. Configuration
 
