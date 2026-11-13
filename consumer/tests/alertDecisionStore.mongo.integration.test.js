@@ -1,5 +1,5 @@
 const { randomUUID } = require("node:crypto");
-const { MongoClient } = require("mongodb");
+const { MongoClient, Long } = require("mongodb");
 const { createAlertDecisionStore } = require("../src/alertDecisionStore");
 const { buildAlert } = require("../src/analytics");
 
@@ -16,7 +16,7 @@ describeWithMongo("alert decision store MongoDB integration", () => {
     client = new MongoClient(integrationUri);
     await client.connect();
     db = client.db(dbName);
-    store = createAlertDecisionStore(db.collection("alert_decisions"));
+    store = createAlertDecisionStore(db.collection("alert_decisions"), "test-group");
   });
 
   afterAll(async () => {
@@ -38,12 +38,15 @@ describeWithMongo("alert decision store MongoDB integration", () => {
       percentChange: 2,
     };
     const id = JSON.stringify([identity.topic, identity.partition, identity.offset]);
+    const metadata = { groupId: "test-group", topic: identity.topic, partition: identity.partition, offset: Long.fromString(identity.offset) };
 
     expect(await store.find(identity)).toBeNull();
-    expect(await store.insertOriginal(identity, empty)).toEqual({ _id: id, ...empty });
-    expect(await store.insertOriginal(identity, positive)).toEqual({ _id: id, ...empty });
-    const secondStore = createAlertDecisionStore(db.collection("alert_decisions"));
-    expect(await secondStore.find(identity)).toEqual({ _id: id, ...empty });
+    expect(await store.insertOriginal(identity, empty)).toEqual({ _id: id, ...metadata, ...empty });
+    expect(await store.insertOriginal(identity, positive)).toEqual({ _id: id, ...metadata, ...empty });
+    const secondStore = createAlertDecisionStore(db.collection("alert_decisions"), "test-group");
+    expect(await secondStore.find(identity)).toEqual({ _id: id, ...metadata, ...empty });
+    const otherGroup = createAlertDecisionStore(db.collection("alert_decisions"), "other-group");
+    await expect(otherGroup.insertOriginal(identity, positive)).rejects.toThrow("Conflicting consumer group ownership");
 
     const positiveId = { ...identity, partition: 3 };
     const inserted = await store.insertOriginal(positiveId, positive);
@@ -61,5 +64,30 @@ describeWithMongo("alert decision store MongoDB integration", () => {
     expect(await db.collection("alert_decisions").countDocuments()).toBe(3);
     expect((await db.collection("alert_decisions").indexes()).map((index) => index.name))
       .toEqual(["_id_"]);
+  });
+
+  it("preserves BSON Long for small offsets and leaves legacy records unchanged", async () => {
+    const prices = db.collection("alert_decisions");
+    const small = { topic: "small-topic", partition: 0, offset: "1" };
+    const id = JSON.stringify([small.topic, small.partition, small.offset]);
+    const decision = { alertCandidate: null, previousPrice: null, percentChange: 0 };
+    expect(Long.isLong((await store.insertOriginal(small, decision)).offset)).toBe(true);
+    expect(Long.isLong((await store.find(small)).offset)).toBe(true);
+
+    const legacy = { topic: "legacy-topic", partition: 0, offset: "7" };
+    const legacyId = JSON.stringify([legacy.topic, legacy.partition, legacy.offset]);
+    await prices.insertOne({ _id: legacyId, ...decision });
+    const warn = jest.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      expect(await store.find(legacy)).toEqual({ _id: legacyId, ...decision });
+      expect(await store.insertOriginal(legacy, decision)).toEqual({ _id: legacyId, ...decision });
+      expect(await prices.findOne({ _id: legacyId })).toEqual({ _id: legacyId, ...decision });
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining(legacyId));
+    } finally {
+      warn.mockRestore();
+    }
+    expect(await prices.findOne({ _id: id }, { promoteLongs: false })).toMatchObject({
+      offset: Long.fromInt(1),
+    });
   });
 });

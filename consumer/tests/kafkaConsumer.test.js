@@ -345,7 +345,7 @@ describe("Kafka consumer message handling", () => {
     });
 
     await eachMessage(record);
-    expect(database.decisions.get(id)).toEqual({
+    expect(database.decisions.get(id)).toMatchObject({
       _id: id, alertCandidate: null, previousPrice: 100, percentChange: 5,
     });
     expect(database.alertUpdateOne).not.toHaveBeenCalled();
@@ -367,7 +367,7 @@ describe("Kafka consumer message handling", () => {
     });
 
     await eachMessage(record);
-    expect(database.decisions.get(id)).toEqual({
+    expect(database.decisions.get(id)).toMatchObject({
       _id: id, alertCandidate, previousPrice: 100, percentChange: 5,
     });
     expect(database.alerts.get(id)).toEqual({ _id: id, ...alertCandidate });
@@ -507,9 +507,13 @@ describe("Kafka consumer message handling", () => {
       { timestamp: -1 },
       { name: "alerts_timestamp" }
     );
+    expect(indexCollections.get("alert_decisions").createIndex).toHaveBeenCalledWith(
+      { groupId: 1, topic: 1, partition: 1, offset: 1 },
+      { name: "decision_group_topic_partition_offset" }
+    );
   });
 
-  it.each(["price_events", "alerts"])(
+  it.each(["price_events", "alerts", "alert_decisions"])(
     "does not start consuming if the %s index build fails",
     async (collectionName) => {
       const failure = new Error(`${collectionName} index conflict`);

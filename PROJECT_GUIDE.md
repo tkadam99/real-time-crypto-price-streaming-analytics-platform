@@ -226,11 +226,30 @@ An append-only record for each alert successfully inserted. The collection may n
 After computing analytics and updating metrics, the consumer enforces `MAX_EVENTS_PER_SYMBOL` (default `10000`) for raw price events by scanning each symbol in reverse `(timestamp, receivedAt, _id)` order, skipping the newest entries up to the cap, and deleting the remaining IDs for that symbol. It repeats this check on replay so a failed prune can be retried. The read and delete are not atomic across concurrent consumers or other writers, so the exact cap is not guaranteed during concurrent processing. A replay of an already-pruned Kafka record can recreate it before the next prune. This retention process does not apply the same cap to the metrics or alerts collections.
 
 The consumer persists original alert decisions in `alert_decisions` independently
-of raw history, keyed by Kafka topic, partition, and offset. On replay, it uses
+of raw history, keyed by Kafka topic, partition, and offset. New decisions include
+the consumer group, topic, partition, and exact BSON 64-bit offset; startup creates
+the `decision_group_topic_partition_offset` index alongside the unique `_id` index.
+The `_id` is not group-scoped: sharing the collection between groups is unsupported,
+and a conflicting recorded group fails processing. Legacy decisions without any
+cleanup metadata retain their original decision and are reported by identity when
+encountered; their group ownership requires a controlled migration. Partial or
+inconsistent metadata fails processing. On replay, the consumer uses
 the persisted positive or null decision; a valid decision in a legacy raw record
 is migrated if no separate decision exists. Legacy decisions already lost to
 retention cannot be reconstructed. Decision records currently have no cleanup
 policy and will accumulate until a commit-aware lifecycle is implemented.
+
+After the consumer starts, a tracked read-only reconciliation worker fetches
+committed next offsets for its group and topic on startup, after commit or group
+join notifications, and every 60 seconds. It logs per-partition offset status and
+a bounded sample of at most 100 index-matched decisions strictly below each
+verified offset; the sample is not a total count. Missing or invalid offsets do
+not produce an eligibility sample. It does not update or delete decisions or
+modify Kafka offsets. Errors are logged and retried on a later trigger or
+periodic cycle; shutdown drains in-flight reconciliation within the existing
+deadline. Eligibility is informational only: group ownership, legacy metadata,
+offset resets, rebalances, and commit-aware deletion still need a separately
+verified cleanup lifecycle.
 
 On startup, the consumer ensures a unique `metrics.symbol` index, two non-unique
 `price_events` indexes on `(symbol, timestamp, receivedAt, _id)` for the

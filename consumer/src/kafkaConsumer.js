@@ -3,6 +3,7 @@ const { getDB } = require("./mongoClient");
 const config = require("./config");
 const { createProcessingTimings } = require("./processingTimings");
 const { createAlertDecisionStore } = require("./alertDecisionStore");
+const { createCommitReconciliation } = require("./commitReconciliation");
 const {
   calculatePercentChange,
   calculateMovingAverage,
@@ -17,16 +18,44 @@ const kafka = new Kafka({
   brokers: [config.kafkaBroker],   // Kafka broker address (localhost:9092) this app connects to
 });
 
-const consumer = kafka.consumer({ groupId: "crypto-analytics-group" });
+const consumerGroupId = "crypto-analytics-group";
+const consumer = kafka.consumer({ groupId: consumerGroupId });
 const livePriceTracker = createLivePriceTracker();
 const processingTimings = config.processingTimings ? createProcessingTimings() : null;
 let shuttingDown = false;
 let activeMessages = 0;
 let resolveDrain;
 let processingFailedDuringShutdown = false;
+let reconciliation;
+let reconciliationListeners = [];
 
 function beginConsumerShutdown() {
   shuttingDown = true;
+  if (reconciliation) reconciliation.stopScheduling();
+  for (const remove of reconciliationListeners) remove();
+  reconciliationListeners = [];
+}
+
+function startReconciliation() {
+  if (shuttingDown) return;
+  if (reconciliation) throw new Error("Commit reconciliation is already initialized.");
+  reconciliation = createCommitReconciliation({
+    admin: kafka.admin(),
+    collection: getDB().collection("alert_decisions"),
+    groupId: consumerGroupId,
+    topic: config.kafkaTopic,
+  });
+  reconciliationListeners.push(
+    consumer.on(consumer.events.COMMIT_OFFSETS, () => reconciliation.schedule("commit"))
+  );
+  reconciliationListeners.push(
+    consumer.on(consumer.events.GROUP_JOIN, () => reconciliation.schedule("group-join"))
+  );
+  reconciliation.start();
+}
+
+async function drainReconciliation() {
+  if (reconciliation) await reconciliation.drain();
 }
 
 function waitForActiveMessages() {
@@ -67,6 +96,10 @@ async function ensureIndexes() {
   await db.collection("alerts").createIndex(
     { timestamp: -1 },
     { name: "alerts_timestamp" }
+  );
+  await db.collection("alert_decisions").createIndex(
+    { groupId: 1, topic: 1, partition: 1, offset: 1 },
+    { name: "decision_group_topic_partition_offset" }
   );
 }
 
@@ -221,7 +254,7 @@ async function processMessage(event, kafkaRecord, timing) {
   const priceEventsCollection = db.collection("price_events");
   const metricsCollection = db.collection("metrics");
   const alertsCollection = db.collection("alerts");
-  const decisionStore = createAlertDecisionStore(db.collection("alert_decisions"));
+  const decisionStore = createAlertDecisionStore(db.collection("alert_decisions"), consumerGroupId);
   const eventId = JSON.stringify([
     kafkaRecord.topic,
     kafkaRecord.partition,
@@ -575,4 +608,6 @@ module.exports = {
   disconnectConsumer: () => consumer.disconnect(),
   waitForActiveMessages,
   hasShutdownProcessingFailure: () => processingFailedDuringShutdown,
+  startReconciliation,
+  drainReconciliation,
 };

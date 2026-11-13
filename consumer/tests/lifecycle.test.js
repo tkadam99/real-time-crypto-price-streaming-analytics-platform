@@ -18,6 +18,8 @@ describe("consumer lifecycle", () => {
   let disconnectKafka;
   let waitForMessages;
   let processingFailed;
+  let startReconciler;
+  let drainReconciler;
   let close;
   let errorSpy;
   let logSpy;
@@ -33,6 +35,8 @@ describe("consumer lifecycle", () => {
     disconnectKafka = jest.fn().mockResolvedValue();
     waitForMessages = jest.fn().mockResolvedValue();
     processingFailed = jest.fn().mockReturnValue(false);
+    startReconciler = jest.fn();
+    drainReconciler = jest.fn().mockResolvedValue();
     close = jest.fn().mockResolvedValue();
     errorSpy = jest.spyOn(console, "error").mockImplementation(() => {});
     logSpy = jest.spyOn(console, "log").mockImplementation(() => {});
@@ -48,6 +52,7 @@ describe("consumer lifecycle", () => {
     return createLifecycle({
       processObject, connect, startKafka, beginShutdown, stopKafka,
       disconnectKafka, waitForMessages, processingFailed, close, ...options,
+      startReconciler, drainReconciler,
     });
   }
 
@@ -65,6 +70,7 @@ describe("consumer lifecycle", () => {
     expect(beginShutdown).toHaveBeenCalledTimes(1);
     expect(stopKafka.mock.invocationCallOrder[0]).toBeLessThan(waitForMessages.mock.invocationCallOrder[0]);
     expect(waitForMessages.mock.invocationCallOrder[0]).toBeLessThan(disconnectKafka.mock.invocationCallOrder[0]);
+    expect(drainReconciler.mock.invocationCallOrder[0]).toBeLessThan(disconnectKafka.mock.invocationCallOrder[0]);
     expect(disconnectKafka.mock.invocationCallOrder[0]).toBeLessThan(close.mock.invocationCallOrder[0]);
   });
 
@@ -75,6 +81,18 @@ describe("consumer lifecycle", () => {
     processObject.emit("SIGTERM");
     await new Promise((resolve) => setImmediate(resolve));
     expect(stopKafka).toHaveBeenCalledTimes(1);
+    expect(disconnectKafka).not.toHaveBeenCalled();
+    expect(close).not.toHaveBeenCalled();
+    active.resolve();
+    expect(await exited.promise).toBe(0);
+  });
+
+  it("waits for reconciliation before disconnecting Kafka or MongoDB", async () => {
+    const active = deferred();
+    drainReconciler.mockReturnValue(active.promise);
+    await lifecycle().start();
+    processObject.emit("SIGTERM");
+    await new Promise((resolve) => setImmediate(resolve));
     expect(disconnectKafka).not.toHaveBeenCalled();
     expect(close).not.toHaveBeenCalled();
     active.resolve();
@@ -118,18 +136,18 @@ describe("consumer lifecycle", () => {
     expect(errorSpy).toHaveBeenCalledWith("A Kafka message failed during shutdown");
   });
 
-  it.each(["stop", "drain", "disconnect", "MongoDB close"])(
+  it.each(["stop", "drain", "reconciliation", "disconnect", "MongoDB close"])(
     "bounds shutdown when %s hangs",
     async (stage) => {
       jest.useFakeTimers();
-      const operations = { stop: stopKafka, drain: waitForMessages, disconnect: disconnectKafka, "MongoDB close": close };
+      const operations = { stop: stopKafka, drain: waitForMessages, reconciliation: drainReconciler, disconnect: disconnectKafka, "MongoDB close": close };
       operations[stage].mockReturnValue(new Promise(() => {}));
       await lifecycle({ graceMs: 100 }).start();
       processObject.emit("SIGTERM");
       await jest.advanceTimersByTimeAsync(100);
       expect(await exited.promise).toBe(1);
       expect(errorSpy).toHaveBeenCalledWith("Consumer shutdown timed out; unfinished work may be replayed");
-      if (stage === "stop" || stage === "drain") expect(close).not.toHaveBeenCalled();
+      if (stage === "stop" || stage === "drain" || stage === "reconciliation") expect(close).not.toHaveBeenCalled();
     }
   );
 

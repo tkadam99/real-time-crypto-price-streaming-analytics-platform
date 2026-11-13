@@ -1,8 +1,11 @@
 const { createAlertDecisionStore } = require("../src/alertDecisionStore");
 const { buildAlert } = require("../src/analytics");
+const { Long } = require("mongodb");
 
 const identity = { topic: "crypto-prices", partition: 0, offset: "9007199254740993" };
 const id = JSON.stringify([identity.topic, identity.partition, identity.offset]);
+const groupId = "crypto-analytics-group";
+const metadata = { groupId, topic: identity.topic, partition: identity.partition, offset: Long.fromString(identity.offset) };
 const positive = {
   alertCandidate: buildAlert(
     "BTC-USD", 2, 102, 100, "2026-01-01T00:01:00Z", "2026-01-01T00:00:00Z", 60000
@@ -18,16 +21,19 @@ describe("alert decision store", () => {
 
   beforeEach(() => {
     collection = { findOne: jest.fn(), findOneAndUpdate: jest.fn() };
-    store = createAlertDecisionStore(collection);
+    jest.spyOn(console, "warn").mockImplementation(() => {});
+    store = createAlertDecisionStore(collection, groupId);
   });
 
+  afterEach(() => jest.restoreAllMocks());
+
   it("inserts and returns the complete positive original decision", async () => {
-    collection.findOneAndUpdate.mockResolvedValue({ _id: id, ...positive });
-    await expect(store.insertOriginal(identity, positive)).resolves.toEqual({ _id: id, ...positive });
+    collection.findOneAndUpdate.mockResolvedValue({ _id: id, ...metadata, ...positive });
+    await expect(store.insertOriginal(identity, positive)).resolves.toEqual({ _id: id, ...metadata, ...positive });
     expect(collection.findOneAndUpdate).toHaveBeenCalledWith(
       { _id: id },
-      { $setOnInsert: { _id: id, ...positive } },
-      { upsert: true, returnDocument: "after" }
+      { $setOnInsert: { _id: id, ...metadata, ...positive } },
+      { upsert: true, returnDocument: "after", promoteLongs: false }
     );
   });
 
@@ -46,7 +52,7 @@ describe("alert decision store", () => {
     collection.findOneAndUpdate.mockRejectedValue(Object.assign(new Error("duplicate"), { code: 11000 }));
     collection.findOne.mockResolvedValue({ _id: id, ...positive });
     await expect(store.insertOriginal(identity, noAlert)).resolves.toEqual({ _id: id, ...positive });
-    expect(collection.findOne).toHaveBeenCalledWith({ _id: id });
+    expect(collection.findOne).toHaveBeenCalledWith({ _id: id }, { promoteLongs: false });
   });
 
   it("propagates a duplicate-key error if the requested winner is absent", async () => {
@@ -108,7 +114,41 @@ describe("alert decision store", () => {
     ];
     for (const item of identities) await store.find(item);
     expect(new Set(collection.findOne.mock.calls.map(([filter]) => filter._id)).size).toBe(5);
-    expect(collection.findOne).toHaveBeenCalledWith({ _id: id });
+    expect(collection.findOne).toHaveBeenCalledWith({ _id: id }, { promoteLongs: false });
+  });
+
+  it("preserves legacy records without assigning ownership and reports them", async () => {
+    const legacy = { _id: id, ...noAlert };
+    collection.findOne.mockResolvedValue(legacy);
+    collection.findOneAndUpdate.mockResolvedValue(legacy);
+    await expect(store.find(identity)).resolves.toEqual(legacy);
+    await expect(store.insertOriginal(identity, positive)).resolves.toEqual(legacy);
+    expect(console.warn).toHaveBeenCalledWith(expect.stringContaining(id));
+    expect(legacy).toEqual({ _id: id, ...noAlert });
+  });
+
+  it("rejects conflicting group ownership without modifying the record", async () => {
+    const other = { _id: id, ...metadata, groupId: "other-group", ...noAlert };
+    collection.findOne.mockResolvedValue(other);
+    collection.findOneAndUpdate.mockResolvedValue(other);
+    await expect(store.find(identity)).rejects.toThrow("Conflicting consumer group ownership");
+    await expect(store.insertOriginal(identity, positive)).rejects.toThrow("Conflicting consumer group ownership");
+  });
+
+  it.each([
+    { groupId },
+    { ...metadata, offset: "9007199254740993" },
+    { ...metadata, offset: Long.fromString("9007199254740994") },
+    { ...metadata, topic: "different" },
+    { ...metadata, partition: 1 },
+    { ...metadata, groupId: "" },
+  ])("rejects partial or malformed metadata", async (invalidMetadata) => {
+    collection.findOne.mockResolvedValue({ _id: id, ...noAlert, ...invalidMetadata });
+    await expect(store.find(identity)).rejects.toThrow("Invalid alert decision metadata");
+  });
+
+  it.each([undefined, null, "", "   ", 1])("rejects invalid group identifiers", (value) => {
+    expect(() => createAlertDecisionStore(collection, value)).toThrow("Invalid Kafka consumer group ID");
   });
 
   it.each([

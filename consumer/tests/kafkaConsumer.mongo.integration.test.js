@@ -61,6 +61,38 @@ describeWithMongo("Kafka consumer MongoDB integration", () => {
     sequence = 0;
   });
 
+  it("creates the decision cleanup index on startup", async () => {
+    const indexes = await db.collection("alert_decisions").indexes();
+    expect(indexes).toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: "_id_", key: { _id: 1 } }),
+      expect.objectContaining({
+        name: "decision_group_topic_partition_offset",
+        key: { groupId: 1, topic: 1, partition: 1, offset: 1 },
+      }),
+    ]));
+  });
+
+  it("writes exact numeric decision metadata for future indexed queries", async () => {
+    const { Long } = require("mongodb");
+    const offset = "9007199254740993";
+    await eachMessage(record({
+      symbol: "SOL-USD", price: 100, timestamp: "2050-01-01T00:00:00.000Z",
+    }, offset));
+    const decisions = db.collection("alert_decisions");
+    const match = {
+      groupId: "crypto-analytics-group",
+      topic: "integration-topic",
+      partition: 0,
+      offset: { $gte: Long.fromString(offset), $lt: Long.fromString("9007199254740994") },
+    };
+    const results = await decisions.find(match, { promoteLongs: false })
+      .hint("decision_group_topic_partition_offset").toArray();
+    expect(results).toHaveLength(1);
+    expect(Long.isLong(results[0].offset)).toBe(true);
+    expect(results[0].offset.toString()).toBe(offset);
+    expect(await decisions.countDocuments({ ...match, offset: { $type: "long" } })).toBe(1);
+  });
+
   function record(event, offset = String(sequence++), topic = "integration-topic") {
     return {
       topic,
@@ -187,6 +219,7 @@ describeWithMongo("Kafka consumer MongoDB integration", () => {
       const lifecycle = require("../src/index").createLifecycle({
         processObject, connect: jest.fn().mockResolvedValue(),
         startKafka: jest.fn().mockResolvedValue(), close,
+        startReconciler: jest.fn(), drainReconciler: jest.fn().mockResolvedValue(),
       });
       await lifecycle.start();
       processObject.emit("SIGTERM");

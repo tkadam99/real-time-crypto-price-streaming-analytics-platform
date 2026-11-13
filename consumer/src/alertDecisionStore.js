@@ -1,3 +1,5 @@
+const { Long } = require("mongodb");
+
 function eventIdentity(identity) {
   if (!identity || typeof identity !== "object" || Array.isArray(identity)) {
     throw new Error("Invalid Kafka event identity.");
@@ -5,7 +7,7 @@ function eventIdentity(identity) {
   const { topic, partition, offset } = identity;
   if (
     typeof topic !== "string" ||
-    topic.length === 0 ||
+    topic.trim().length === 0 ||
     !Number.isInteger(partition) ||
     partition < 0 ||
     partition > 2147483647 ||
@@ -60,11 +62,40 @@ function validateDecision(decision, id, description = "persisted alert decision"
   return decision;
 }
 
-function createAlertDecisionStore(collection) {
+function createAlertDecisionStore(collection, groupId) {
+  if (typeof groupId !== "string" || groupId.trim() === "") {
+    throw new Error("Invalid Kafka consumer group ID.");
+  }
+
+  function validateStored(decision, identity, id) {
+    validateDecision(decision, id);
+    const fields = ["groupId", "topic", "partition", "offset"];
+    const present = fields.filter((field) => Object.prototype.hasOwnProperty.call(decision, field));
+    if (present.length === 0) {
+      console.warn(`Legacy alert decision ${id} has no cleanup metadata; ownership requires controlled migration.`);
+      return decision;
+    }
+    if (
+      present.length !== fields.length ||
+      typeof decision.groupId !== "string" ||
+      decision.groupId.trim() === "" ||
+      decision.topic !== identity.topic ||
+      decision.partition !== identity.partition ||
+      !Long.isLong(decision.offset) ||
+      decision.offset.toString() !== identity.offset
+    ) {
+      throw new Error(`Invalid alert decision metadata for Kafka event ${id}.`);
+    }
+    if (decision.groupId !== groupId) {
+      throw new Error(`Conflicting consumer group ownership for Kafka event ${id}.`);
+    }
+    return decision;
+  }
+
   async function find(identity) {
     const id = eventIdentity(identity);
-    const decision = await collection.findOne({ _id: id });
-    return decision === null ? null : validateDecision(decision, id);
+    const decision = await collection.findOne({ _id: id }, { promoteLongs: false });
+    return decision === null ? null : validateStored(decision, identity, id);
   }
 
   async function insertOriginal(identity, decision) {
@@ -74,6 +105,10 @@ function createAlertDecisionStore(collection) {
     }
     const document = {
       _id: id,
+      groupId,
+      topic: identity.topic,
+      partition: identity.partition,
+      offset: Long.fromString(identity.offset),
       alertCandidate: decision.alertCandidate,
       previousPrice: decision.previousPrice,
       percentChange: decision.percentChange,
@@ -85,14 +120,14 @@ function createAlertDecisionStore(collection) {
       persisted = await collection.findOneAndUpdate(
         { _id: id },
         { $setOnInsert: document },
-        { upsert: true, returnDocument: "after" }
+        { upsert: true, returnDocument: "after", promoteLongs: false }
       );
     } catch (error) {
       if (error.code !== 11000) throw error;
-      persisted = await collection.findOne({ _id: id });
+      persisted = await collection.findOne({ _id: id }, { promoteLongs: false });
       if (persisted === null) throw error;
     }
-    return validateDecision(persisted, id);
+    return validateStored(persisted, identity, id);
   }
 
   return { find, insertOriginal };

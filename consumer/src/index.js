@@ -6,6 +6,8 @@ const {
   disconnectConsumer,
   waitForActiveMessages,
   hasShutdownProcessingFailure,
+  startReconciliation,
+  drainReconciliation,
 } = require("./kafkaConsumer");
 
 // Includes startup, Kafka drain/disconnect, and MongoDB close; timeout exits for replay.
@@ -20,6 +22,8 @@ function createLifecycle({
   disconnectKafka = disconnectConsumer,
   waitForMessages = waitForActiveMessages,
   processingFailed = hasShutdownProcessingFailure,
+  startReconciler = startReconciliation,
+  drainReconciler = drainReconciliation,
   processObject = process,
   graceMs = SHUTDOWN_GRACE_MS,
 } = {}) {
@@ -61,6 +65,15 @@ function createLifecycle({
           failed = true;
           console.error("A Kafka message failed during shutdown");
         }
+
+        console.log("Draining commit reconciliation");
+        try {
+          await drainReconciler();
+        } catch (error) {
+          failed = true;
+          console.error("Failed to drain commit reconciliation:", error.message);
+        }
+        if (timedOut) return;
 
         console.log("Disconnecting Kafka consumer");
         try {
@@ -109,6 +122,7 @@ function createLifecycle({
         if (shutdownPromise) return;
         await connect();
         if (!shutdownPromise) await startKafka();
+        if (!shutdownPromise) startReconciler();
       } catch (error) {
         startupFailed = true;
         console.error("Failed to start consumer:", error.message);

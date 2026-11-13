@@ -73,6 +73,7 @@ describe("consumer processing timings", () => {
     };
     const documents = new Map();
     const decisions = {
+      createIndex: jest.fn().mockResolvedValue("index"),
       findOne: jest.fn(async ({ _id }) => documents.get(_id) || null),
       findOneAndUpdate: jest.fn(async ({ _id }, update) => {
         if (!documents.has(_id)) documents.set(_id, update.$setOnInsert);
