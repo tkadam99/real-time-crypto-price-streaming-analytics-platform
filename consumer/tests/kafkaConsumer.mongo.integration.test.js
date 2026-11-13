@@ -133,9 +133,9 @@ describeWithMongo("Kafka consumer MongoDB integration", () => {
 
     expect(await db.collection("metrics").findOne({ symbol: "ETH-USD" })).toMatchObject({
       latestPrice: 110,
-      previousPrice: 100,
+      previousPrice: 105,
       movingAverage: 105,
-      percentChange: 10,
+      percentChange: 4.7619,
       updatedAt: events[1].timestamp,
     });
   });
@@ -171,6 +171,82 @@ describeWithMongo("Kafka consumer MongoDB integration", () => {
       latestPrice: 150,
       movingAverage: 150,
       updatedAt: event.timestamp,
+    });
+  });
+
+  it("repairs latest previous-price metrics after the confirmed partial-write replay sequence", async () => {
+    const originalUpdateOne = db.collection("metrics").updateOne.bind(db.collection("metrics"));
+    let armed = false;
+    let failed = false;
+    withCollectionOverride(
+      "metrics",
+      (collection) =>
+        overrideMethod(collection, "updateOne", async (...args) => {
+          if (armed && !failed) {
+            failed = true;
+            throw new Error("injected 12:01 metrics failure");
+          }
+          return originalUpdateOne(...args);
+        })
+    );
+
+    const events = [
+      { symbol: "BTC-USD", price: 100, timestamp: "2045-01-01T12:00:00.000Z" },
+      { symbol: "BTC-USD", price: 110, timestamp: "2045-01-01T12:01:00.000Z" },
+      { symbol: "BTC-USD", price: 120, timestamp: "2045-01-01T12:02:00.000Z" },
+    ];
+    const records = events.map((event, index) =>
+      record(event, String(80 + index))
+    );
+
+    await eachMessage(records[0]);
+    armed = true;
+    await expect(eachMessage(records[1])).rejects.toThrow(
+      "injected 12:01 metrics failure"
+    );
+    global.__consumerIntegrationDB = db;
+    await eachMessage(records[2]);
+
+    expect(await db.collection("price_events").countDocuments({ symbol: "BTC-USD" })).toBe(3);
+    expect(await db.collection("metrics").findOne({ symbol: "BTC-USD" })).toMatchObject({
+      latestPrice: 120,
+      previousPrice: 110,
+      percentChange: 9.0909,
+      updatedAt: events[2].timestamp,
+    });
+
+    await eachMessage(records[1]);
+
+    expect(await db.collection("price_events").countDocuments({ symbol: "BTC-USD" })).toBe(3);
+    expect(await db.collection("metrics").findOne({ symbol: "BTC-USD" })).toMatchObject({
+      latestPrice: 120,
+      previousPrice: 110,
+      percentChange: 9.0909,
+      updatedAt: events[2].timestamp,
+    });
+  });
+
+  it("preserves derived snapshot values when retention has pruned the prior raw event", async () => {
+    require("../src/config").maxEventsPerSymbol = 1;
+    const events = [
+      { symbol: "ETH-USD", price: 100, timestamp: "2046-01-01T12:00:00.000Z" },
+      { symbol: "ETH-USD", price: 110, timestamp: "2046-01-01T12:01:00.000Z" },
+    ];
+    const records = events.map((event, index) =>
+      record(event, String(90 + index))
+    );
+
+    await eachMessage(records[0]);
+    await eachMessage(records[1]);
+    expect(await db.collection("price_events").countDocuments({ symbol: "ETH-USD" })).toBe(1);
+
+    await eachMessage(records[1]);
+
+    expect(await db.collection("metrics").findOne({ symbol: "ETH-USD" })).toMatchObject({
+      latestPrice: 110,
+      previousPrice: 100,
+      percentChange: 10,
+      updatedAt: events[1].timestamp,
     });
   });
 

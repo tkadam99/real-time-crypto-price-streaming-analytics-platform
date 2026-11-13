@@ -74,6 +74,13 @@ describe("Kafka consumer message handling", () => {
     }
 
     if ("$literal" in expression) return expression.$literal;
+    if ("$ifNull" in expression) {
+      const [value, fallback] = expression.$ifNull;
+      const evaluatedValue = evaluateExpression(value, document);
+      return evaluatedValue == null
+        ? evaluateExpression(fallback, document)
+        : evaluatedValue;
+    }
     if ("$convert" in expression) {
       const { input, onError, onNull } = expression.$convert;
       const value = evaluateExpression(input, document);
@@ -142,13 +149,31 @@ describe("Kafka consumer message handling", () => {
         return recentEventsCursor;
       }),
       toArray: jest.fn(async () => {
-        const direction = Object.values(recentEventsCursor.sortSpec)[0];
-        return [...storedPriceEvents]
-          .sort(
-            (left, right) =>
-              direction *
-              (Date.parse(left.timestamp) - Date.parse(right.timestamp))
-          )
+        const filteredEvents = storedPriceEvents.filter((historyEvent) => {
+          const timestampFilter = recentEventsCursor.filter?.timestamp;
+          return (
+            !timestampFilter?.$lt ||
+            historyEvent.timestamp < timestampFilter.$lt
+          );
+        });
+        return [...filteredEvents]
+          .sort((left, right) => {
+            for (const [field, direction] of Object.entries(
+              recentEventsCursor.sortSpec
+            )) {
+              const leftValue =
+                field === "timestamp" || field === "receivedAt"
+                  ? Date.parse(left[field] || 0)
+                  : left[field];
+              const rightValue =
+                field === "timestamp" || field === "receivedAt"
+                  ? Date.parse(right[field] || 0)
+                  : right[field];
+              if (leftValue < rightValue) return -direction;
+              if (leftValue > rightValue) return direction;
+            }
+            return 0;
+          })
           .slice(0, recentEventsCursor.limitValue);
       }),
       project: jest.fn(() => recentEventsCursor),
@@ -161,15 +186,29 @@ describe("Kafka consumer message handling", () => {
       countDocuments: jest.fn(async ({ symbol }) =>
         storedPriceEvents.filter((event) => event.symbol === symbol).length
       ),
-      find: jest.fn(() => recentEventsCursor),
+      find: jest.fn((filter) => {
+        recentEventsCursor.filter = filter;
+        return recentEventsCursor;
+      }),
+      deleteMany: jest.fn().mockResolvedValue({ deletedCount: 0 }),
     };
-    if (!options.updateOne || options.failMetricsOnce) {
+    if (
+      !options.updateOne ||
+      options.failMetricsOnce ||
+      options.failMetricsOnCall
+    ) {
       let failedMetricsWrite = false;
       let racedMetricsUpsert = false;
+      let metricsWriteCount = 0;
       updateOne.mockImplementation(async (filter, pipeline, updateOptions) => {
+        metricsWriteCount += 1;
         if (options.failMetricsOnce && !failedMetricsWrite) {
           failedMetricsWrite = true;
           throw options.failMetricsOnce;
+        }
+
+        if (metricsWriteCount === options.failMetricsOnCall) {
+          throw options.failMetricsError || new Error("Injected metrics failure");
         }
 
         if (options.metricsDuplicateRace && !racedMetricsUpsert) {
@@ -558,6 +597,62 @@ describe("Kafka consumer message handling", () => {
     });
   });
 
+  it("calculates negative percentage change from the preceding event-time price", async () => {
+    const { metricsDocuments } = configureDatabase();
+    const firstEvent = {
+      symbol: "ETH-USD",
+      price: 100,
+      timestamp: "2055-01-01T12:00:00.000Z",
+    };
+    const secondEvent = {
+      symbol: "ETH-USD",
+      price: 90,
+      timestamp: "2055-01-01T12:01:00.000Z",
+    };
+
+    await eachMessage(kafkaMessage(JSON.stringify(firstEvent)));
+    await eachMessage(kafkaMessage(JSON.stringify(secondEvent)));
+
+    expect(metricsDocuments.get("ETH-USD")).toMatchObject({
+      latestPrice: 90,
+      previousPrice: 100,
+      percentChange: -10,
+    });
+  });
+
+  it("repairs previous price and percentage after a failed event metrics write and replay", async () => {
+    const database = configureDatabase({ failMetricsOnCall: 2 });
+    const events = [
+      { symbol: "BTC-USD", price: 100, timestamp: "2056-01-01T12:00:00.000Z" },
+      { symbol: "BTC-USD", price: 110, timestamp: "2056-01-01T12:01:00.000Z" },
+      { symbol: "BTC-USD", price: 120, timestamp: "2056-01-01T12:02:00.000Z" },
+    ];
+    const records = events.map((event, index) =>
+      kafkaMessage(JSON.stringify(event), { offset: String(index + 1) })
+    );
+
+    await eachMessage(records[0]);
+    await expect(eachMessage(records[1])).rejects.toThrow("Injected metrics failure");
+    await eachMessage(records[2]);
+
+    expect(database.metricsDocuments.get("BTC-USD")).toMatchObject({
+      latestPrice: 120,
+      previousPrice: 110,
+      percentChange: 9.0909,
+      updatedAt: events[2].timestamp,
+    });
+
+    await eachMessage(records[1]);
+
+    expect(database.storedPriceEvents).toHaveLength(3);
+    expect(database.metricsDocuments.get("BTC-USD")).toMatchObject({
+      latestPrice: 120,
+      previousPrice: 110,
+      percentChange: 9.0909,
+      updatedAt: events[2].timestamp,
+    });
+  });
+
   it("does not let a late older event regress snapshot fields and refreshes the affected moving average", async () => {
     const { metricsDocuments } = configureDatabase();
     const events = [
@@ -584,9 +679,9 @@ describe("Kafka consumer message handling", () => {
 
     expect(metricsDocuments.get("BTC-USD")).toMatchObject({
       latestPrice: 110,
-      previousPrice: 100,
+      previousPrice: 105,
       movingAverage: 105,
-      percentChange: 10,
+      percentChange: 4.7619,
       updatedAt: events[1].timestamp,
     });
   });

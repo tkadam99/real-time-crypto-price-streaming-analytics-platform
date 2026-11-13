@@ -138,65 +138,54 @@ async function processMessage(event, kafkaRecord) {
     throw new Error(`Kafka event ${eventId} could not be loaded after persistence.`);
   }
 
-  const previousPrice =
-    storedEvent.previousPrice === undefined
-      ? candidatePreviousPrice
-      : storedEvent.previousPrice;
-  const percentChange =
-    storedEvent.percentChange === undefined
-      ? candidatePercentChange
-      : storedEvent.percentChange;
   const alertCandidate =
     storedEvent.alertCandidate === undefined
       ? candidateAlert
       : storedEvent.alertCandidate;
 
-  //------------------------------------------------------------------------------------------------
-
-  // LIMIT HISTORY SIZE PER SYMBOL
-  // Keep only last N events per symbol
-  // Delete older ones
-  
-  const maxEventsPerSymbol = config.maxEventsPerSymbol;
-
-  const totalCount = await priceEventsCollection.countDocuments({
-    symbol: event.symbol,
-  });
-
-  if (totalCount > maxEventsPerSymbol) {
-    const excess = totalCount - maxEventsPerSymbol;
-
-    const oldDocs = await priceEventsCollection
-      .find({ symbol: event.symbol })
-      .sort({ timestamp: 1 }) // oldest first
-      .limit(excess)
-      .project({ _id: 1 })
-      .toArray();
-
-    const idsToDelete = oldDocs.map(doc => doc._id);
-
-    await priceEventsCollection.deleteMany({
-      _id: { $in: idsToDelete },
-    });
-
-    console.log(`Cleaned ${idsToDelete.length} old events for ${event.symbol}`);
-  }
-
-  //------------------------------------------------------------------------------------------------
-
-  //Find recent events for same symbol to compute analytics
+  // Read history before retention pruning so the preceding event remains available.
   const recentEvents = await priceEventsCollection
     .find({ symbol: event.symbol })
-    .sort({ timestamp: -1 })
-    .limit(config.movingAverageWindow)
+    .sort({ timestamp: -1, receivedAt: 1, _id: 1 })
+    .limit(Math.max(config.movingAverageWindow, 2))
     .toArray();
 
-  const prices = recentEvents.map((doc) => doc.price);
+  const latestEvent = recentEvents[0] || event;
+  const latestEventTime = Date.parse(latestEvent.timestamp);
+  const precedingEvent =
+    recentEvents.find(
+      (historyEvent) => Date.parse(historyEvent.timestamp) < latestEventTime
+    ) ||
+    (
+      await priceEventsCollection
+        .find({
+          symbol: event.symbol,
+          timestamp: { $lt: latestEvent.timestamp },
+        })
+        .sort({ timestamp: -1, receivedAt: -1, _id: -1 })
+        .limit(1)
+        .toArray()
+    )[0];
+  const previousSnapshotPrice = precedingEvent?.price ?? null;
+  const snapshotPercentChange = calculatePercentChange(
+    previousSnapshotPrice,
+    latestEvent.price
+  );
+  const previousPriceValue =
+    precedingEvent === undefined
+      ? { $ifNull: ["$previousPrice", null] }
+      : { $literal: previousSnapshotPrice };
+  const percentChangeValue =
+    precedingEvent === undefined
+      ? { $ifNull: ["$percentChange", 0] }
+      : { $literal: Number(snapshotPercentChange.toFixed(4)) };
+  const prices = recentEvents
+    .slice(0, config.movingAverageWindow)
+    .map((doc) => doc.price);
   const movingAverage = calculateMovingAverage(prices);
-  const eventTime = new Date(Date.parse(event.timestamp));
   const latestHistoryTime = recentEvents.length
     ? new Date(Date.parse(recentEvents[0].timestamp))
-    : eventTime;
+    : new Date(Date.parse(event.timestamp));
   const storedUpdatedAt = {
     $convert: {
       input: "$updatedAt",
@@ -205,50 +194,50 @@ async function processMessage(event, kafkaRecord) {
       onNull: null,
     },
   };
-  const isNewerSnapshot = {
+  const shouldUpdateSnapshot = {
     $or: [
       { $eq: [storedUpdatedAt, null] },
-      { $gt: [{ $literal: eventTime }, storedUpdatedAt] },
-    ],
-  };
-  const shouldUpdateMovingAverage = {
-    $or: [
-      isNewerSnapshot,
-      {
-        $gte: [{ $literal: latestHistoryTime }, storedUpdatedAt],
-      },
+      { $gte: [{ $literal: latestHistoryTime }, storedUpdatedAt] },
     ],
   };
 
-  // Atomically keep snapshot fields from the newest event timestamp.
+  // Ties are ordered by first persisted time, then Kafka identity.
   const metricsUpdatePipeline = [
     {
       $set: {
         symbol: { $literal: event.symbol },
         latestPrice: {
-          $cond: [isNewerSnapshot, { $literal: event.price }, "$latestPrice"],
+          $cond: [
+            shouldUpdateSnapshot,
+            { $literal: latestEvent.price },
+            "$latestPrice",
+          ],
         },
         previousPrice: {
-          $cond: [isNewerSnapshot, { $literal: previousPrice }, "$previousPrice"],
+          $cond: [
+            shouldUpdateSnapshot,
+            previousPriceValue,
+            "$previousPrice",
+          ],
         },
         movingAverage: {
           $cond: [
-            shouldUpdateMovingAverage,
+            shouldUpdateSnapshot,
             { $literal: Number(movingAverage.toFixed(4)) },
             "$movingAverage",
           ],
         },
         percentChange: {
           $cond: [
-            isNewerSnapshot,
-            { $literal: Number(percentChange.toFixed(4)) },
+            shouldUpdateSnapshot,
+            percentChangeValue,
             "$percentChange",
           ],
         },
         updatedAt: {
           $cond: [
-            isNewerSnapshot,
-            { $literal: event.timestamp },
+            shouldUpdateSnapshot,
+            { $literal: latestEvent.timestamp },
             "$updatedAt",
           ],
         },
@@ -275,6 +264,28 @@ async function processMessage(event, kafkaRecord) {
       metricsUpdatePipeline,
       { upsert: false }
     );
+  }
+
+  const maxEventsPerSymbol = config.maxEventsPerSymbol;
+  const totalCount = await priceEventsCollection.countDocuments({
+    symbol: event.symbol,
+  });
+
+  if (totalCount > maxEventsPerSymbol) {
+    const excess = totalCount - maxEventsPerSymbol;
+    const oldDocs = await priceEventsCollection
+      .find({ symbol: event.symbol })
+      .sort({ timestamp: 1, receivedAt: 1, _id: 1 })
+      .limit(excess)
+      .project({ _id: 1 })
+      .toArray();
+    const idsToDelete = oldDocs.map((doc) => doc._id);
+
+    await priceEventsCollection.deleteMany({
+      _id: { $in: idsToDelete },
+    });
+
+    console.log(`Cleaned ${idsToDelete.length} old events for ${event.symbol}`);
   }
 
   if (alertCandidate) {
@@ -310,9 +321,9 @@ async function processMessage(event, kafkaRecord) {
 
   console.log("Processed event:", {
     symbol: event.symbol,
-    latestPrice: event.price,
-    previousPrice,
-    percentChange: Number(percentChange.toFixed(4)),
+    latestPrice: latestEvent.price,
+    previousPrice: previousSnapshotPrice,
+    percentChange: Number(snapshotPercentChange.toFixed(4)),
     movingAverage: Number(movingAverage.toFixed(4)),
   });
 }
