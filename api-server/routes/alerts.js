@@ -1,14 +1,21 @@
 const express = require("express");
 const router = express.Router();
 const { getDB } = require("../src/db");
+const { parseLimit, MAX_LIMIT } = require("../src/validation");
 
 // GET /api/alerts
 router.get("/", async (req, res) => {
+  const limit = parseLimit(req.query);
+  if (limit === null) {
+    return res.status(400).json({
+      success: false,
+      message: `limit must be an integer between 1 and ${MAX_LIMIT}`,
+    });
+  }
+
   try {
     const db = getDB();
     const alertsCollection = db.collection("alerts");
-
-    const limit = Number(req.query.limit) || 20;
 
     const alerts = await alertsCollection
       .find({}, { projection: { _id: 0 } })

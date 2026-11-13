@@ -237,7 +237,7 @@ All application endpoints use the `/api` prefix and return JSON.
 | `GET` | `/api/metrics` | Returns the current metrics snapshot for each symbol. |
 | `GET` | `/api/alerts?limit=20` | Returns the newest alert documents first. |
 
-History and alert limits default to 20 when omitted or not numerically provided. The dashboard overrides these defaults by requesting 10 history records and 10 alerts. API responses generally include a `success` flag, a `count`, and a `data` array; health uses its own status response.
+History and alert limits default to 20 when omitted. Explicit limits must contain decimal digits only and be between 1 and 10000 inclusive; invalid or repeated limits return HTTP 400. History accepts only `BTC-USD`, `ETH-USD`, and `SOL-USD`, with unsupported symbols also returning HTTP 400. The dashboard requests 10 history records and 10 alerts. API responses generally include a `success` flag, a `count`, and a `data` array; health uses its own status response.
 
 ## 8. Configuration
 

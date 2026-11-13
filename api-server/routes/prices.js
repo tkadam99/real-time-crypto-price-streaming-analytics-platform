@@ -1,6 +1,7 @@
 const express = require("express");
 const router = express.Router();
 const { getDB } = require("../src/db");
+const { isSupportedSymbol, parseLimit, MAX_LIMIT } = require("../src/validation");
 
 // GET /api/prices/latest
 router.get("/latest", async (req, res) => {
@@ -29,12 +30,24 @@ router.get("/latest", async (req, res) => {
 
 // GET /api/prices/history/:symbol
 router.get("/history/:symbol", async (req, res) => {
+  const { symbol } = req.params;
+  if (!isSupportedSymbol(symbol)) {
+    return res.status(400).json({
+      success: false,
+      message: "Unsupported symbol; expected BTC-USD, ETH-USD, or SOL-USD",
+    });
+  }
+  const limit = parseLimit(req.query);
+  if (limit === null) {
+    return res.status(400).json({
+      success: false,
+      message: `limit must be an integer between 1 and ${MAX_LIMIT}`,
+    });
+  }
+
   try {
     const db = getDB();
     const priceEventsCollection = db.collection("price_events");
-
-    const { symbol } = req.params;
-    const limit = Number(req.query.limit) || 20;
 
     const history = await priceEventsCollection
       .find({ symbol })
