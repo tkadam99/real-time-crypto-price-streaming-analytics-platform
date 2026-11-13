@@ -10,24 +10,18 @@ const connectDB = async () => {
         return db;
     }
 
-    try {
-        //  Creates a client pointed at mongodb://localhost:27017
-        client = new MongoClient(config.mongoUri);
+    //  Creates a client pointed at mongodb://localhost:27017
+    client = new MongoClient(config.mongoUri);
 
-        // Opens the connection
-        await client.connect();
+    // Opens the connection
+    await client.connect();
 
-        //  Selects the crypto_analytics database
-        db = client.db(config.dbName);
+    //  Selects the crypto_analytics database
+    db = client.db(config.dbName);
 
-        console.log(`Connected to MongoDB: ${config.dbName}`);
+    console.log(`Connected to MongoDB: ${config.dbName}`);
 
-        return db;
-    }
-    catch (err) {
-        console.error("Failed to Connect to MongoDB: ", err.message);
-        process.exit(1);
-    }
+    return db;
 }
 
 // Any file that needs the database calls getDB() instead of managing the connection themselves
@@ -42,6 +36,7 @@ const closeDB = async () => {
     if (client) {
         await client.close();
         db = null;
+        client = null;
         console.log("MongoDB connected closed");
     }
 }
