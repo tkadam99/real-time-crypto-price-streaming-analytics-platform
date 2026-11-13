@@ -164,7 +164,9 @@ export default function Documentation() {
           <ul>
             <li>Moving average calculation</li>
             <li>Percent change computation</li>
-            <li>Alert generation based on threshold</li>
+            <li>Alerts compare the current ticker with a recent price from the configured time window</li>
+            <li>Alert evaluation is skipped when no baseline exists within the configured tolerance</li>
+            <li>Alerts trigger at the configured percentage threshold for increases or decreases, with a per-symbol cooldown</li>
           </ul>
         </section>
 

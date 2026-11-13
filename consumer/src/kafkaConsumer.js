@@ -6,6 +6,7 @@ const {
   calculateMovingAverage,
   shouldCreateAlert,
   buildAlert,
+  createLivePriceTracker,
 } = require("./analytics");
 
 // Creating a Kafka client
@@ -15,6 +16,7 @@ const kafka = new Kafka({
 });
 
 const consumer = kafka.consumer({ groupId: "crypto-analytics-group" });
+const livePriceTracker = createLivePriceTracker();
 
 async function processMessage(event) {
   const db = getDB();
@@ -22,6 +24,9 @@ async function processMessage(event) {
   const priceEventsCollection = db.collection("price_events");
   const metricsCollection = db.collection("metrics");
   const alertsCollection = db.collection("alerts");
+  const baseline = livePriceTracker.getBaseline(event.symbol, event.timestamp);
+  const previousPrice = baseline?.price ?? null;
+  const percentChange = calculatePercentChange(previousPrice, event.price);
 
   //Store raw price event
   await priceEventsCollection.insertOne({
@@ -74,10 +79,6 @@ async function processMessage(event) {
   const prices = recentEvents.map((doc) => doc.price);
   const movingAverage = calculateMovingAverage(prices);
 
-  const previousEvent = recentEvents.length > 1 ? recentEvents[1] : null;
-  const previousPrice = previousEvent ? previousEvent.price : null;
-  const percentChange = calculatePercentChange(previousPrice, event.price);
-
   //Upsert latest metrics snapshot
   await metricsCollection.updateOne(
     { symbol: event.symbol },
@@ -94,17 +95,26 @@ async function processMessage(event) {
     { upsert: true }
   );
 
-  // 4. Create alert if threshold exceeded
-  if (previousPrice !== null && shouldCreateAlert(percentChange)) {
+  livePriceTracker.recordPrice(event.symbol, event.price, event.timestamp);
+
+  // Create an alert only when a valid time-window comparison meets the threshold.
+  if (
+    baseline &&
+    shouldCreateAlert(percentChange) &&
+    !livePriceTracker.isOnCooldown(event.symbol, event.timestamp)
+  ) {
     const alert = buildAlert(
       event.symbol,
       percentChange,
       event.price,
       previousPrice,
-      event.timestamp
+      event.timestamp,
+      new Date(baseline.timestamp).toISOString(),
+      config.alertWindowMs
     );
 
     await alertsCollection.insertOne(alert);
+    livePriceTracker.recordAlert(event.symbol, event.timestamp);
     console.log("Alert created:", alert);
   }
 
@@ -112,8 +122,8 @@ async function processMessage(event) {
     symbol: event.symbol,
     latestPrice: event.price,
     previousPrice,
-    movingAverage: Number(movingAverage.toFixed(4)),
     percentChange: Number(percentChange.toFixed(4)),
+    movingAverage: Number(movingAverage.toFixed(4)),
   });
 }
 

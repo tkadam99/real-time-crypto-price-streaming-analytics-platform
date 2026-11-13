@@ -1,4 +1,5 @@
 const {
+  createLivePriceTracker,
   calculatePercentChange,
   calculateMovingAverage,
   shouldCreateAlert,
@@ -6,6 +7,85 @@ const {
 } = require("../src/analytics");
 
 describe("Analytics Unit Tests", () => {
+  describe("createLivePriceTracker", () => {
+    const trackerOptions = {
+      windowMs: 60_000,
+      baselineToleranceMs: 10_000,
+      cooldownMs: 300_000,
+    };
+
+    it("uses a recent event at the comparison-window boundary as the baseline", () => {
+      const tracker = createLivePriceTracker(trackerOptions);
+      tracker.recordPrice("BTC-USD", 100, "2026-04-04T12:00:00.000Z");
+
+      expect(
+        tracker.getBaseline("BTC-USD", "2026-04-04T12:01:00.000Z")
+      ).toEqual({
+        price: 100,
+        timestamp: Date.parse("2026-04-04T12:00:00.000Z"),
+      });
+    });
+
+    it("skips a baseline that is outside the configured tolerance", () => {
+      const tracker = createLivePriceTracker(trackerOptions);
+      tracker.recordPrice("BTC-USD", 100, "2026-04-04T11:59:49.999Z");
+
+      expect(
+        tracker.getBaseline("BTC-USD", "2026-04-04T12:01:00.000Z")
+      ).toBeNull();
+    });
+
+    it("does not use an event newer than the comparison target", () => {
+      const tracker = createLivePriceTracker(trackerOptions);
+      tracker.recordPrice("BTC-USD", 101, "2026-04-04T12:00:01.000Z");
+
+      expect(
+        tracker.getBaseline("BTC-USD", "2026-04-04T12:01:00.000Z")
+      ).toBeNull();
+    });
+
+    it("tracks the previous price independently for each symbol", () => {
+      const tracker = createLivePriceTracker(trackerOptions);
+
+      tracker.recordPrice("BTC-USD", 100, "2026-04-04T12:00:00.000Z");
+      tracker.recordPrice("ETH-USD", 20, "2026-04-04T12:00:00.000Z");
+      tracker.recordPrice("BTC-USD", 101, "2026-04-04T12:00:10.000Z");
+
+      expect(
+        tracker.getBaseline("BTC-USD", "2026-04-04T12:01:10.000Z").price
+      ).toBe(101);
+      expect(
+        tracker.getBaseline("ETH-USD", "2026-04-04T12:01:00.000Z").price
+      ).toBe(20);
+    });
+
+    it("allows events to be recorded out of timestamp order", () => {
+      const tracker = createLivePriceTracker(trackerOptions);
+      tracker.recordPrice("BTC-USD", 101, "2026-04-04T12:00:01.000Z");
+      tracker.recordPrice("BTC-USD", 100, "2026-04-04T12:00:00.000Z");
+
+      expect(
+        tracker.getBaseline("BTC-USD", "2026-04-04T12:01:01.000Z").price
+      ).toBe(101);
+    });
+
+    it("applies cooldown independently per symbol and allows an alert at expiry", () => {
+      const tracker = createLivePriceTracker(trackerOptions);
+      const alertTime = "2026-04-04T12:00:00.000Z";
+      tracker.recordAlert("BTC-USD", alertTime);
+
+      expect(
+        tracker.isOnCooldown("BTC-USD", "2026-04-04T12:04:59.999Z")
+      ).toBe(true);
+      expect(
+        tracker.isOnCooldown("BTC-USD", "2026-04-04T12:05:00.000Z")
+      ).toBe(false);
+      expect(
+        tracker.isOnCooldown("ETH-USD", "2026-04-04T12:00:01.000Z")
+      ).toBe(false);
+    });
+  });
+
   describe("calculateMovingAverage", () => {
     it("should return 0 for an empty array", () => {
       expect(calculateMovingAverage([])).toBe(0);
@@ -52,19 +132,19 @@ describe("Analytics Unit Tests", () => {
 
   describe("shouldCreateAlert", () => {
     it("should return false when change is below threshold", () => {
-      expect(shouldCreateAlert(1.0)).toBe(false);
+      expect(shouldCreateAlert(0.49)).toBe(false);
     });
 
     it("should return true when change is above positive threshold", () => {
-      expect(shouldCreateAlert(2.0)).toBe(true);
+      expect(shouldCreateAlert(0.6)).toBe(true);
     });
 
     it("should return true when change is above negative threshold in absolute value", () => {
-      expect(shouldCreateAlert(-2.0)).toBe(true);
+      expect(shouldCreateAlert(-0.6)).toBe(true);
     });
 
     it("should return true when change is exactly at threshold", () => {
-      expect(shouldCreateAlert(1.5)).toBe(true);
+      expect(shouldCreateAlert(0.5)).toBe(true);
     });
   });
 
@@ -75,14 +155,20 @@ describe("Analytics Unit Tests", () => {
         2.5,
         102.5,
         100,
-        "2026-04-04T12:00:00Z"
+        "2026-04-04T12:00:00Z",
+        "2026-04-04T11:59:00Z"
       );
 
       expect(alert).toHaveProperty("symbol", "BTC-USD");
       expect(alert).toHaveProperty("alertType", "SPIKE");
       expect(alert).toHaveProperty("percentChange", 2.5);
       expect(alert).toHaveProperty("timestamp", "2026-04-04T12:00:00Z");
+      expect(alert).toHaveProperty("previousPrice", 100);
+      expect(alert).toHaveProperty("currentPrice", 102.5);
+      expect(alert).toHaveProperty("comparisonTimestamp", "2026-04-04T11:59:00Z");
+      expect(alert).toHaveProperty("windowMs", 60_000);
       expect(alert.message).toContain("increased");
+      expect(alert.message).toContain("over 1 minute");
     });
 
     it("should build a decrease alert correctly", () => {
@@ -91,7 +177,8 @@ describe("Analytics Unit Tests", () => {
         -3.2,
         96.8,
         100,
-        "2026-04-04T12:00:00Z"
+        "2026-04-04T12:00:00Z",
+        "2026-04-04T11:59:00Z"
       );
 
       expect(alert).toHaveProperty("symbol", "ETH-USD");
