@@ -1,5 +1,13 @@
 # React + Vite
 
+The dashboard refreshes every 10 seconds. Current-price cards use only
+`/api/prices/current`, independently of historical metrics, alerts and history.
+Missing symbols are unavailable. Cards report freshness from each market-event
+timestamp, separately from current-price and historical refresh times. Recent
+fetches do not imply fresh market data; historical analytics may lag behind.
+
+Run the dashboard refresh and freshness tests with `npm test`.
+
 This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
 
 Currently, two official plugins are available:

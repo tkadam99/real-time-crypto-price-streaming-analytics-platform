@@ -1,9 +1,10 @@
-const SUPPORTED_SYMBOLS = new Set(["BTC-USD", "ETH-USD", "SOL-USD"]);
+const SUPPORTED_SYMBOLS = Object.freeze(["BTC-USD", "ETH-USD", "SOL-USD"]);
+const supportedSymbolSet = new Set(SUPPORTED_SYMBOLS);
 const DEFAULT_LIMIT = 20;
 const MAX_LIMIT = 10000;
 
 function isSupportedSymbol(symbol) {
-  return typeof symbol === "string" && SUPPORTED_SYMBOLS.has(symbol);
+  return typeof symbol === "string" && supportedSymbolSet.has(symbol);
 }
 
 function parseLimit(query) {
@@ -18,4 +19,4 @@ function parseLimit(query) {
     : null;
 }
 
-module.exports = { isSupportedSymbol, parseLimit, MAX_LIMIT };
+module.exports = { SUPPORTED_SYMBOLS, isSupportedSymbol, parseLimit, MAX_LIMIT };

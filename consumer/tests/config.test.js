@@ -6,7 +6,7 @@ const numericVariables = [
   "MOVING_AVERAGE_WINDOW",
   "MAX_EVENTS_PER_SYMBOL",
 ];
-const configVariables = [...numericVariables, "CONSUMER_PROCESSING_TIMINGS"];
+const configVariables = [...numericVariables, "CONSUMER_PROCESSING_TIMINGS", "ALERT_DECISION_CLEANUP_ENABLED"];
 
 function loadConfig(overrides = {}) {
   const previousValues = Object.fromEntries(
@@ -47,6 +47,7 @@ describe("consumer numerical configuration", () => {
       movingAverageWindow: 5,
       maxEventsPerSymbol: 10_000,
       processingTimings: false,
+      decisionCleanupEnabled: false,
     });
   });
 
@@ -78,6 +79,16 @@ describe("consumer numerical configuration", () => {
   it("rejects an invalid processing timings setting", () => {
     expect(() => loadConfig({ CONSUMER_PROCESSING_TIMINGS: "yes" })).toThrow(
       'CONSUMER_PROCESSING_TIMINGS must be "true" or "false"'
+    );
+  });
+
+  it.each([["true", true], ["false", false]])("configures cleanup with %s", (value, expected) => {
+    expect(loadConfig({ ALERT_DECISION_CLEANUP_ENABLED: value }).decisionCleanupEnabled).toBe(expected);
+  });
+
+  it.each(["", "TRUE", "yes", "1"])("rejects invalid cleanup setting %s", (value) => {
+    expect(() => loadConfig({ ALERT_DECISION_CLEANUP_ENABLED: value })).toThrow(
+      'ALERT_DECISION_CLEANUP_ENABLED must be "true" or "false"'
     );
   });
 

@@ -5,6 +5,8 @@
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
+    "start:current-prices": "node src/currentPriceMain.js",
+    "diagnose:kafka": "node scripts/kafkaTailDiagnostic.js",
     "test": "jest --runInBand"
   },
   "keywords": [],

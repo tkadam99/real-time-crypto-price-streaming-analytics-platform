@@ -1,7 +1,30 @@
 const express = require("express");
 const router = express.Router();
 const { getDB } = require("../src/db");
-const { isSupportedSymbol, parseLimit, MAX_LIMIT } = require("../src/validation");
+const { SUPPORTED_SYMBOLS, isSupportedSymbol, parseLimit, MAX_LIMIT } = require("../src/validation");
+const { serializeCurrentPrice } = require("../src/currentPrice");
+
+// GET /api/prices/current
+router.get("/current", async (req, res) => {
+  if (Object.keys(req.query).length > 0) {
+    return res.status(400).json({ success: false, message: "Query parameters are not supported" });
+  }
+  try {
+    const snapshots = await getDB().collection("current_prices")
+      .find(
+        { _id: { $in: SUPPORTED_SYMBOLS } },
+        { projection: { _id: 1, symbol: 1, price: 1, marketTimestamp: 1, receivedAt: 1 } }
+      )
+      .sort({ _id: 1 })
+      .toArray();
+    const data = snapshots.map(serializeCurrentPrice);
+    res.set("Cache-Control", "no-store");
+    res.json({ success: true, count: data.length, data });
+  } catch (error) {
+    console.error("Error fetching current prices:", error.message);
+    res.status(500).json({ success: false, message: "Failed to fetch current prices" });
+  }
+});
 
 // GET /api/prices/latest
 router.get("/latest", async (req, res) => {

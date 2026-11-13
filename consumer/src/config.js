@@ -28,6 +28,7 @@ module.exports = {
   dbName: process.env.DB_NAME || "crypto_analytics",
   symbols: ["BTC-USD", "ETH-USD", "SOL-USD"],
   processingTimings: readBooleanSetting("CONSUMER_PROCESSING_TIMINGS"),
+  decisionCleanupEnabled: readBooleanSetting("ALERT_DECISION_CLEANUP_ENABLED"),
   alertThresholdPercent: readNumericSetting(
     "ALERT_THRESHOLD_PERCENT",
     0.5,

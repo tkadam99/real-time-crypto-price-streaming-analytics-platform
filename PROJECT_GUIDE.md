@@ -236,20 +236,48 @@ encountered; their group ownership requires a controlled migration. Partial or
 inconsistent metadata fails processing. On replay, the consumer uses
 the persisted positive or null decision; a valid decision in a legacy raw record
 is migrated if no separate decision exists. Legacy decisions already lost to
-retention cannot be reconstructed. Decision records currently have no cleanup
-policy and will accumulate until a commit-aware lifecycle is implemented.
+retention cannot be reconstructed.
 
-After the consumer starts, a tracked read-only reconciliation worker fetches
+After the consumer starts, a tracked reconciliation worker fetches
 committed next offsets for its group and topic on startup, after commit or group
 join notifications, and every 60 seconds. It logs per-partition offset status and
 a bounded sample of at most 100 index-matched decisions strictly below each
 verified offset; the sample is not a total count. Missing or invalid offsets do
-not produce an eligibility sample. It does not update or delete decisions or
-modify Kafka offsets. Errors are logged and retried on a later trigger or
-periodic cycle; shutdown drains in-flight reconciliation within the existing
-deadline. Eligibility is informational only: group ownership, legacy metadata,
-offset resets, rebalances, and commit-aware deletion still need a separately
-verified cleanup lifecycle.
+not produce an eligibility sample. By default it is read-only and does not
+delete decisions or modify Kafka offsets. Errors are logged and retried on a
+later trigger or periodic cycle; shutdown drains in-flight reconciliation
+within the existing deadline.
+
+`ALERT_DECISION_CLEANUP_ENABLED` is strictly `true` or `false`, defaults to
+`false`, and is not enabled by the normal configuration. Explicitly enabling it
+allows the same worker to inspect at most four partitions per cycle, selecting
+at most 500 validated decisions for one deletion batch per partition. It checks
+the broker again immediately before every delete; missing, invalid or decreased
+boundaries prevent that batch. The indexed deletion repeats the group, topic,
+partition, exact selected identity, metadata types and strict numeric offset
+boundary, and verifies the selected decision has not changed. Positive and
+null decisions receive the same treatment. Metadata-free, ambiguous, malformed
+and conflicting records are left untouched. When cleanup is enabled, startup
+creates `decision_cleanup_pagination` on `(groupId, topic, partition, offset,
+_id)`. A bounded, in-memory per-partition cursor advances past ambiguous
+records, including ties at the same offset, then wraps to revisit earlier
+records. A restart resets these cursors. A full page or unvisited partitions
+schedule a coalesced follow-up after 50 ms; partition rotation provides fairness.
+When no deletions occur, automatic scans stop after a complete empty partition
+sweep or eight cycles containing full pages, and failures, partial deletions or
+uncertain/decreased boundaries defer further work to a later trigger or the
+60-second periodic cycle. This bounds retries while allowing the cursor to
+progress through ambiguous records over subsequent triggers. Operators must
+investigate ambiguous records rather than silently migrate or delete them.
+
+Cleanup requires one application group to own the collection, no other group
+depending on the same identities, forward-only offsets, no concurrent
+administrative rewind, and no group identity reuse or topic recreation. Group
+ownership cannot be independently established from legacy records. A Kafka
+recheck and MongoDB deletion are not atomic: an administrative reset after the
+check can make deletion unsafe. Do not enable cleanup without enforcing these
+operational assumptions and a controlled rollout. Storage is not absolutely
+bounded during failures, absent commits, or unresolved ambiguous records.
 
 On startup, the consumer ensures a unique `metrics.symbol` index, two non-unique
 `price_events` indexes on `(symbol, timestamp, receivedAt, _id)` for the
@@ -385,6 +413,20 @@ npm test
 cd ../consumer
 npm test
 ```
+
+The consumer's real-Kafka reconciliation test is opt-in. With Kafka and
+MongoDB reachable from the host, run in PowerShell from `consumer`:
+
+```powershell
+$env:KAFKA_INTEGRATION_BROKER = "localhost:9092"
+$env:MONGO_INTEGRATION_URI = "mongodb://127.0.0.1:27017"
+npm test -- --runTestsByPath tests/commitReconciliation.kafka.integration.test.js
+```
+
+It creates and removes a UUID-named test topic, consumer group, and MongoDB
+database. The Kafka group commits test offsets only; cleanup is enabled solely
+for an isolated test collection. The Kafka test is skipped unless both variables are
+set. MongoDB-only integration tests require `MONGO_INTEGRATION_URI`.
 
 Frontend static checks/build:
 

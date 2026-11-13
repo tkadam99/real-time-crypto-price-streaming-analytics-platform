@@ -63,4 +63,21 @@ describe("reconciliation consumer wiring", () => {
     expect(removeCommit).toHaveBeenCalledTimes(1);
     expect(mockWorker.drain).toHaveBeenCalledTimes(1);
   });
+
+  it("passes the configured cleanup flag to the tracked worker", async () => {
+    mockConsumer.on.mockReturnValue(jest.fn());
+    const config = require("../src/config");
+    const original = config.decisionCleanupEnabled;
+    config.decisionCleanupEnabled = true;
+    try {
+      const consumer = require("../src/kafkaConsumer");
+      consumer.startReconciliation();
+      expect(require("../src/commitReconciliation").createCommitReconciliation)
+        .toHaveBeenCalledWith(expect.objectContaining({ cleanupEnabled: true }));
+      consumer.beginConsumerShutdown();
+      await consumer.drainReconciliation();
+    } finally {
+      config.decisionCleanupEnabled = original;
+    }
+  });
 });

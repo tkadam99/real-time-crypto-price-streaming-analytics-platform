@@ -44,6 +44,7 @@ function startReconciliation() {
     collection: getDB().collection("alert_decisions"),
     groupId: consumerGroupId,
     topic: config.kafkaTopic,
+    cleanupEnabled: config.decisionCleanupEnabled,
   });
   reconciliationListeners.push(
     consumer.on(consumer.events.COMMIT_OFFSETS, () => reconciliation.schedule("commit"))
@@ -101,6 +102,12 @@ async function ensureIndexes() {
     { groupId: 1, topic: 1, partition: 1, offset: 1 },
     { name: "decision_group_topic_partition_offset" }
   );
+  if (config.decisionCleanupEnabled) {
+    await db.collection("alert_decisions").createIndex(
+      { groupId: 1, topic: 1, partition: 1, offset: 1, _id: 1 },
+      { name: "decision_cleanup_pagination" }
+    );
+  }
 }
 
 async function restoreAlertCooldowns() {

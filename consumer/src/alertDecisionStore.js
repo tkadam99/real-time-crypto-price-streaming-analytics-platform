@@ -45,8 +45,8 @@ function isValidCandidate(candidate) {
   );
 }
 
-function validateDecision(decision, id, description = "persisted alert decision") {
-  if (
+function isValidDecision(decision, id) {
+  return !(
     !decision ||
     typeof decision !== "object" ||
     Array.isArray(decision) ||
@@ -56,7 +56,11 @@ function validateDecision(decision, id, description = "persisted alert decision"
     !(decision.previousPrice === null || isPositiveNumber(decision.previousPrice)) ||
     typeof decision.percentChange !== "number" ||
     !Number.isFinite(decision.percentChange)
-  ) {
+  );
+}
+
+function validateDecision(decision, id, description = "persisted alert decision") {
+  if (!isValidDecision(decision, id)) {
     throw new Error(`Invalid ${description} for Kafka event ${id}.`);
   }
   return decision;
@@ -133,4 +137,4 @@ function createAlertDecisionStore(collection, groupId) {
   return { find, insertOriginal };
 }
 
-module.exports = { createAlertDecisionStore };
+module.exports = { createAlertDecisionStore, isValidDecision };

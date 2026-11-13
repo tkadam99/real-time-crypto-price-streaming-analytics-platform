@@ -616,6 +616,23 @@ button {
   word-break: break-word;
 }
 
+.dashboard-refresh-time {
+  color: var(--text-muted);
+  font-size: 0.9rem;
+  margin-top: 6px;
+}
+
+.market-freshness {
+  font-size: 0.9rem;
+  font-weight: 600;
+  text-transform: capitalize;
+}
+
+.market-freshness--fresh { color: #15803d; }
+.market-freshness--delayed { color: #a16207; }
+.market-freshness--stale { color: #b91c1c; }
+.market-freshness--unknown { color: #475569; }
+
 /* Metrics table */
 .table-wrapper {
   overflow-x: auto;

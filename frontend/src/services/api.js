@@ -1,5 +1,16 @@
 const API_BASE_URL = "http://localhost:5000/api";
 
+export async function fetchCurrentPrices(signal) {
+  const response = await fetch(`${API_BASE_URL}/prices/current`, {
+    cache: "no-store",
+    signal,
+  });
+  if (!response.ok) {
+    throw new Error("Failed to fetch current prices");
+  }
+  return response.json();
+}
+
 export async function fetchLatestPrices() {
   const response = await fetch(`${API_BASE_URL}/prices/latest`, {
     cache: "no-store",
@@ -10,9 +21,10 @@ export async function fetchLatestPrices() {
   return response.json();
 }
 
-export async function fetchMetrics() {
+export async function fetchMetrics(signal) {
   const response = await fetch(`${API_BASE_URL}/metrics`, {
     cache: "no-store",
+    signal,
   });
   if (!response.ok) {
     throw new Error("Failed to fetch metrics");
@@ -20,9 +32,10 @@ export async function fetchMetrics() {
   return response.json();
 }
 
-export async function fetchAlerts(limit = 10) {
+export async function fetchAlerts(limit = 10, signal) {
   const response = await fetch(`${API_BASE_URL}/alerts?limit=${limit}`, {
     cache: "no-store",
+    signal,
   });
   if (!response.ok) {
     throw new Error("Failed to fetch alerts");
@@ -30,10 +43,10 @@ export async function fetchAlerts(limit = 10) {
   return response.json();
 }
 
-export async function fetchPriceHistory(symbol = "BTC-USD", limit = 10) {
+export async function fetchPriceHistory(symbol = "BTC-USD", limit = 10, signal) {
   const response = await fetch(
     `${API_BASE_URL}/prices/history/${symbol}?limit=${limit}`,
-    { cache: "no-store" }
+    { cache: "no-store", signal }
   );
   if (!response.ok) {
     throw new Error("Failed to fetch price history");

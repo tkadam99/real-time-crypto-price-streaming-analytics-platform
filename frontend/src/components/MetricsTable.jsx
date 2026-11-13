@@ -7,7 +7,7 @@ import {
 export default function MetricsTable({ metrics = [] }) {
   return (
     <section className="dashboard-section">
-      <h2 className="dashboard-section-title">Metrics Snapshot</h2>
+      <h2 className="dashboard-section-title">Historical Metrics Snapshot</h2>
 
       <div className="table-wrapper">
         <table className="metrics-table">

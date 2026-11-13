@@ -513,6 +513,32 @@ describe("Kafka consumer message handling", () => {
     );
   });
 
+  it("builds the pagination index only when cleanup is enabled and fails startup on error", async () => {
+    const config = require("../src/config");
+    const decisions = indexCollections.get("alert_decisions");
+    expect(decisions.createIndex).not.toHaveBeenCalledWith(
+      { groupId: 1, topic: 1, partition: 1, offset: 1, _id: 1 },
+      { name: "decision_cleanup_pagination" }
+    );
+    const original = config.decisionCleanupEnabled;
+    config.decisionCleanupEnabled = true;
+    try {
+      decisions.createIndex.mockClear();
+      await startConsumer();
+      expect(decisions.createIndex).toHaveBeenCalledWith(
+        { groupId: 1, topic: 1, partition: 1, offset: 1, _id: 1 },
+        { name: "decision_cleanup_pagination" }
+      );
+      decisions.createIndex.mockClear();
+      decisions.createIndex.mockResolvedValueOnce("index").mockRejectedValueOnce(new Error("pagination index failure"));
+      mockConsumer.connect.mockClear();
+      await expect(startConsumer()).rejects.toThrow("pagination index failure");
+      expect(mockConsumer.connect).not.toHaveBeenCalled();
+    } finally {
+      config.decisionCleanupEnabled = original;
+    }
+  });
+
   it.each(["price_events", "alerts", "alert_decisions"])(
     "does not start consuming if the %s index build fails",
     async (collectionName) => {
