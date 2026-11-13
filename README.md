@@ -101,7 +101,7 @@ Coinbase WebSocket
 * The first minute of events after consumer startup warms up this history; no alert is evaluated until a valid one-minute baseline is available.
 * Each ticker is compared with the most recent event at or before one minute earlier. The baseline must be within 10 seconds of the target time; otherwise that ticker is skipped for alert evaluation.
 * An alert is created when the absolute percent change meets the configured threshold (0.5% by default), for either an increase or a decrease.
-* A five-minute cooldown is applied independently per symbol. Prices and metrics continue to be processed during cooldown.
+* A five-minute cooldown is applied independently per symbol. On restart, the consumer restores cooldowns from persisted alert event timestamps. Prices and metrics continue to be processed during cooldown.
 * Historical events remain stored, but pre-start events are not used as alert baselines.
 * `ALERT_WINDOW_MS`, `ALERT_BASELINE_TOLERANCE_MS`, `ALERT_THRESHOLD_PERCENT`, and `ALERT_COOLDOWN_MS` configure the alert window, baseline tolerance, threshold, and cooldown.
 

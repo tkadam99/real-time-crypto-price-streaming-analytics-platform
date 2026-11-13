@@ -174,7 +174,7 @@ The alert baseline is not simply the immediately preceding ticker:
 
 Defaults are a 60-second window and a 10-second tolerance. Thus, for an event at 12:01:00, the target is 12:00:00 and an event from 11:59:50 through 12:00:00 can qualify; an event after 12:00:00 cannot be used because it is newer than the target.
 
-The tracker stores timestamped prices separately for each symbol in process memory. It sorts out-of-order arrivals by their event timestamp and prunes history older than the window plus tolerance. It does not load the old `price_events` collection to seed alert baselines. Restarting the consumer therefore resets this in-memory comparison history and cooldown state.
+The tracker stores timestamped prices separately for each symbol in process memory. It sorts out-of-order arrivals by their event timestamp and prunes history older than the window plus tolerance. It does not load the old `price_events` collection to seed alert baselines, so restarting the consumer resets this comparison history. Cooldown state is restored separately from persisted alerts.
 
 ### 5.4 Alert threshold and cooldown
 
@@ -184,7 +184,7 @@ An alert is eligible when:
 absolute(percentChange) >= ALERT_THRESHOLD_PERCENT
 ```
 
-The default threshold is `0.5%`, so an increase or decrease of at least that magnitude qualifies. An alert is suppressed if the same symbol is still within its cooldown; the default cooldown is five minutes. Cooldown state is per symbol, and a successful database insert is followed by recording that symbol's alert time. Price events and metrics continue to be processed during warm-up and cooldown.
+The default threshold is `0.5%`, so an increase or decrease of at least that magnitude qualifies. An alert is suppressed if the same symbol is still within its cooldown; the default cooldown is five minutes. Cooldown state is per symbol, and a successful database insert is followed by recording that symbol's alert time. Before connecting to Kafka, the consumer restores each supported symbol's latest persisted alert event timestamp; startup fails if this state cannot be loaded or a supported symbol has an invalid alert timestamp. Price events and metrics continue to be processed during warm-up and cooldown.
 
 An alert document includes the symbol, type, message, percent change, current and baseline prices, current timestamp, comparison timestamp, and comparison-window duration.
 
@@ -344,7 +344,7 @@ The producer package does not currently have an automated test suite.
 
 - **Dashboard is fetch-based, not push-based.** It does not update continuously without another fetch.
 - **Chart and backend averages differ.** The backend uses five recent stored events by default; the chart uses up to 50 points but currently receives only 10 records.
-- **Alert state is volatile.** In-memory alert history and cooldowns reset when the consumer process restarts; the old MongoDB event history is not used to initialize the tracker.
+- **Alert baseline state is volatile.** The in-memory price history used for alert baselines resets on restart; old MongoDB price events are not used to initialize it. Cooldowns are restored from persisted alert timestamps, but concurrent consumers do not share live cooldown updates.
 - **Persistence retention is limited to raw events.** `price_events` is capped per symbol; alerts are not pruned by this setting.
 - **Single-broker infrastructure is not highly available.** The provided Compose configuration is for local development.
 - **Local MongoDB selection matters.** A host-installed MongoDB and the Compose MongoDB may be different instances even if both use port 27017 at different times or loopback addresses.

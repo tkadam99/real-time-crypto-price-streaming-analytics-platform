@@ -89,6 +89,87 @@ describeWithMongo("Kafka consumer MongoDB integration", () => {
     });
   }
 
+  it("restores the latest per-symbol cooldown after restart and ignores an older replay", async () => {
+    const btcEvents = [
+      { symbol: "BTC-USD", price: 100, timestamp: "2048-01-01T12:00:00.000Z" },
+      { symbol: "BTC-USD", price: 100, timestamp: "2048-01-01T12:01:00.000Z" },
+      { symbol: "BTC-USD", price: 101, timestamp: "2048-01-01T12:02:00.000Z" },
+      { symbol: "BTC-USD", price: 100, timestamp: "2048-01-01T12:07:00.000Z" },
+      { symbol: "BTC-USD", price: 101, timestamp: "2048-01-01T12:08:00.000Z" },
+    ];
+    const btcRecords = btcEvents.map((event, index) =>
+      record(event, String(300 + index))
+    );
+    for (const kafkaRecord of btcRecords) await eachMessage(kafkaRecord);
+    expect(await db.collection("alerts").countDocuments({ symbol: "BTC-USD" })).toBe(2);
+
+    await db.collection("alerts").insertMany([
+      { _id: "eth-older", symbol: "ETH-USD", timestamp: "2048-01-01T14:03:00+02:00" },
+      { _id: "eth-newer", symbol: "ETH-USD", timestamp: "2048-01-01T12:08:00.250Z" },
+    ]);
+
+    jest.resetModules();
+    mockConsumer.run.mockClear();
+    await require("../src/kafkaConsumer").startConsumer();
+    eachMessage = mockConsumer.run.mock.calls[0][0].eachMessage;
+
+    await eachMessage(btcRecords[2]);
+    await eachMessage(btcRecords[4]);
+    await eachMessage(record(
+      { symbol: "BTC-USD", price: 102, timestamp: "2048-01-01T12:09:00.000Z" },
+      "305"
+    ));
+
+    await eachMessage(record(
+      { symbol: "ETH-USD", price: 100, timestamp: "2048-01-01T12:08:30.000Z" },
+      "306"
+    ));
+    await eachMessage(record(
+      { symbol: "ETH-USD", price: 102, timestamp: "2048-01-01T12:09:30.000Z" },
+      "307"
+    ));
+
+    await eachMessage(record(
+      { symbol: "SOL-USD", price: 100, timestamp: "2048-01-01T12:08:00.000Z" },
+      "308"
+    ));
+    await eachMessage(record(
+      { symbol: "SOL-USD", price: 102, timestamp: "2048-01-01T12:09:00.000Z" },
+      "309"
+    ));
+
+    expect(await db.collection("alerts").countDocuments({ symbol: "BTC-USD" })).toBe(2);
+    expect(await db.collection("alerts").countDocuments({ symbol: "ETH-USD" })).toBe(2);
+    expect(await db.collection("alerts").countDocuments({ symbol: "SOL-USD" })).toBe(1);
+
+    await eachMessage(record(
+      { symbol: "BTC-USD", price: 100, timestamp: "2048-01-01T12:12:00.000Z" },
+      "310"
+    ));
+    await eachMessage(record(
+      { symbol: "BTC-USD", price: 102, timestamp: "2048-01-01T12:13:00.000Z" },
+      "311"
+    ));
+    expect(await db.collection("alerts").countDocuments({ symbol: "BTC-USD" })).toBe(3);
+  });
+
+  it("refuses startup when a supported symbol has an invalid persisted alert timestamp", async () => {
+    await db.collection("alerts").insertOne({
+      _id: "invalid-alert",
+      symbol: "BTC-USD",
+      timestamp: "invalid",
+    });
+    jest.resetModules();
+    mockConsumer.connect.mockClear();
+    mockConsumer.run.mockClear();
+
+    await expect(require("../src/kafkaConsumer").startConsumer()).rejects.toThrow(
+      "Cannot restore alert cooldown for BTC-USD: persisted alert timestamp is invalid."
+    );
+    expect(mockConsumer.connect).not.toHaveBeenCalled();
+    expect(mockConsumer.run).not.toHaveBeenCalled();
+  });
+
   it("creates the unique metrics index and persists replay/distinct records correctly", async () => {
     const indexes = await db.collection("metrics").listIndexes().toArray();
     expect(indexes).toEqual(

@@ -42,6 +42,51 @@ async function ensureIndexes() {
   );
 }
 
+async function restoreAlertCooldowns() {
+  const latestAlerts = await getDB()
+    .collection("alerts")
+    .aggregate([
+      { $match: { symbol: { $in: config.symbols } } },
+      {
+        $set: {
+          eventTime: {
+            $convert: {
+              input: "$timestamp",
+              to: "date",
+              onError: null,
+              onNull: null,
+            },
+          },
+        },
+      },
+      { $sort: { eventTime: -1, _id: 1 } },
+      {
+        $group: {
+          _id: "$symbol",
+          timestamp: { $first: "$eventTime" },
+          eventId: { $first: "$_id" },
+          invalidCount: {
+            $sum: { $cond: [{ $eq: ["$eventTime", null] }, 1, 0] },
+          },
+        },
+      },
+    ])
+    .toArray();
+
+  for (const alert of latestAlerts) {
+    if (alert.invalidCount > 0 || !alert.timestamp) {
+      throw new Error(
+        `Cannot restore alert cooldown for ${alert._id}: persisted alert timestamp is invalid.`
+      );
+    }
+    livePriceTracker.recordAlert(
+      alert._id,
+      alert.timestamp.toISOString(),
+      alert.eventId
+    );
+  }
+}
+
 function validateEvent(event) {
   if (!event || typeof event !== "object" || Array.isArray(event)) {
     return "event must be an object";
@@ -330,6 +375,7 @@ async function processMessage(event, kafkaRecord) {
 
 async function startConsumer() {
   await ensureIndexes();
+  await restoreAlertCooldowns();
   await consumer.connect();
   console.log(`Consumer connected to Kafka at ${config.kafkaBroker}`);
 
