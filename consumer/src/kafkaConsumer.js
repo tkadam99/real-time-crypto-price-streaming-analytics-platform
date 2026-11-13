@@ -18,6 +18,30 @@ const kafka = new Kafka({
 const consumer = kafka.consumer({ groupId: "crypto-analytics-group" });
 const livePriceTracker = createLivePriceTracker();
 
+async function ensureIndexes() {
+  const db = getDB();
+  const metricsCollection = db.collection("metrics");
+  const duplicateSymbols = await metricsCollection
+    .aggregate([
+      { $group: { _id: "$symbol", count: { $sum: 1 } } },
+      { $match: { count: { $gt: 1 } } },
+      { $limit: 10 },
+    ])
+    .toArray();
+
+  if (duplicateSymbols.length > 0) {
+    const symbols = duplicateSymbols.map(({ _id }) => _id).join(", ");
+    throw new Error(
+      `Cannot create unique metrics symbol index; duplicate symbols already exist: ${symbols}. Resolve these records before starting the consumer.`
+    );
+  }
+
+  await metricsCollection.createIndex(
+    { symbol: 1 },
+    { unique: true, name: "unique_metrics_symbol" }
+  );
+}
+
 function validateEvent(event) {
   if (!event || typeof event !== "object" || Array.isArray(event)) {
     return "event must be an object";
@@ -46,23 +70,86 @@ function validateEvent(event) {
   return null;
 }
 
-async function processMessage(event) {
+async function processMessage(event, kafkaRecord) {
   const db = getDB();
 
   const priceEventsCollection = db.collection("price_events");
   const metricsCollection = db.collection("metrics");
   const alertsCollection = db.collection("alerts");
+  const eventId = JSON.stringify([
+    kafkaRecord.topic,
+    kafkaRecord.partition,
+    kafkaRecord.message.offset,
+  ]);
+  const identity = { _id: eventId };
   const baseline = livePriceTracker.getBaseline(event.symbol, event.timestamp);
-  const previousPrice = baseline?.price ?? null;
-  const percentChange = calculatePercentChange(previousPrice, event.price);
+  const candidatePreviousPrice = baseline?.price ?? null;
+  const candidatePercentChange = calculatePercentChange(
+    candidatePreviousPrice,
+    event.price
+  );
+  const candidateAlert =
+    baseline &&
+    shouldCreateAlert(candidatePercentChange) &&
+    !livePriceTracker.isOnCooldown(event.symbol, event.timestamp, eventId)
+      ? buildAlert(
+          event.symbol,
+          candidatePercentChange,
+          event.price,
+          candidatePreviousPrice,
+          event.timestamp,
+          new Date(baseline.timestamp).toISOString(),
+          config.alertWindowMs
+        )
+      : null;
+  let storedEvent;
 
-  //Store raw price event
-  await priceEventsCollection.insertOne({
-    symbol: event.symbol,
-    price: event.price,
-    timestamp: event.timestamp,
-    receivedAt: new Date().toISOString(),
-  });
+  try {
+    const result = await priceEventsCollection.updateOne(
+      identity,
+      {
+        $setOnInsert: {
+          symbol: event.symbol,
+          price: event.price,
+          timestamp: event.timestamp,
+          receivedAt: new Date().toISOString(),
+          previousPrice: candidatePreviousPrice,
+          percentChange: candidatePercentChange,
+          alertCandidate: candidateAlert,
+        },
+      },
+      { upsert: true }
+    );
+    storedEvent =
+      result.upsertedCount === 1
+        ? {
+            previousPrice: candidatePreviousPrice,
+            percentChange: candidatePercentChange,
+            alertCandidate: candidateAlert,
+          }
+        : await priceEventsCollection.findOne(identity);
+  } catch (error) {
+    if (error.code !== 11000) throw error;
+
+    storedEvent = await priceEventsCollection.findOne(identity);
+    if (!storedEvent) throw error;
+  }
+  if (!storedEvent) {
+    throw new Error(`Kafka event ${eventId} could not be loaded after persistence.`);
+  }
+
+  const previousPrice =
+    storedEvent.previousPrice === undefined
+      ? candidatePreviousPrice
+      : storedEvent.previousPrice;
+  const percentChange =
+    storedEvent.percentChange === undefined
+      ? candidatePercentChange
+      : storedEvent.percentChange;
+  const alertCandidate =
+    storedEvent.alertCandidate === undefined
+      ? candidateAlert
+      : storedEvent.alertCandidate;
 
   //------------------------------------------------------------------------------------------------
 
@@ -134,67 +221,92 @@ async function processMessage(event) {
   };
 
   // Atomically keep snapshot fields from the newest event timestamp.
-  await metricsCollection.updateOne(
-    { symbol: event.symbol },
-    [
-      {
-        $set: {
-          symbol: { $literal: event.symbol },
-          latestPrice: {
-            $cond: [isNewerSnapshot, { $literal: event.price }, "$latestPrice"],
-          },
-          previousPrice: {
-            $cond: [isNewerSnapshot, { $literal: previousPrice }, "$previousPrice"],
-          },
-          movingAverage: {
-            $cond: [
-              shouldUpdateMovingAverage,
-              { $literal: Number(movingAverage.toFixed(4)) },
-              "$movingAverage",
-            ],
-          },
-          percentChange: {
-            $cond: [
-              isNewerSnapshot,
-              { $literal: Number(percentChange.toFixed(4)) },
-              "$percentChange",
-            ],
-          },
-          updatedAt: {
-            $cond: [
-              isNewerSnapshot,
-              { $literal: event.timestamp },
-              "$updatedAt",
-            ],
-          },
+  const metricsUpdatePipeline = [
+    {
+      $set: {
+        symbol: { $literal: event.symbol },
+        latestPrice: {
+          $cond: [isNewerSnapshot, { $literal: event.price }, "$latestPrice"],
+        },
+        previousPrice: {
+          $cond: [isNewerSnapshot, { $literal: previousPrice }, "$previousPrice"],
+        },
+        movingAverage: {
+          $cond: [
+            shouldUpdateMovingAverage,
+            { $literal: Number(movingAverage.toFixed(4)) },
+            "$movingAverage",
+          ],
+        },
+        percentChange: {
+          $cond: [
+            isNewerSnapshot,
+            { $literal: Number(percentChange.toFixed(4)) },
+            "$percentChange",
+          ],
+        },
+        updatedAt: {
+          $cond: [
+            isNewerSnapshot,
+            { $literal: event.timestamp },
+            "$updatedAt",
+          ],
         },
       },
-    ],
-    { upsert: true }
-  );
+    },
+  ];
 
-  livePriceTracker.recordPrice(event.symbol, event.price, event.timestamp);
-
-  // Create an alert only when a valid time-window comparison meets the threshold.
-  if (
-    baseline &&
-    shouldCreateAlert(percentChange) &&
-    !livePriceTracker.isOnCooldown(event.symbol, event.timestamp)
-  ) {
-    const alert = buildAlert(
-      event.symbol,
-      percentChange,
-      event.price,
-      previousPrice,
-      event.timestamp,
-      new Date(baseline.timestamp).toISOString(),
-      config.alertWindowMs
+  try {
+    await metricsCollection.updateOne(
+      { symbol: event.symbol },
+      metricsUpdatePipeline,
+      { upsert: true }
     );
+  } catch (error) {
+    if (error.code !== 11000) throw error;
 
-    await alertsCollection.insertOne(alert);
-    livePriceTracker.recordAlert(event.symbol, event.timestamp);
-    console.log("Alert created:", alert);
+    const existingMetrics = await metricsCollection.findOne({
+      symbol: event.symbol,
+    });
+    if (!existingMetrics) throw error;
+
+    await metricsCollection.updateOne(
+      { symbol: event.symbol },
+      metricsUpdatePipeline,
+      { upsert: false }
+    );
   }
+
+  if (alertCandidate) {
+    let alertCreated = false;
+    try {
+      const result = await alertsCollection.updateOne(
+        identity,
+        {
+          $setOnInsert: {
+            ...alertCandidate,
+          },
+        },
+        { upsert: true }
+      );
+      alertCreated = result.upsertedCount === 1;
+    } catch (error) {
+      if (error.code !== 11000) throw error;
+
+      const existingAlert = await alertsCollection.findOne(identity);
+      if (!existingAlert) throw error;
+    }
+
+    livePriceTracker.recordAlert(event.symbol, event.timestamp, eventId);
+    if (alertCreated) console.log("Alert created:", alertCandidate);
+  }
+
+  livePriceTracker.recordPrice(
+    event.symbol,
+    event.price,
+    event.timestamp,
+    eventId
+  );
 
   console.log("Processed event:", {
     symbol: event.symbol,
@@ -206,6 +318,7 @@ async function processMessage(event) {
 }
 
 async function startConsumer() {
+  await ensureIndexes();
   await consumer.connect();
   console.log(`Consumer connected to Kafka at ${config.kafkaBroker}`);
 
@@ -217,7 +330,7 @@ async function startConsumer() {
   console.log(`Consumer subscribed to topic: ${config.kafkaTopic}`);
 
   await consumer.run({
-    eachMessage: async ({ message }) => {
+    eachMessage: async ({ topic, partition, message }) => {
       if (!message.value) {
         console.warn("Discarding invalid Kafka event: message value is missing");
         return;
@@ -237,7 +350,7 @@ async function startConsumer() {
         return;
       }
 
-      await processMessage(event);
+      await processMessage(event, { topic, partition, message });
     },
   });
 }

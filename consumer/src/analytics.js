@@ -27,14 +27,25 @@ function createLivePriceTracker({
 
       return null;
     },
-    recordPrice(symbol, price, timestamp) {
+    recordPrice(symbol, price, timestamp, eventId) {
       const eventTime = Date.parse(timestamp);
       if (!Number.isFinite(eventTime)) return;
 
       const events = eventsBySymbol.get(symbol) || [];
+      if (
+        eventId !== undefined &&
+        events.some((event) => event.eventId === eventId)
+      ) {
+        return;
+      }
+
       let index = events.findIndex((event) => event.timestamp > eventTime);
       if (index === -1) index = events.length;
-      events.splice(index, 0, { price, timestamp: eventTime });
+      events.splice(index, 0, {
+        price,
+        timestamp: eventTime,
+        ...(eventId === undefined ? {} : { eventId }),
+      });
 
       const newestTime = events[events.length - 1].timestamp;
       const oldestNeededTime = newestTime - windowMs - baselineToleranceMs;
@@ -45,19 +56,20 @@ function createLivePriceTracker({
 
       eventsBySymbol.set(symbol, events);
     },
-    isOnCooldown(symbol, timestamp) {
+    isOnCooldown(symbol, timestamp, eventId) {
       const eventTime = Date.parse(timestamp);
-      const lastAlertTime = lastAlertBySymbol.get(symbol);
+      const lastAlert = lastAlertBySymbol.get(symbol);
       return (
-        lastAlertTime !== undefined &&
+        lastAlert !== undefined &&
+        !(eventId !== undefined && lastAlert.eventId === eventId) &&
         Number.isFinite(eventTime) &&
-        eventTime - lastAlertTime < cooldownMs
+        eventTime - lastAlert.timestamp < cooldownMs
       );
     },
-    recordAlert(symbol, timestamp) {
+    recordAlert(symbol, timestamp, eventId) {
       const eventTime = Date.parse(timestamp);
       if (Number.isFinite(eventTime)) {
-        lastAlertBySymbol.set(symbol, eventTime);
+        lastAlertBySymbol.set(symbol, { timestamp: eventTime, eventId });
       }
     },
   };

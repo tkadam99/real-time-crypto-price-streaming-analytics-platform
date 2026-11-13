@@ -21,14 +21,35 @@ describe("Kafka consumer message handling", () => {
   let errorSpy;
   let warnSpy;
   let eachMessage;
+  let indexCollections;
+  let nextOffset;
+  let testTopic;
+  let testSequence = 0;
 
   beforeEach(async () => {
     jest.clearAllMocks();
+    nextOffset = 0;
+    testTopic = `crypto-prices-test-${++testSequence}`;
     mockConsumer.connect.mockResolvedValue();
     mockConsumer.subscribe.mockResolvedValue();
     mockConsumer.run.mockResolvedValue();
     errorSpy = jest.spyOn(console, "error").mockImplementation(() => {});
     warnSpy = jest.spyOn(console, "warn").mockImplementation(() => {});
+
+    indexCollections = new Map();
+    getDB.mockReturnValue({
+      collection: jest.fn((name) => {
+        if (!indexCollections.has(name)) {
+          indexCollections.set(name, {
+            aggregate: jest.fn(() => ({
+              toArray: jest.fn().mockResolvedValue([]),
+            })),
+            createIndex: jest.fn().mockResolvedValue("index"),
+          });
+        }
+        return indexCollections.get(name);
+      }),
+    });
 
     await startConsumer();
     eachMessage = mockConsumer.run.mock.calls[0][0].eachMessage;
@@ -96,14 +117,18 @@ describe("Kafka consumer message handling", () => {
   }
 
   function configureDatabase(options = {}) {
-    const insertOne = options.insertOne || jest.fn().mockResolvedValue({});
+    const rawUpdateOne = options.rawUpdateOne || jest.fn();
     const updateOne = options.updateOne || jest.fn();
     const storedPriceEvents = [];
     const metricsDocuments = new Map();
-    if (!options.insertOne) {
-      insertOne.mockImplementation(async (event) => {
-        storedPriceEvents.push(event);
-        return {};
+    const alerts = new Map();
+    if (!options.rawUpdateOne) {
+      rawUpdateOne.mockImplementation(async (filter, update) => {
+        if (storedPriceEvents.some((event) => event._id === filter._id)) {
+          return { matchedCount: 1, upsertedCount: 0 };
+        }
+        storedPriceEvents.push({ _id: filter._id, ...update.$setOnInsert });
+        return { matchedCount: 0, upsertedCount: 1 };
       });
     }
 
@@ -126,14 +151,36 @@ describe("Kafka consumer message handling", () => {
           )
           .slice(0, recentEventsCursor.limitValue);
       }),
+      project: jest.fn(() => recentEventsCursor),
     };
     const priceEventsCollection = {
-      insertOne,
-      countDocuments: jest.fn().mockResolvedValue(1),
+      updateOne: rawUpdateOne,
+      findOne: jest.fn(async (filter) =>
+        storedPriceEvents.find((event) => event._id === filter._id) || null
+      ),
+      countDocuments: jest.fn(async ({ symbol }) =>
+        storedPriceEvents.filter((event) => event.symbol === symbol).length
+      ),
       find: jest.fn(() => recentEventsCursor),
     };
-    if (!options.updateOne) {
+    if (!options.updateOne || options.failMetricsOnce) {
+      let failedMetricsWrite = false;
+      let racedMetricsUpsert = false;
       updateOne.mockImplementation(async (filter, pipeline, updateOptions) => {
+        if (options.failMetricsOnce && !failedMetricsWrite) {
+          failedMetricsWrite = true;
+          throw options.failMetricsOnce;
+        }
+
+        if (options.metricsDuplicateRace && !racedMetricsUpsert) {
+          racedMetricsUpsert = true;
+          metricsDocuments.set(filter.symbol, {
+            symbol: filter.symbol,
+            ...options.metricsDuplicateRace.document,
+          });
+          throw options.metricsDuplicateRace.error;
+        }
+
         let document = metricsDocuments.get(filter.symbol);
         if (!document && updateOptions.upsert) {
           document = { symbol: filter.symbol };
@@ -153,21 +200,56 @@ describe("Kafka consumer message handling", () => {
         return {};
       });
     }
-    const metricsCollection = { updateOne };
+    const metricsCollection = {
+      updateOne,
+      findOne: jest.fn(async ({ symbol }) => metricsDocuments.get(symbol) || null),
+      createIndex: jest.fn().mockResolvedValue("unique_metrics_symbol"),
+      aggregate: jest.fn(() => ({ toArray: jest.fn().mockResolvedValue([]) })),
+    };
+    const alertUpdateOne = options.alertUpdateOne || jest.fn();
+    if (!options.alertUpdateOne) {
+      alertUpdateOne.mockImplementation(async (filter, update) => {
+        if (alerts.has(filter._id)) {
+          return { matchedCount: 1, upsertedCount: 0 };
+        }
+        alerts.set(filter._id, { _id: filter._id, ...update.$setOnInsert });
+        return { matchedCount: 0, upsertedCount: 1 };
+      });
+    }
+    const alertsCollection = {
+      updateOne: alertUpdateOne,
+      findOne: jest.fn(async (filter) => alerts.get(filter._id) || null),
+    };
 
     getDB.mockReturnValue({
       collection: jest.fn((name) => {
         if (name === "price_events") return priceEventsCollection;
         if (name === "metrics") return metricsCollection;
-        return { insertOne: jest.fn().mockResolvedValue({}) };
+        return alertsCollection;
       }),
     });
 
-    return { priceEventsCollection, metricsCollection, metricsDocuments };
+    return {
+      priceEventsCollection,
+      metricsCollection,
+      metricsDocuments,
+      storedPriceEvents,
+      alerts,
+      alertsCollection,
+      alertUpdateOne,
+    };
   }
 
-  function kafkaMessage(value) {
-    return { message: { value: Buffer.from(value) } };
+  function kafkaMessage(value, identity = {}) {
+    const { topic = testTopic, partition = 0, offset } = identity;
+    return {
+      topic,
+      partition,
+      message: {
+        value: Buffer.from(value),
+        offset: offset === undefined ? String(nextOffset++) : String(offset),
+      },
+    };
   }
 
   it.each(["BTC-USD", "ETH-USD", "SOL-USD"])(
@@ -184,8 +266,12 @@ describe("Kafka consumer message handling", () => {
         eachMessage(kafkaMessage(JSON.stringify(event)))
       ).resolves.toBeUndefined();
 
-      expect(priceEventsCollection.insertOne).toHaveBeenCalledWith(
-        expect.objectContaining(event)
+      expect(priceEventsCollection.updateOne).toHaveBeenCalledWith(
+        { _id: expect.any(String) },
+        {
+          $setOnInsert: expect.objectContaining(event),
+        },
+        { upsert: true }
       );
       expect(metricsDocuments.get(symbol)).toMatchObject({
         symbol,
@@ -198,17 +284,236 @@ describe("Kafka consumer message handling", () => {
     }
   );
 
+  it("creates a unique index on metrics.symbol before consuming", () => {
+    const metricsCollection = indexCollections.get("metrics");
+
+    expect(metricsCollection.createIndex).toHaveBeenCalledWith(
+      { symbol: 1 },
+      { unique: true, name: "unique_metrics_symbol" }
+    );
+    expect(metricsCollection.aggregate).toHaveBeenCalled();
+  });
+
+  it("refuses startup when duplicate metric symbols already exist", async () => {
+    const connectCallCount = mockConsumer.connect.mock.calls.length;
+    getDB.mockReturnValue({
+      collection: jest.fn(() => ({
+        aggregate: jest.fn(() => ({
+          toArray: jest.fn().mockResolvedValue([{ _id: "BTC-USD", count: 2 }]),
+        })),
+        createIndex: jest.fn(),
+      })),
+    });
+
+    await expect(startConsumer()).rejects.toThrow(
+      "duplicate symbols already exist: BTC-USD"
+    );
+    expect(mockConsumer.connect).toHaveBeenCalledTimes(connectCallCount);
+  });
+
+  it("persists one raw event and snapshot for the first Kafka record delivery", async () => {
+    const { storedPriceEvents, metricsDocuments } = configureDatabase();
+    const event = {
+      symbol: "BTC-USD",
+      price: 100,
+      timestamp: "2030-01-01T12:00:00.000Z",
+    };
+    const record = kafkaMessage(JSON.stringify(event), { offset: "42" });
+
+    await eachMessage(record);
+
+    expect(storedPriceEvents).toHaveLength(1);
+    expect(storedPriceEvents[0]._id).toBe(
+      JSON.stringify([testTopic, 0, "42"])
+    );
+    expect(metricsDocuments.get("BTC-USD").latestPrice).toBe(100);
+  });
+
+  it("replays the same Kafka record without duplicating raw history or the moving average", async () => {
+    const { storedPriceEvents, metricsDocuments } = configureDatabase();
+    const event = {
+      symbol: "BTC-USD",
+      price: 100,
+      timestamp: "2030-01-01T12:00:00.000Z",
+    };
+    const record = kafkaMessage(JSON.stringify(event), { offset: "42" });
+
+    await eachMessage(record);
+    await eachMessage(record);
+
+    expect(storedPriceEvents).toHaveLength(1);
+    expect(metricsDocuments.get("BTC-USD")).toMatchObject({
+      latestPrice: 100,
+      movingAverage: 100,
+      updatedAt: event.timestamp,
+    });
+  });
+
+  it("persists distinct Kafka records with identical market data", async () => {
+    const { storedPriceEvents, metricsDocuments } = configureDatabase();
+    const event = {
+      symbol: "BTC-USD",
+      price: 100,
+      timestamp: "2030-01-01T12:00:00.000Z",
+    };
+
+    await eachMessage(kafkaMessage(JSON.stringify(event), { offset: "42" }));
+    await eachMessage(kafkaMessage(JSON.stringify(event), { offset: "43" }));
+
+    expect(storedPriceEvents).toHaveLength(2);
+    expect(metricsDocuments.get("BTC-USD").movingAverage).toBe(100);
+  });
+
+  it("does not create duplicate spike alerts when the same Kafka record is replayed", async () => {
+    const { alerts, alertUpdateOne } = configureDatabase();
+    const records = [
+      {
+        symbol: "BTC-USD",
+        price: 100,
+        timestamp: "2040-01-01T12:00:00.000Z",
+      },
+      {
+        symbol: "BTC-USD",
+        price: 100,
+        timestamp: "2040-01-01T12:01:00.000Z",
+      },
+      {
+        symbol: "BTC-USD",
+        price: 102,
+        timestamp: "2040-01-01T12:02:00.000Z",
+      },
+    ];
+
+    await eachMessage(kafkaMessage(JSON.stringify(records[0]), { offset: "1" }));
+    await eachMessage(kafkaMessage(JSON.stringify(records[1]), { offset: "2" }));
+    const spikeRecord = kafkaMessage(JSON.stringify(records[2]), { offset: "3" });
+    await eachMessage(spikeRecord);
+    await eachMessage(spikeRecord);
+
+    expect(alerts.size).toBe(1);
+    expect(alertUpdateOne).toHaveBeenCalledTimes(2);
+    expect([...alerts.values()][0]).toMatchObject({
+      symbol: "BTC-USD",
+      percentChange: 2,
+      timestamp: records[2].timestamp,
+    });
+  });
+
+  it("recovers an alert write that failed after raw and metrics persistence", async () => {
+    const alertError = new Error("temporary alert persistence failure");
+    const alerts = new Map();
+    let failedFirstWrite = false;
+    const alertUpdateOne = jest.fn(async (filter, update) => {
+      if (!failedFirstWrite) {
+        failedFirstWrite = true;
+        throw alertError;
+      }
+      if (alerts.has(filter._id)) {
+        return { matchedCount: 1, upsertedCount: 0 };
+      }
+      alerts.set(filter._id, { _id: filter._id, ...update.$setOnInsert });
+      return { matchedCount: 0, upsertedCount: 1 };
+    });
+    const database = configureDatabase({ alertUpdateOne });
+    const records = [
+      {
+        symbol: "BTC-USD",
+        price: 100,
+        timestamp: "2045-01-01T12:00:00.000Z",
+      },
+      {
+        symbol: "BTC-USD",
+        price: 100,
+        timestamp: "2045-01-01T12:01:00.000Z",
+      },
+      {
+        symbol: "BTC-USD",
+        price: 102,
+        timestamp: "2045-01-01T12:02:00.000Z",
+      },
+    ];
+
+    await eachMessage(kafkaMessage(JSON.stringify(records[0]), { offset: "1" }));
+    await eachMessage(kafkaMessage(JSON.stringify(records[1]), { offset: "2" }));
+    const spikeRecord = kafkaMessage(JSON.stringify(records[2]), { offset: "3" });
+
+    await expect(eachMessage(spikeRecord)).rejects.toBe(alertError);
+    expect(database.storedPriceEvents[2].alertCandidate).toMatchObject({
+      percentChange: 2,
+      timestamp: records[2].timestamp,
+    });
+
+    await eachMessage(spikeRecord);
+
+    expect(database.storedPriceEvents).toHaveLength(3);
+    expect(database.metricsDocuments.get("BTC-USD").latestPrice).toBe(102);
+    expect(alerts.size).toBe(1);
+    expect(alertUpdateOne).toHaveBeenCalledTimes(2);
+  });
+
+  it("reprocesses downstream writes after raw persistence succeeded but metrics failed", async () => {
+    const failure = new Error("temporary metrics failure");
+    const database = configureDatabase({ failMetricsOnce: failure });
+    const event = {
+      symbol: "BTC-USD",
+      price: 100,
+      timestamp: "2042-01-01T12:00:00.000Z",
+    };
+    const record = kafkaMessage(JSON.stringify(event), { offset: "42" });
+
+    await expect(eachMessage(record)).rejects.toBe(failure);
+    await eachMessage(record);
+
+    expect(database.storedPriceEvents).toHaveLength(1);
+    expect(database.metricsDocuments.get("BTC-USD")).toMatchObject({
+      latestPrice: 100,
+      movingAverage: 100,
+    });
+    expect(database.metricsCollection.updateOne).toHaveBeenCalledTimes(2);
+  });
+
+  it("continues after an expected duplicate-key race when the Kafka record exists", async () => {
+    const duplicateError = Object.assign(new Error("duplicate key"), {
+      code: 11000,
+    });
+    let injectedDuplicate = false;
+    const database = configureDatabase({
+      rawUpdateOne: jest.fn(async (filter, update) => {
+        if (!injectedDuplicate) {
+          injectedDuplicate = true;
+          database.storedPriceEvents.push({
+            _id: filter._id,
+            ...update.$setOnInsert,
+          });
+          throw duplicateError;
+        }
+        return { matchedCount: 1, upsertedCount: 0 };
+      }),
+    });
+    const event = {
+      symbol: "BTC-USD",
+      price: 100,
+      timestamp: "2041-01-01T12:00:00.000Z",
+    };
+
+    await expect(
+      eachMessage(kafkaMessage(JSON.stringify(event), { offset: "42" }))
+    ).resolves.toBeUndefined();
+    expect(database.storedPriceEvents).toHaveLength(1);
+    expect(database.metricsDocuments.get("BTC-USD").latestPrice).toBe(100);
+  });
+
   it("keeps the normal chronological snapshot and analytics values", async () => {
     const { metricsDocuments } = configureDatabase();
     const firstEvent = {
       symbol: "BTC-USD",
       price: 100,
-      timestamp: "2030-01-01T12:00:00.000Z",
+      timestamp: "2050-01-01T12:00:00.000Z",
     };
     const secondEvent = {
       symbol: "BTC-USD",
       price: 110,
-      timestamp: "2030-01-01T12:01:00.000Z",
+      timestamp: "2050-01-01T12:01:00.000Z",
     };
 
     await eachMessage(kafkaMessage(JSON.stringify(firstEvent)));
@@ -229,17 +534,17 @@ describe("Kafka consumer message handling", () => {
       {
         symbol: "BTC-USD",
         price: 100,
-        timestamp: "2031-01-01T12:00:00.000Z",
+        timestamp: "2060-01-01T12:00:00.000Z",
       },
       {
         symbol: "BTC-USD",
         price: 110,
-        timestamp: "2031-01-01T12:01:00.000Z",
+        timestamp: "2060-01-01T12:01:00.000Z",
       },
       {
         symbol: "BTC-USD",
         price: 105,
-        timestamp: "2031-01-01T12:00:30.000Z",
+        timestamp: "2060-01-01T12:00:30.000Z",
       },
     ];
 
@@ -262,17 +567,17 @@ describe("Kafka consumer message handling", () => {
       {
         symbol: "BTC-USD",
         price: 100,
-        timestamp: "2032-01-01T12:00:00.000Z",
+        timestamp: "2070-01-01T12:00:00.000Z",
       },
       {
         symbol: "BTC-USD",
         price: 110,
-        timestamp: "2032-01-01T12:01:00.000Z",
+        timestamp: "2070-01-01T12:01:00.000Z",
       },
       {
         symbol: "BTC-USD",
         price: 120,
-        timestamp: "2032-01-01T12:01:00.000Z",
+        timestamp: "2070-01-01T12:01:00.000Z",
       },
     ];
 
@@ -294,7 +599,7 @@ describe("Kafka consumer message handling", () => {
     const event = {
       symbol: "ETH-USD",
       price: 2500,
-      timestamp: "2033-01-01T12:00:00.000Z",
+      timestamp: "2080-01-01T12:00:00.000Z",
     };
 
     await expect(eachMessage(kafkaMessage(JSON.stringify(event)))).resolves.toBeUndefined();
@@ -305,6 +610,41 @@ describe("Kafka consumer message handling", () => {
       previousPrice: null,
       movingAverage: 2500,
       percentChange: 0,
+      updatedAt: event.timestamp,
+    });
+  });
+
+  it("recovers a concurrent first metrics upsert through the unique symbol index", async () => {
+    const duplicateError = Object.assign(new Error("duplicate key"), {
+      code: 11000,
+    });
+    const database = configureDatabase({
+      metricsDuplicateRace: {
+        error: duplicateError,
+        document: {
+          latestPrice: 90,
+          previousPrice: 80,
+          movingAverage: 85,
+          percentChange: 12.5,
+          updatedAt: "2091-01-01T11:59:00.000Z",
+        },
+      },
+    });
+    const event = {
+      symbol: "BTC-USD",
+      price: 100,
+      timestamp: "2091-01-01T12:00:00.000Z",
+    };
+
+    await expect(eachMessage(kafkaMessage(JSON.stringify(event)))).resolves.toBeUndefined();
+
+    expect(database.metricsCollection.updateOne).toHaveBeenCalledTimes(2);
+    expect(database.metricsCollection.updateOne.mock.calls[1][2]).toEqual({
+      upsert: false,
+    });
+    expect(database.metricsDocuments.size).toBe(1);
+    expect(database.metricsDocuments.get("BTC-USD")).toMatchObject({
+      latestPrice: 100,
       updatedAt: event.timestamp,
     });
   });
@@ -441,7 +781,7 @@ describe("Kafka consumer message handling", () => {
   it("rejects the callback when MongoDB persistence fails", async () => {
     const persistenceError = new Error("MongoDB write failed");
     configureDatabase({
-      insertOne: jest.fn().mockRejectedValue(persistenceError),
+      rawUpdateOne: jest.fn().mockRejectedValue(persistenceError),
     });
     const event = {
       symbol: "BTC-USD",
@@ -463,7 +803,7 @@ describe("Kafka consumer message handling", () => {
     const event = {
       symbol: "BTC-USD",
       price: 100,
-      timestamp: "2034-01-01T12:00:00.000Z",
+      timestamp: "2090-01-01T12:00:00.000Z",
     };
 
     await expect(eachMessage(kafkaMessage(JSON.stringify(event)))).rejects.toBe(
