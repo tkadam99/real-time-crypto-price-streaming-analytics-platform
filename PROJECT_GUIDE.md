@@ -251,12 +251,12 @@ The API server, producer, and consumer load local environment variables with `do
 | `KAFKA_BROKER` | Producer, consumer | `localhost:9092` | Kafka broker address for locally run Node services. |
 | `KAFKA_TOPIC` | Producer, consumer | `crypto-prices` | Shared Kafka topic name. |
 | `COINBASE_WS_URL` | Producer | `wss://ws-feed.exchange.coinbase.com` | Coinbase WebSocket URL. |
-| `ALERT_WINDOW_MS` | Consumer | `60000` | Time window used to select an alert baseline. |
-| `ALERT_BASELINE_TOLERANCE_MS` | Consumer | `10000` | Maximum age gap between the target time and accepted baseline. |
-| `ALERT_THRESHOLD_PERCENT` | Consumer | `0.5` | Absolute percent change needed for an alert. |
-| `ALERT_COOLDOWN_MS` | Consumer | `300000` | Per-symbol alert cooldown. |
-| `MOVING_AVERAGE_WINDOW` | Consumer | `5` | Number of recent raw events used by the backend average. |
-| `MAX_EVENTS_PER_SYMBOL` | Consumer | `10000` | Raw event retention cap per symbol. |
+| `ALERT_WINDOW_MS` | Consumer | `60000` | Positive finite duration in milliseconds used to select an alert baseline. |
+| `ALERT_BASELINE_TOLERANCE_MS` | Consumer | `10000` | Nonnegative finite duration in milliseconds; zero requires an exact target-time baseline. |
+| `ALERT_THRESHOLD_PERCENT` | Consumer | `0.5` | Positive finite percent change needed for an alert. |
+| `ALERT_COOLDOWN_MS` | Consumer | `300000` | Nonnegative finite per-symbol cooldown in milliseconds; zero disables cooldown. |
+| `MOVING_AVERAGE_WINDOW` | Consumer | `5` | Positive safe integer number of recent raw events used by the backend average. |
+| `MAX_EVENTS_PER_SYMBOL` | Consumer | `10000` | Positive safe integer raw event retention cap per symbol. |
 
 The Coinbase product IDs are currently listed directly in `producer/src/config.js`: BTC-USD, ETH-USD, and SOL-USD. The chart's 50-point window and dashboard's 10-record history request are currently set in frontend source rather than environment variables.
 
