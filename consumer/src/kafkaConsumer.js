@@ -1,6 +1,8 @@
 const { Kafka } = require("kafkajs");
 const { getDB } = require("./mongoClient");
 const config = require("./config");
+const { createProcessingTimings } = require("./processingTimings");
+const { createAlertDecisionStore } = require("./alertDecisionStore");
 const {
   calculatePercentChange,
   calculateMovingAverage,
@@ -17,6 +19,7 @@ const kafka = new Kafka({
 
 const consumer = kafka.consumer({ groupId: "crypto-analytics-group" });
 const livePriceTracker = createLivePriceTracker();
+const processingTimings = config.processingTimings ? createProcessingTimings() : null;
 let shuttingDown = false;
 let activeMessages = 0;
 let resolveDrain;
@@ -212,40 +215,61 @@ function validateEvent(event) {
   return null;
 }
 
-async function processMessage(event, kafkaRecord) {
+async function processMessage(event, kafkaRecord, timing) {
   const db = getDB();
 
   const priceEventsCollection = db.collection("price_events");
   const metricsCollection = db.collection("metrics");
   const alertsCollection = db.collection("alerts");
+  const decisionStore = createAlertDecisionStore(db.collection("alert_decisions"));
   const eventId = JSON.stringify([
     kafkaRecord.topic,
     kafkaRecord.partition,
     kafkaRecord.message.offset,
   ]);
   const identity = { _id: eventId };
-  const baseline = livePriceTracker.getBaseline(event.symbol, event.timestamp);
-  const candidatePreviousPrice = baseline?.price ?? null;
-  const candidatePercentChange = calculatePercentChange(
-    candidatePreviousPrice,
-    event.price
-  );
-  const candidateAlert =
-    baseline &&
-    shouldCreateAlert(candidatePercentChange) &&
-    !livePriceTracker.isOnCooldown(event.symbol, event.timestamp, eventId)
-      ? buildAlert(
-          event.symbol,
-          candidatePercentChange,
-          event.price,
-          candidatePreviousPrice,
-          event.timestamp,
-          new Date(baseline.timestamp).toISOString(),
-          config.alertWindowMs
-        )
-      : null;
+  const kafkaIdentity = {
+    topic: kafkaRecord.topic,
+    partition: kafkaRecord.partition,
+    offset: kafkaRecord.message.offset,
+  };
+  if (timing) timing.start("decisionPersistence");
+  let decision = await decisionStore.find(kafkaIdentity);
+  if (!decision) {
+    const legacyEvent = await priceEventsCollection.findOne(identity);
+    let originalDecision;
+    if (legacyEvent && legacyEvent.alertCandidate !== undefined) {
+      originalDecision = {
+        alertCandidate: legacyEvent.alertCandidate,
+        previousPrice: legacyEvent.previousPrice,
+        percentChange: legacyEvent.percentChange,
+      };
+    } else {
+      const baseline = livePriceTracker.getBaseline(event.symbol, event.timestamp);
+      const previousPrice = baseline?.price ?? null;
+      const percentChange = calculatePercentChange(previousPrice, event.price);
+      const alertCandidate =
+        baseline &&
+        shouldCreateAlert(percentChange) &&
+        !livePriceTracker.isOnCooldown(event.symbol, event.timestamp, eventId)
+          ? buildAlert(
+              event.symbol,
+              percentChange,
+              event.price,
+              previousPrice,
+              event.timestamp,
+              new Date(baseline.timestamp).toISOString(),
+              config.alertWindowMs
+            )
+          : null;
+      originalDecision = { alertCandidate, previousPrice, percentChange };
+    }
+    decision = await decisionStore.insertOriginal(kafkaIdentity, originalDecision);
+  }
+  if (timing) timing.end();
   let storedEvent;
 
+  if (timing) timing.start("rawPersistence");
   try {
     const result = await priceEventsCollection.updateOne(
       identity,
@@ -255,50 +279,53 @@ async function processMessage(event, kafkaRecord) {
           price: event.price,
           timestamp: event.timestamp,
           receivedAt: new Date().toISOString(),
-          previousPrice: candidatePreviousPrice,
-          percentChange: candidatePercentChange,
-          alertCandidate: candidateAlert,
+          previousPrice: decision.previousPrice,
+          percentChange: decision.percentChange,
+          alertCandidate: decision.alertCandidate,
         },
       },
       { upsert: true }
     );
+    if (timing) timing.classify(result.upsertedCount === 1 ? "new" : "replay");
     storedEvent =
       result.upsertedCount === 1
         ? {
-            previousPrice: candidatePreviousPrice,
-            percentChange: candidatePercentChange,
-            alertCandidate: candidateAlert,
+            previousPrice: decision.previousPrice,
+            percentChange: decision.percentChange,
+            alertCandidate: decision.alertCandidate,
           }
         : await priceEventsCollection.findOne(identity);
   } catch (error) {
     if (error.code !== 11000) throw error;
 
+    if (timing) timing.classify("replay");
     storedEvent = await priceEventsCollection.findOne(identity);
     if (!storedEvent) throw error;
   }
   if (!storedEvent) {
     throw new Error(`Kafka event ${eventId} could not be loaded after persistence.`);
   }
+  if (timing) timing.end();
 
-  const alertCandidate =
-    storedEvent.alertCandidate === undefined
-      ? candidateAlert
-      : storedEvent.alertCandidate;
+  const alertCandidate = decision.alertCandidate;
 
   // Read history before retention pruning so the preceding event remains available.
+  if (timing) timing.start("recentHistory");
   const recentEvents = await priceEventsCollection
     .find({ symbol: event.symbol })
     .sort({ timestamp: -1, receivedAt: 1, _id: 1 })
     .limit(Math.max(config.movingAverageWindow, 2))
     .toArray();
+  if (timing) timing.end();
 
   const latestEvent = recentEvents[0] || event;
   const latestEventTime = Date.parse(latestEvent.timestamp);
-  const precedingEvent =
-    recentEvents.find(
-      (historyEvent) => Date.parse(historyEvent.timestamp) < latestEventTime
-    ) ||
-    (
+  let precedingEvent = recentEvents.find(
+    (historyEvent) => Date.parse(historyEvent.timestamp) < latestEventTime
+  );
+  if (!precedingEvent) {
+    if (timing) timing.start("predecessor");
+    precedingEvent = (
       await priceEventsCollection
         .find({
           symbol: event.symbol,
@@ -308,6 +335,9 @@ async function processMessage(event, kafkaRecord) {
         .limit(1)
         .toArray()
     )[0];
+    if (timing) timing.end();
+  }
+  if (timing) timing.start("metricsCalculation");
   const previousSnapshotPrice = precedingEvent?.price ?? null;
   const snapshotPercentChange = calculatePercentChange(
     previousSnapshotPrice,
@@ -387,6 +417,8 @@ async function processMessage(event, kafkaRecord) {
     },
   ];
 
+  if (timing) timing.end();
+  if (timing) timing.start("metricsPersistence");
   try {
     await metricsCollection.updateOne(
       { symbol: event.symbol },
@@ -407,23 +439,29 @@ async function processMessage(event, kafkaRecord) {
       { upsert: false }
     );
   }
+  if (timing) timing.end();
 
+  if (timing) timing.start("retentionQuery");
   const oldDocs = await priceEventsCollection
     .find({ symbol: event.symbol })
     .sort({ timestamp: -1, receivedAt: -1, _id: -1 })
     .skip(config.maxEventsPerSymbol)
     .project({ _id: 1 })
     .toArray();
+  if (timing) timing.end();
   if (oldDocs.length > 0) {
+    if (timing) timing.start("retentionDeletion");
     const result = await priceEventsCollection.deleteMany({
       symbol: event.symbol,
       _id: { $in: oldDocs.map((doc) => doc._id) },
     });
+    if (timing) timing.end();
     console.log(`Cleaned ${result.deletedCount} old events for ${event.symbol}`);
   }
 
   if (alertCandidate) {
     let alertCreated = false;
+    if (timing) timing.start("alertPersistence");
     try {
       const result = await alertsCollection.updateOne(
         identity,
@@ -441,6 +479,7 @@ async function processMessage(event, kafkaRecord) {
       const existingAlert = await alertsCollection.findOne(identity);
       if (!existingAlert) throw error;
     }
+    if (timing) timing.end();
 
     livePriceTracker.recordAlert(event.symbol, event.timestamp, eventId);
     if (alertCreated) console.log("Alert created:", alertCandidate);
@@ -507,7 +546,14 @@ async function startConsumer() {
           return;
         }
 
-        await processMessage(event, { topic, partition, message });
+        const timing = processingTimings ? processingTimings.beginEvent() : null;
+        try {
+          await processMessage(event, { topic, partition, message }, timing);
+          if (timing) timing.finish(true);
+        } catch (error) {
+          if (timing) timing.finish(false);
+          throw error;
+        }
       } catch (error) {
         if (shuttingDown) processingFailedDuringShutdown = true;
         throw error;

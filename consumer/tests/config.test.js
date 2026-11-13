@@ -6,15 +6,16 @@ const numericVariables = [
   "MOVING_AVERAGE_WINDOW",
   "MAX_EVENTS_PER_SYMBOL",
 ];
+const configVariables = [...numericVariables, "CONSUMER_PROCESSING_TIMINGS"];
 
 function loadConfig(overrides = {}) {
   const previousValues = Object.fromEntries(
-    numericVariables.map((name) => [name, process.env[name]])
+    configVariables.map((name) => [name, process.env[name]])
   );
   let config;
 
   try {
-    for (const name of numericVariables) delete process.env[name];
+    for (const name of configVariables) delete process.env[name];
     for (const [name, value] of Object.entries(overrides)) {
       if (value !== undefined) process.env[name] = value;
     }
@@ -45,6 +46,7 @@ describe("consumer numerical configuration", () => {
       alertCooldownMs: 300_000,
       movingAverageWindow: 5,
       maxEventsPerSymbol: 10_000,
+      processingTimings: false,
     });
   });
 
@@ -64,6 +66,19 @@ describe("consumer numerical configuration", () => {
     expect(config.alertCooldownMs).toBe(300_000);
     expect(config.movingAverageWindow).toBe(5);
     expect(config.maxEventsPerSymbol).toBe(10_000);
+  });
+
+  it.each([["true", true], ["false", false]])(
+    "configures processing timings with %s",
+    (value, expected) => {
+      expect(loadConfig({ CONSUMER_PROCESSING_TIMINGS: value }).processingTimings).toBe(expected);
+    }
+  );
+
+  it("rejects an invalid processing timings setting", () => {
+    expect(() => loadConfig({ CONSUMER_PROCESSING_TIMINGS: "yes" })).toThrow(
+      'CONSUMER_PROCESSING_TIMINGS must be "true" or "false"'
+    );
   });
 
   it("accepts positive fractional threshold and duration values", () => {

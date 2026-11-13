@@ -44,7 +44,7 @@ describeWithMongo("Kafka consumer MongoDB integration", () => {
   });
 
   beforeEach(async () => {
-    for (const name of ["price_events", "metrics", "alerts"]) {
+    for (const name of ["price_events", "metrics", "alerts", "alert_decisions"]) {
       await db.collection(name).deleteMany({});
     }
 
@@ -92,6 +92,68 @@ describeWithMongo("Kafka consumer MongoDB integration", () => {
       },
     });
   }
+
+  it("preserves a pruned late positive decision after alert failure and restart", async () => {
+    require("../src/config").maxEventsPerSymbol = 2;
+    const make = (offset, time, price) => record({
+      symbol: "BTC-USD", price, timestamp: `2053-01-01T12:${time}.000Z`,
+    }, offset);
+    await eachMessage(make("900", "01:00", 100));
+    await eachMessage(make("901", "02:05", 100));
+    await eachMessage(make("902", "02:10", 100));
+    const late = make("903", "02:00", 110);
+    const id = JSON.stringify(["integration-topic", 0, "903"]);
+    const failure = new Error("alert write failed after pruning");
+    withCollectionOverride("alerts", (collection) =>
+      overrideMethod(collection, "updateOne", jest.fn().mockRejectedValue(failure))
+    );
+    try {
+      await expect(eachMessage(late)).rejects.toBe(failure);
+      expect(await db.collection("price_events").findOne({ _id: id })).toBeNull();
+      expect(await db.collection("alert_decisions").findOne({ _id: id }))
+        .toMatchObject({ alertCandidate: { previousPrice: 100, currentPrice: 110, percentChange: 10 } });
+      expect(await db.collection("metrics").findOne({ symbol: "BTC-USD" }))
+        .toMatchObject({ latestPrice: 100, updatedAt: "2053-01-01T12:02:10.000Z" });
+    } finally {
+      global.__consumerIntegrationDB = db;
+    }
+
+    jest.resetModules();
+    mockConsumer.run.mockClear();
+    require("../src/config").maxEventsPerSymbol = 2;
+    await require("../src/kafkaConsumer").startConsumer();
+    eachMessage = mockConsumer.run.mock.calls[0][0].eachMessage;
+    await eachMessage(late);
+    await eachMessage(late);
+    expect(await db.collection("alerts").countDocuments({ _id: id })).toBe(1);
+    expect(await db.collection("alerts").findOne({ _id: id }))
+      .toMatchObject({ previousPrice: 100, currentPrice: 110, percentChange: 10 });
+    expect(await db.collection("price_events").countDocuments({ symbol: "BTC-USD" })).toBe(2);
+    expect(await db.collection("price_events").findOne({ _id: id })).toBeNull();
+
+    await eachMessage(make("904", "01:01", 100));
+    await eachMessage(make("905", "02:01", 110));
+    expect(await db.collection("alerts").countDocuments({ symbol: "BTC-USD" })).toBe(1);
+  });
+
+  it("preserves a pruned null decision even when a baseline later becomes available", async () => {
+    require("../src/config").maxEventsPerSymbol = 2;
+    const make = (offset, time, price) => record({
+      symbol: "ETH-USD", price, timestamp: `2053-01-01T12:${time}.000Z`,
+    }, offset);
+    const late = make("910", "02:00", 110);
+    const id = JSON.stringify(["integration-topic", 0, "910"]);
+    await eachMessage(late);
+    await eachMessage(make("911", "02:05", 100));
+    await eachMessage(make("912", "02:10", 100));
+    expect(await db.collection("price_events").findOne({ _id: id })).toBeNull();
+    await eachMessage(make("913", "01:00", 100));
+    await eachMessage(late);
+    expect(await db.collection("alert_decisions").findOne({ _id: id }))
+      .toMatchObject({ alertCandidate: null });
+    expect(await db.collection("alerts").countDocuments({ symbol: "ETH-USD" })).toBe(0);
+    expect(await db.collection("price_events").countDocuments({ symbol: "ETH-USD" })).toBe(2);
+  });
 
   it.each([false, true])(
     "drains an active real-MongoDB callback during shutdown (write failure: %s)",

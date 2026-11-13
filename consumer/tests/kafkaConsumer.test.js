@@ -136,6 +136,14 @@ describe("Kafka consumer message handling", () => {
     const storedPriceEvents = [];
     const metricsDocuments = new Map();
     const alerts = new Map();
+    const decisions = new Map();
+    const decisionsCollection = {
+      findOne: jest.fn(async ({ _id }) => decisions.get(_id) || null),
+      findOneAndUpdate: jest.fn(async ({ _id }, update) => {
+        if (!decisions.has(_id)) decisions.set(_id, update.$setOnInsert);
+        return decisions.get(_id);
+      }),
+    };
     if (!options.rawUpdateOne) {
       rawUpdateOne.mockImplementation(async (filter, update) => {
         if (storedPriceEvents.some((event) => event._id === filter._id)) {
@@ -294,6 +302,7 @@ describe("Kafka consumer message handling", () => {
       collection: jest.fn((name) => {
         if (name === "price_events") return priceEventsCollection;
         if (name === "metrics") return metricsCollection;
+        if (name === "alert_decisions") return decisionsCollection;
         return alertsCollection;
       }),
     });
@@ -306,6 +315,8 @@ describe("Kafka consumer message handling", () => {
       alerts,
       alertsCollection,
       alertUpdateOne,
+      decisions,
+      decisionsCollection,
     };
   }
 
@@ -320,6 +331,126 @@ describe("Kafka consumer message handling", () => {
       },
     };
   }
+
+  it("migrates a legacy null decision rather than recalculating it", async () => {
+    const database = configureDatabase();
+    const record = kafkaMessage(JSON.stringify({
+      symbol: "BTC-USD", price: 105, timestamp: "2030-01-01T12:01:00Z",
+    }), { offset: "42" });
+    const id = JSON.stringify([record.topic, 0, "42"]);
+    database.storedPriceEvents.push({
+      _id: id, symbol: "BTC-USD", price: 105, timestamp: "2030-01-01T12:01:00Z",
+      receivedAt: "2030-01-01T12:01:01Z", alertCandidate: null,
+      previousPrice: 100, percentChange: 5,
+    });
+
+    await eachMessage(record);
+    expect(database.decisions.get(id)).toEqual({
+      _id: id, alertCandidate: null, previousPrice: 100, percentChange: 5,
+    });
+    expect(database.alertUpdateOne).not.toHaveBeenCalled();
+  });
+
+  it("migrates a legacy positive alert with its original payload", async () => {
+    const database = configureDatabase();
+    const record = kafkaMessage(JSON.stringify({
+      symbol: "BTC-USD", price: 105, timestamp: "2030-01-01T12:01:00Z",
+    }), { offset: "43" });
+    const id = JSON.stringify([record.topic, 0, "43"]);
+    const alertCandidate = require("../src/analytics").buildAlert(
+      "BTC-USD", 5, 105, 100, "2030-01-01T12:01:00Z", "2030-01-01T12:00:00Z", 60000
+    );
+    database.storedPriceEvents.push({
+      _id: id, symbol: "BTC-USD", price: 105, timestamp: "2030-01-01T12:01:00Z",
+      receivedAt: "2030-01-01T12:01:01Z", alertCandidate,
+      previousPrice: 100, percentChange: 5,
+    });
+
+    await eachMessage(record);
+    expect(database.decisions.get(id)).toEqual({
+      _id: id, alertCandidate, previousPrice: 100, percentChange: 5,
+    });
+    expect(database.alerts.get(id)).toEqual({ _id: id, ...alertCandidate });
+  });
+
+  it("uses a concurrent decision-store winner rather than its local candidate", async () => {
+    const database = configureDatabase();
+    const record = kafkaMessage(JSON.stringify({
+      symbol: "BTC-USD", price: 105, timestamp: "2030-01-01T12:01:00Z",
+    }), { offset: "44" });
+    const id = JSON.stringify([record.topic, 0, "44"]);
+    const alertCandidate = require("../src/analytics").buildAlert(
+      "BTC-USD", 5, 105, 100, "2030-01-01T12:01:00Z", "2030-01-01T12:00:00Z", 60000
+    );
+    database.decisionsCollection.findOneAndUpdate.mockResolvedValueOnce({
+      _id: id, alertCandidate, previousPrice: 100, percentChange: 5,
+    });
+
+    await eachMessage(record);
+    expect(database.alerts.get(id)).toEqual({ _id: id, ...alertCandidate });
+    expect(database.storedPriceEvents[0]).toMatchObject({
+      alertCandidate, previousPrice: 100, percentChange: 5,
+    });
+  });
+
+  it("propagates decision read and write failures before raw persistence", async () => {
+    const database = configureDatabase();
+    const record = kafkaMessage(JSON.stringify({
+      symbol: "ETH-USD", price: 100, timestamp: "2030-01-01T12:00:00Z",
+    }));
+    const failure = new Error("decision store failed");
+    database.decisionsCollection.findOne.mockRejectedValueOnce(failure);
+    await expect(eachMessage(record)).rejects.toBe(failure);
+    database.decisionsCollection.findOneAndUpdate.mockRejectedValueOnce(failure);
+    await expect(eachMessage(record)).rejects.toBe(failure);
+    expect(database.priceEventsCollection.updateOne).not.toHaveBeenCalled();
+    await expect(eachMessage(record)).resolves.toBeUndefined();
+  });
+
+  it("rejects malformed durable decisions before raw persistence", async () => {
+    const database = configureDatabase();
+    const record = kafkaMessage(JSON.stringify({
+      symbol: "BTC-USD", price: 100, timestamp: "2030-01-01T12:00:00Z",
+    }));
+    const id = JSON.stringify([record.topic, 0, record.message.offset]);
+    database.decisions.set(id, { _id: id, alertCandidate: {} });
+    await expect(eachMessage(record)).rejects.toThrow("Invalid persisted alert decision");
+    expect(database.priceEventsCollection.updateOne).not.toHaveBeenCalled();
+  });
+
+  it("reuses a saved decision when raw persistence fails before insertion", async () => {
+    const failure = new Error("raw write failed");
+    const database = configureDatabase();
+    const record = kafkaMessage(JSON.stringify({
+      symbol: "SOL-USD", price: 100, timestamp: "2030-01-01T12:00:00Z",
+    }));
+    database.priceEventsCollection.updateOne.mockRejectedValueOnce(failure);
+    await expect(eachMessage(record)).rejects.toBe(failure);
+    expect(database.decisions.size).toBe(1);
+    await expect(eachMessage(record)).resolves.toBeUndefined();
+    expect(database.decisionsCollection.findOneAndUpdate).toHaveBeenCalledTimes(1);
+  });
+
+  it("replays idempotently if processing fails after alert persistence", async () => {
+    const database = configureDatabase();
+    const make = (offset, timestamp, price) => kafkaMessage(JSON.stringify({
+      symbol: "BTC-USD", price, timestamp,
+    }), { offset });
+    await eachMessage(make("70", "2038-01-01T12:00:00Z", 100));
+    const spike = make("71", "2038-01-01T12:01:00Z", 110);
+    const failure = new Error("failure after alert persistence");
+    const log = jest.spyOn(console, "log").mockImplementation((message) => {
+      if (message === "Alert created:") throw failure;
+    });
+    try {
+      await expect(eachMessage(spike)).rejects.toBe(failure);
+      expect(database.alerts.size).toBe(1);
+      await expect(eachMessage(spike)).resolves.toBeUndefined();
+      expect(database.alerts.size).toBe(1);
+    } finally {
+      log.mockRestore();
+    }
+  });
 
   it.each(["BTC-USD", "ETH-USD", "SOL-USD"])(
     "processes a valid %s event after persistence and metric update",

@@ -225,6 +225,13 @@ An append-only record for each alert successfully inserted. The collection may n
 
 After computing analytics and updating metrics, the consumer enforces `MAX_EVENTS_PER_SYMBOL` (default `10000`) for raw price events by scanning each symbol in reverse `(timestamp, receivedAt, _id)` order, skipping the newest entries up to the cap, and deleting the remaining IDs for that symbol. It repeats this check on replay so a failed prune can be retried. The read and delete are not atomic across concurrent consumers or other writers, so the exact cap is not guaranteed during concurrent processing. A replay of an already-pruned Kafka record can recreate it before the next prune. This retention process does not apply the same cap to the metrics or alerts collections.
 
+The consumer persists original alert decisions in `alert_decisions` independently
+of raw history, keyed by Kafka topic, partition, and offset. On replay, it uses
+the persisted positive or null decision; a valid decision in a legacy raw record
+is migrated if no separate decision exists. Legacy decisions already lost to
+retention cannot be reconstructed. Decision records currently have no cleanup
+policy and will accumulate until a commit-aware lifecycle is implemented.
+
 On startup, the consumer ensures a unique `metrics.symbol` index, two non-unique
 `price_events` indexes on `(symbol, timestamp, receivedAt, _id)` for the
 different existing sort directions, and a non-unique descending
@@ -270,6 +277,23 @@ The API server, producer, and consumer load local environment variables with `do
 | `ALERT_COOLDOWN_MS` | Consumer | `300000` | Nonnegative finite per-symbol cooldown in milliseconds; zero disables cooldown. |
 | `MOVING_AVERAGE_WINDOW` | Consumer | `5` | Positive safe integer number of recent raw events used by the backend average. |
 | `MAX_EVENTS_PER_SYMBOL` | Consumer | `10000` | Positive safe integer raw event retention cap per symbol. |
+| `CONSUMER_PROCESSING_TIMINGS` | Consumer | `false` | Set to `true` to enable aggregate consumer processing timing logs; `false` disables them. Other values fail startup. |
+
+When enabled, the consumer emits a JSON timing summary at most once per minute
+when completed processing attempts were recorded. It uses a monotonic clock and
+reports successful event counts and total processing time, failed attempt counts,
+and per-operation counts, totals, averages, p50, and p95 in milliseconds. Operation
+measurements include failed operations up to the point of failure; optional
+operations have zero counts when not executed. Summaries distinguish newly
+inserted records, recognized replays, and attempts whose identity could not yet
+be determined. A replay whose raw record was already pruned can be classified as
+new. Counts and totals cover the entire reporting interval, while percentiles use
+the most recent 1,024 samples per operation and classification. In-flight work is
+reported in the interval when it finishes; shutdown or a crash can lose an
+unreported interval. The event timer starts after validation and excludes Kafka
+fetching and offset commits. Enabling timing adds clock reads, bounded memory,
+and periodic logging. `decisionPersistence` covers decision lookup, legacy
+lookup, calculation when needed, and decision insertion.
 
 The Coinbase product IDs are currently listed directly in `producer/src/config.js`: BTC-USD, ETH-USD, and SOL-USD. The chart's 50-point window and dashboard's 10-record history request are currently set in frontend source rather than environment variables.
 

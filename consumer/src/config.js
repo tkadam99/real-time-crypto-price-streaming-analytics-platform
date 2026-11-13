@@ -14,12 +14,20 @@ function readNumericSetting(name, defaultValue, isValid, constraint) {
   return value;
 }
 
+function readBooleanSetting(name) {
+  const value = process.env[name];
+  if (value === undefined || value === "false") return false;
+  if (value === "true") return true;
+  throw new Error(`${name} must be "true" or "false"; received ${JSON.stringify(value)}.`);
+}
+
 module.exports = {
   kafkaBroker: process.env.KAFKA_BROKER || "localhost:9092",
   kafkaTopic: process.env.KAFKA_TOPIC || "crypto-prices",
   mongoUri: process.env.MONGO_URI || "mongodb://localhost:27017",
   dbName: process.env.DB_NAME || "crypto_analytics",
   symbols: ["BTC-USD", "ETH-USD", "SOL-USD"],
+  processingTimings: readBooleanSetting("CONSUMER_PROCESSING_TIMINGS"),
   alertThresholdPercent: readNumericSetting(
     "ALERT_THRESHOLD_PERCENT",
     0.5,
