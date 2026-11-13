@@ -71,15 +71,25 @@ async function restoreAlertCooldowns() {
           },
         },
       },
-      { $sort: { eventTime: -1, _id: 1 } },
       {
         $group: {
           _id: "$symbol",
-          timestamp: { $first: "$eventTime" },
-          eventId: { $first: "$_id" },
+          latest: {
+            $top: {
+              sortBy: { eventTime: -1, _id: 1 },
+              output: { timestamp: "$eventTime", eventId: "$_id" },
+            },
+          },
           invalidCount: {
             $sum: { $cond: [{ $eq: ["$eventTime", null] }, 1, 0] },
           },
+        },
+      },
+      {
+        $project: {
+          timestamp: "$latest.timestamp",
+          eventId: "$latest.eventId",
+          invalidCount: 1,
         },
       },
     ])
@@ -135,15 +145,15 @@ async function restorePriceBaselines() {
       -8640000000000000,
       entry.latest.getTime() - config.alertWindowMs - config.alertBaselineToleranceMs
     ));
-    const history = await collection.aggregate([
+    const history = collection.aggregate([
       { $match: { symbol } },
       { $set: { eventTime } },
       { $match: { eventTime: { $gte: earliest, $lte: entry.latest } } },
       { $sort: { eventTime: 1, receivedAt: 1, _id: 1 } },
       { $project: { symbol: 1, price: 1, timestamp: 1 } },
-    ]).toArray();
+    ]);
 
-    for (const event of history) {
+    for await (const event of history) {
       const validationError = validateEvent(event);
       if (validationError) {
         throw new Error(

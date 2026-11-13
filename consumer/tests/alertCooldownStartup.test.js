@@ -70,6 +70,12 @@ describe("alert cooldown restoration at startup", () => {
     expect(alertsAggregate).toHaveBeenCalledWith(
       expect.arrayContaining([
         { $match: { symbol: { $in: ["BTC-USD", "ETH-USD", "SOL-USD"] } } },
+        { $group: expect.objectContaining({
+          latest: { $top: {
+            sortBy: { eventTime: -1, _id: 1 },
+            output: { timestamp: "$eventTime", eventId: "$_id" },
+          } },
+        }) },
       ])
     );
     expect(tracker.isOnCooldown("BTC-USD", "2040-01-01T12:09:00.000Z")).toBe(false);

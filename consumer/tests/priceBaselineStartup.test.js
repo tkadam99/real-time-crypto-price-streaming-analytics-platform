@@ -35,6 +35,9 @@ describe("price baseline restoration at startup", () => {
         const symbol = pipeline[0].$match.symbol;
         return typeof symbol === "string" ? histories[symbol] || [] : groups;
       }),
+      async *[Symbol.asyncIterator]() {
+        yield* histories[pipeline[0].$match.symbol] || [];
+      },
     }));
     const metrics = {
       aggregate: jest.fn(() => ({ toArray: jest.fn().mockResolvedValue([]) })),
@@ -160,13 +163,45 @@ describe("price baseline restoration at startup", () => {
     const firstQuery = priceAggregate.getMockImplementation();
     priceAggregate.mockImplementation((pipeline) => {
       if (typeof pipeline[0].$match.symbol === "string") {
-        return { toArray: jest.fn().mockRejectedValue(failure) };
+        return {
+          async *[Symbol.asyncIterator]() {
+            throw failure;
+          },
+        };
       }
       return firstQuery(pipeline);
     });
 
     await expect(startConsumer()).rejects.toBe(failure);
     expect(mockConsumer.connect).not.toHaveBeenCalled();
+  });
+
+  it("does not start consuming if a history cursor fails after yielding an event", async () => {
+    groups = [{
+      _id: "BTC-USD",
+      latest: new Date("2040-01-01T12:01:00Z"),
+      invalidCount: 0,
+    }];
+    const failure = new Error("history cursor interrupted");
+    const firstQuery = priceAggregate.getMockImplementation();
+    priceAggregate.mockImplementation((pipeline) => {
+      if (typeof pipeline[0].$match.symbol === "string") {
+        return {
+          async *[Symbol.asyncIterator]() {
+            yield {
+              _id: "first", symbol: "BTC-USD", price: 100,
+              timestamp: "2040-01-01T12:00:00Z",
+            };
+            throw failure;
+          },
+        };
+      }
+      return firstQuery(pipeline);
+    });
+
+    await expect(startConsumer()).rejects.toBe(failure);
+    expect(mockConsumer.connect).not.toHaveBeenCalled();
+    expect(mockConsumer.run).not.toHaveBeenCalled();
   });
 
   it("rejects malformed persisted history before consuming", async () => {

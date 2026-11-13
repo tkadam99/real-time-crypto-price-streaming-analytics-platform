@@ -335,7 +335,7 @@ describeWithMongo("Kafka consumer MongoDB integration", () => {
       { $sort: { eventTime: 1, receivedAt: 1, _id: 1 } },
       { $project: { symbol: 1, price: 1, timestamp: 1 } },
     ];
-    const cooldownPipeline = [
+    const previousCooldownPipeline = [
       { $match: { symbol: { $in: config.symbols } } },
       { $set: { eventTime: restoredTime } },
       { $sort: { eventTime: -1, _id: 1 } },
@@ -344,6 +344,21 @@ describeWithMongo("Kafka consumer MongoDB integration", () => {
         timestamp: { $first: "$eventTime" },
         eventId: { $first: "$_id" },
         invalidCount: { $sum: { $cond: [{ $eq: ["$eventTime", null] }, 1, 0] } },
+      } },
+    ];
+    const cooldownPipeline = [
+      { $match: { symbol: { $in: config.symbols } } },
+      { $set: { eventTime: restoredTime } },
+      { $group: {
+        _id: "$symbol",
+        latest: { $top: {
+          sortBy: { eventTime: -1, _id: 1 },
+          output: { timestamp: "$eventTime", eventId: "$_id" },
+        } },
+        invalidCount: { $sum: { $cond: [{ $eq: ["$eventTime", null] }, 1, 0] } },
+      } },
+      { $project: {
+        timestamp: "$latest.timestamp", eventId: "$latest.eventId", invalidCount: 1,
       } },
     ];
     const plans = {
@@ -362,8 +377,16 @@ describeWithMongo("Kafka consumer MongoDB integration", () => {
         .sort({ symbol: 1 }).explain("executionStats"),
     };
     const baselineExplain = await prices.aggregate(baselinePipeline).explain("executionStats");
+    const previousCooldownExplain = await db.collection("alerts")
+      .aggregate(previousCooldownPipeline).explain("executionStats");
     const cooldownExplain = await db.collection("alerts").aggregate(cooldownPipeline)
       .explain("executionStats");
+    const sortBySymbol = (a, b) => a._id.localeCompare(b._id);
+    expect((await db.collection("alerts").aggregate(cooldownPipeline).toArray()).sort(sortBySymbol))
+      .toEqual((await db.collection("alerts").aggregate(previousCooldownPipeline).toArray())
+        .sort(sortBySymbol));
+    expect(previousCooldownExplain.stages.some((stage) => stage.$sort)).toBe(true);
+    expect(cooldownExplain.stages.some((stage) => stage.$sort)).toBe(false);
 
     for (const name of ["history", "analytics"]) {
       expect(planSummary(plans[name]).indexes).toContain("price_symbol_timestamp_received_id");
@@ -390,6 +413,7 @@ describeWithMongo("Kafka consumer MongoDB integration", () => {
     ));
     for (const [name, explanation] of [
       ["baseline restoration", baselineExplain],
+      ["previous cooldown restoration", previousCooldownExplain],
       ["cooldown restoration", cooldownExplain],
     ]) {
       const cursor = explanation.stages.find((stage) => stage.$cursor).$cursor;
@@ -434,7 +458,7 @@ describeWithMongo("Kafka consumer MongoDB integration", () => {
   it("restores out-of-order and equal timestamps deterministically without using future baselines", async () => {
     const history = [
       { _id: "late", symbol: "SOL-USD", price: 999, timestamp: "2051-01-01T12:00:30.000Z", receivedAt: "2051-01-01T12:02:00.000Z" },
-      { _id: "second", symbol: "SOL-USD", price: 101, timestamp: "2051-01-01T12:00:00.000Z", receivedAt: "2051-01-01T12:01:01.000Z" },
+      { _id: "second", symbol: "SOL-USD", price: 101, timestamp: "2051-01-01T14:00:00.000+02:00", receivedAt: "2051-01-01T12:01:01.000Z" },
       { _id: "first", symbol: "SOL-USD", price: 100, timestamp: "2051-01-01T12:00:00.000Z", receivedAt: "2051-01-01T12:01:00.000Z" },
     ];
     await db.collection("price_events").insertMany(history);
@@ -454,6 +478,27 @@ describeWithMongo("Kafka consumer MongoDB integration", () => {
       comparisonTimestamp: "2051-01-01T12:00:00.000Z",
       percentChange: 1.9802,
     });
+  });
+
+  it("restores equal-time cooldowns using the lowest identity and converted event time", async () => {
+    await db.collection("alerts").insertMany([
+      { _id: "z", symbol: "BTC-USD", timestamp: "2048-01-01T14:08:00+02:00" },
+      { _id: "a", symbol: "BTC-USD", timestamp: "2048-01-01T12:08:00.000Z" },
+      { _id: "old", symbol: "BTC-USD", timestamp: "2048-01-01T12:07:00.000Z" },
+      { _id: "eth", symbol: "ETH-USD", timestamp: new Date("2048-01-01T12:03:00.000Z") },
+    ]);
+
+    jest.resetModules();
+    const analytics = require("../src/analytics");
+    const tracker = analytics.createLivePriceTracker();
+    jest.spyOn(analytics, "createLivePriceTracker").mockReturnValue(tracker);
+    mockConsumer.run.mockClear();
+    await require("../src/kafkaConsumer").startConsumer();
+
+    expect(tracker.isOnCooldown("BTC-USD", "2048-01-01T12:09:00Z", "a")).toBe(false);
+    expect(tracker.isOnCooldown("BTC-USD", "2048-01-01T12:09:00Z", "z")).toBe(true);
+    expect(tracker.isOnCooldown("ETH-USD", "2048-01-01T12:07:59Z")).toBe(true);
+    expect(tracker.isOnCooldown("ETH-USD", "2048-01-01T12:08:00Z")).toBe(false);
   });
 
   it("restores the latest per-symbol cooldown after restart and ignores an older replay", async () => {
@@ -521,11 +566,10 @@ describeWithMongo("Kafka consumer MongoDB integration", () => {
   });
 
   it("refuses startup when a supported symbol has an invalid persisted alert timestamp", async () => {
-    await db.collection("alerts").insertOne({
-      _id: "invalid-alert",
-      symbol: "BTC-USD",
-      timestamp: "invalid",
-    });
+    await db.collection("alerts").insertMany([
+      { _id: "valid-alert", symbol: "BTC-USD", timestamp: "2048-01-01T12:08:00.000Z" },
+      { _id: "invalid-alert", symbol: "BTC-USD", timestamp: "invalid" },
+    ]);
     jest.resetModules();
     mockConsumer.connect.mockClear();
     mockConsumer.run.mockClear();

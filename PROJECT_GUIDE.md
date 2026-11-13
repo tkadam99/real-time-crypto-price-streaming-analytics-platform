@@ -174,7 +174,7 @@ The alert baseline is not simply the immediately preceding ticker:
 
 Defaults are a 60-second window and a 10-second tolerance. Thus, for an event at 12:01:00, the target is 12:00:00 and an event from 11:59:50 through 12:00:00 can qualify; an event after 12:00:00 cannot be used because it is newer than the target.
 
-The tracker stores timestamped prices separately for each symbol in process memory. It sorts out-of-order arrivals by their event timestamp and prunes history older than the window plus tolerance. Before consuming, the consumer restores retained `price_events` within that horizon relative to each symbol's newest persisted event. Events are ordered by event time, then receipt time and identity for ties. If retained history lacks an eligible baseline, startup warns and new events must warm up the tracker; malformed restored history or database errors fail startup. Cooldown state is restored separately from persisted alerts.
+The tracker stores timestamped prices separately for each symbol in process memory. It sorts out-of-order arrivals by their event timestamp and prunes history older than the window plus tolerance. Before consuming, the consumer streams retained `price_events` within that horizon relative to each symbol's newest persisted event into the tracker. Events are ordered by event time, then receipt time and identity for ties. If retained history lacks an eligible baseline, startup warns and new events must warm up the tracker; malformed restored history or database errors fail startup. Cooldown state is restored separately from persisted alerts.
 
 ### 5.4 Alert threshold and cooldown
 
@@ -231,7 +231,10 @@ different existing sort directions, and a non-unique descending
 `alerts.timestamp` index. MongoDB's `_id` indexes remain unique for event and
 alert identity. Index creation failures stop consumer startup; the consumer
 does not delete records to resolve conflicts. Computed event-time conversions
-in restoration pipelines still require additional processing and sorting.
+in restoration pipelines still require additional processing. Baseline history
+requires a computed sort; cooldown restoration selects the latest alert per
+symbol without a global sort. The existing indexes cannot directly order
+converted event times when stored timestamp formats differ.
 
 ## 7. REST API
 
