@@ -325,9 +325,12 @@ The API server, producer, and consumer load local environment variables with `do
 | `MOVING_AVERAGE_WINDOW` | Consumer | `5` | Positive safe integer number of recent raw events used by the backend average. |
 | `MAX_EVENTS_PER_SYMBOL` | Consumer | `10000` | Positive safe integer raw event retention cap per symbol. |
 | `CONSUMER_PROCESSING_TIMINGS` | Consumer | `false` | Set to `true` to enable aggregate consumer processing timing logs; `false` disables them. Other values fail startup. |
+| `CONSUMER_VERBOSE_EVENT_LOGGING` | Consumer | `false` | Set to `true` to log each processed event and retention deletion; `false` suppresses per-event and single-record cleanup logs. Other values fail startup. |
 
-When enabled, the consumer emits a JSON timing summary at most once per minute
-when completed processing attempts were recorded. It uses a monotonic clock and
+The historical consumer logs its timing and verbose-logging settings at startup.
+When timings are enabled, it emits a JSON summary prefixed
+`Consumer processing timings:` at 60-second intervals when completed processing
+attempts were recorded. Reports are independent of verbose event logging. It uses a monotonic clock and
 reports successful event counts and total processing time, failed attempt counts,
 and per-operation counts, totals, averages, p50, and p95 in milliseconds. Operation
 measurements include failed operations up to the point of failure; optional

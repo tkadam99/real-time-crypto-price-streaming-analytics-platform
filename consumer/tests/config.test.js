@@ -6,7 +6,10 @@ const numericVariables = [
   "MOVING_AVERAGE_WINDOW",
   "MAX_EVENTS_PER_SYMBOL",
 ];
-const configVariables = [...numericVariables, "CONSUMER_PROCESSING_TIMINGS", "ALERT_DECISION_CLEANUP_ENABLED"];
+const configVariables = [
+  ...numericVariables, "CONSUMER_PROCESSING_TIMINGS", "CONSUMER_VERBOSE_EVENT_LOGGING",
+  "ALERT_DECISION_CLEANUP_ENABLED",
+];
 
 function loadConfig(overrides = {}) {
   const previousValues = Object.fromEntries(
@@ -47,6 +50,7 @@ describe("consumer numerical configuration", () => {
       movingAverageWindow: 5,
       maxEventsPerSymbol: 10_000,
       processingTimings: false,
+      verboseEventLogging: false,
       decisionCleanupEnabled: false,
     });
   });
@@ -79,6 +83,19 @@ describe("consumer numerical configuration", () => {
   it("rejects an invalid processing timings setting", () => {
     expect(() => loadConfig({ CONSUMER_PROCESSING_TIMINGS: "yes" })).toThrow(
       'CONSUMER_PROCESSING_TIMINGS must be "true" or "false"'
+    );
+  });
+
+  it.each([["true", true], ["false", false]])(
+    "configures verbose event logging with %s",
+    (value, expected) => {
+      expect(loadConfig({ CONSUMER_VERBOSE_EVENT_LOGGING: value }).verboseEventLogging).toBe(expected);
+    }
+  );
+
+  it.each(["", "TRUE", "yes", "1", " true "])("rejects invalid verbose event logging setting %j", (value) => {
+    expect(() => loadConfig({ CONSUMER_VERBOSE_EVENT_LOGGING: value })).toThrow(
+      'CONSUMER_VERBOSE_EVENT_LOGGING must be "true" or "false"'
     );
   });
 

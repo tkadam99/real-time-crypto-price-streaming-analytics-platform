@@ -496,7 +496,9 @@ async function processMessage(event, kafkaRecord, timing) {
       _id: { $in: oldDocs.map((doc) => doc._id) },
     });
     if (timing) timing.end();
-    console.log(`Cleaned ${result.deletedCount} old events for ${event.symbol}`);
+    if (config.verboseEventLogging || result.deletedCount > 1) {
+      console.log(`Cleaned ${result.deletedCount} old events for ${event.symbol}`);
+    }
   }
 
   if (alertCandidate) {
@@ -532,13 +534,15 @@ async function processMessage(event, kafkaRecord, timing) {
     eventId
   );
 
-  console.log("Processed event:", {
-    symbol: event.symbol,
-    latestPrice: latestEvent.price,
-    previousPrice: previousSnapshotPrice,
-    percentChange: Number(snapshotPercentChange.toFixed(4)),
-    movingAverage: Number(movingAverage.toFixed(4)),
-  });
+  if (config.verboseEventLogging) {
+    console.log("Processed event:", {
+      symbol: event.symbol,
+      latestPrice: latestEvent.price,
+      previousPrice: previousSnapshotPrice,
+      percentChange: Number(snapshotPercentChange.toFixed(4)),
+      movingAverage: Number(movingAverage.toFixed(4)),
+    });
+  }
 }
 
 async function startConsumer() {
@@ -559,6 +563,10 @@ async function startConsumer() {
   if (shuttingDown) return;
 
   console.log(`Consumer subscribed to topic: ${config.kafkaTopic}`);
+  console.log(
+    `Consumer diagnostics: processing timings ${config.processingTimings ? "enabled" : "disabled"}; ` +
+    `verbose event logging ${config.verboseEventLogging ? "enabled" : "disabled"}`
+  );
 
   await consumer.run({
     eachMessage: async ({ topic, partition, message }) => {

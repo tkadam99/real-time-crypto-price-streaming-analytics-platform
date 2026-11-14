@@ -12,6 +12,7 @@ jest.mock("../src/mongoClient", () => ({ getDB: jest.fn() }));
 describe("consumer processing timings", () => {
   let log;
   let warn;
+  let error;
 
   beforeEach(() => {
     jest.resetModules();
@@ -21,6 +22,7 @@ describe("consumer processing timings", () => {
     mockConsumer.run.mockReset().mockResolvedValue();
     log = jest.spyOn(console, "log").mockImplementation(() => {});
     warn = jest.spyOn(console, "warn").mockImplementation(() => {});
+    error = jest.spyOn(console, "error").mockImplementation(() => {});
   });
 
   afterEach(() => {
@@ -28,12 +30,14 @@ describe("consumer processing timings", () => {
     jest.useRealTimers();
     log.mockRestore();
     warn.mockRestore();
+    error.mockRestore();
   });
 
-  async function start(enabled) {
+  async function start(enabled, verbose = false) {
     jest.doMock("../src/config", () => ({
       ...jest.requireActual("../src/config"),
       processingTimings: enabled,
+      verboseEventLogging: verbose,
     }));
 
     let stored;
@@ -104,6 +108,50 @@ describe("consumer processing timings", () => {
   it("does not schedule timing reports when disabled", async () => {
     await start(false);
     expect(jest.getTimerCount()).toBe(0);
+  });
+
+  it("does not enable timing reports merely because verbose logging is enabled", async () => {
+    const { eachMessage, metrics } = await start(false, true);
+    metrics.updateOne.mockReset().mockResolvedValue({});
+    await eachMessage(record);
+    jest.advanceTimersByTime(60_000);
+    expect(log).toHaveBeenCalledWith("Processed event:", expect.any(Object));
+    expect(log.mock.calls.some(([label]) => label === "Consumer processing timings:")).toBe(false);
+  });
+
+  it.each([false, true])("keeps operational messages and gates event logs when verbose is %s", async (verbose) => {
+    const { eachMessage, metrics, raw } = await start(true, verbose);
+    expect(log).toHaveBeenCalledWith(expect.stringContaining("Consumer connected to Kafka at "));
+    expect(log).toHaveBeenCalledWith(expect.stringContaining("Consumer subscribed to topic: "));
+    expect(log).toHaveBeenCalledWith(
+      `Consumer diagnostics: processing timings enabled; verbose event logging ${verbose ? "enabled" : "disabled"}`
+    );
+    metrics.updateOne.mockReset().mockResolvedValue({});
+    await eachMessage(record);
+    expect(log.mock.calls.some(([label]) => label === "Processed event:")).toBe(verbose);
+    expect(log.mock.calls.some(([label]) => label === "Cleaned 1 old events for BTC-USD")).toBe(verbose);
+    expect(raw.deleteMany).toHaveBeenCalledTimes(1);
+    await eachMessage({ ...record, message: { ...record.message, value: Buffer.from("{") } });
+    expect(error).toHaveBeenCalledWith("Discarding malformed Kafka event JSON:", expect.any(String));
+    await eachMessage({ ...record, message: { ...record.message, value: null } });
+    expect(warn).toHaveBeenCalledWith("Discarding invalid Kafka event: message value is missing");
+    jest.advanceTimersByTime(60_000);
+    const reports = log.mock.calls.filter(([label]) => label === "Consumer processing timings:");
+    expect(reports).toHaveLength(1);
+    expect(JSON.parse(reports[0][1]).successfulEvents).toBe(1);
+    await eachMessage(record);
+    jest.advanceTimersByTime(60_000);
+    const nextReports = log.mock.calls.filter(([label]) => label === "Consumer processing timings:");
+    expect(nextReports).toHaveLength(2);
+    expect(JSON.parse(nextReports[1][1]).successfulEvents).toBe(1);
+  });
+
+  it("reports multi-record retention cleanup even when verbose logging is disabled", async () => {
+    const { eachMessage, metrics, raw } = await start(false);
+    metrics.updateOne.mockReset().mockResolvedValue({});
+    raw.deleteMany.mockResolvedValue({ deletedCount: 2 });
+    await eachMessage(record);
+    expect(log).toHaveBeenCalledWith("Cleaned 2 old events for BTC-USD");
   });
 
   it("reports failed and replayed attempts without swallowing processing errors", async () => {
