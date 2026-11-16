@@ -15,8 +15,11 @@ From `consumer`, run:
 ```powershell
 $env:MONGO_INTEGRATION_URI = 'mongodb://127.0.0.1:27018'
 $env:KAFKA_INTEGRATION_BROKER = $null
-npm test -- --runTestsByPath tests\retentionHarness.mongo.integration.test.js
-node tests\retentionBenchmark.js > retention-benchmark.json
+$env:RETENTION_BENCH_WARMUP = '2'
+$env:RETENTION_BENCH_TRIALS = '8'
+$env:RETENTION_BENCH_SEED = '20261113'
+npm test -- --runTestsByPath tests\retentionBenchmarkUtils.test.js tests\retentionHarness.mongo.integration.test.js
+node tests\retentionBenchmark.js > retention-benchmark-paired.json
 $LASTEXITCODE
 npm test
 ```
@@ -51,34 +54,74 @@ Thus the boundary candidate is **not production-equivalent** and must not be
 recommended as a drop-in replacement. The hinted candidate also needs real
 production-plan and index-availability analysis before any change.
 
-The correctness suite compares all documents and ordering after insertion and
-pruning, and compares a five-record recent-history query and a simplified
-predecessor/average calculation. The injected read, delete, and partial-delete
-failures occur at harness hook boundaries; they are not MongoDB failpoint,
-network or crash tests. Retry is a fresh function invocation, not a process or
-Kafka restart. Full consumer analytics, alert decisions, offset handling and
-recovery are outside its scope.
+Before each successful cleanup, the harness independently reads all documents
+in MongoDB's stored sort order. It retains the pre-cleanup first N for the
+processed symbol as the oracle, and after cleanup checks the cap, exact ordered
+documents and unchanged unrelated symbols. This oracle does not use either
+algorithm's deletion candidates. The integration suite also compares a
+five-record recent-history query and a simplified predecessor/average.
+
+The injected read, delete, and partial-delete failures occur at harness hook
+boundaries; they are not MongoDB failpoint, network or crash tests. No cap is
+required immediately after failure; the independent cap and identity checks
+apply after a successful fresh invocation. Retry is not a process or Kafka
+restart. Full consumer analytics, alert decisions, offset handling and recovery
+are outside the scope of this harness.
 
 ## Measurement
 
-The benchmark runs the same seed data and event steps in separate collections
-on one deployment, with both production indexes, one warm-up and three measured
-trials at each target (100 and 10,000). It includes normal inserts, duplicate
-upserts, late/reinserted records and a large excess with timestamp/receipt ties
-and a second symbol. All records are compared after every step. Explain plans
-are sampled before the first retention operation of each measured trial.
-Untimed injected read, deletion and partial-deletion failures are also compared
-before and after a fresh invocation; these do not simulate a real server crash
-or process restart.
+The benchmark uses separate collections on one deployment with identical seed
+data, steps and both production indexes. Targets are 100 and 10,000. Defaults
+are two warm-up and eight measured trials per workload, configurable with
+`RETENTION_BENCH_WARMUP` (0-10) and `RETENTION_BENCH_TRIALS` (1-50). Normal
+has three steps, so the default yields 24 measured observations per algorithm
+and target; each other workload has 16. The normal, duplicate, late/reinserted
+and large-excess/tie workloads are unchanged. The large-excess collection also
+contains one untouched ETH record.
 
-JSON includes MongoDB version, actual indexes, settings, retention and simulated
-upsert-plus-retention latency (mean/p95), simulated throughput, find/getMore and
-delete command counts, deleted document counts, explain keys/documents examined,
-final counts and ordered identity hashes. Explain, setup, upserts and
-verification are excluded from retention command counts. The boundary
-delete-predicate find explain is **only a proxy**, not the delete execution
-plan; reference delete execution work is not measured by the selection explain.
-Counts aggregate measured trials, while explain is sampled; p95 is nearest-rank
-over the small number of observed operations. This is not end-to-end consumer
-latency or a substitute for isolated server-side failure and replay tests. Any
-identity or ordering mismatch aborts with a nonzero exit; no speedup is assumed.
+Default setup inserts approximately 1,227,060 documents across all trial
+collections and performs 540 retention operations including warm-up, plus
+snapshot reads, explains, cleanup and untimed failure scenarios. Each operation
+reads the entire collection before and after retention for correctness; this is
+deliberate and expensive. Increasing trial counts multiplies this work. Use an
+isolated deployment with sufficient storage and capacity.
+
+Each step's algorithm order is shuffled deterministically from the seed, trial
+and step. Record the seed and settings when sharing results; repeat whole runs
+with different seeds to assess sensitivity to ordering. Seeded shuffling does
+not guarantee balanced positions. Collections, cache, storage layout, background
+load, and earlier operations can still affect measurements. Pre-operation
+snapshots and sampled explains also warm data: this is not a cold-cache
+experiment or an exact reproduction of production's concurrent workload.
+
+JSON includes MongoDB version, actual index metadata, settings, individual
+trial/step samples and execution order, query, delete, total retention and
+simulated upsert-plus-retention wall times, simulated throughput, and measured
+find/getMore/delete command and deleted-document counts. `deleteMs` is zero when
+no deletion is issued; total time includes helper overhead and need not equal
+the sum of query and delete times. Explain, setup, upserts and verification are
+excluded from retention command counts. Nearest-rank p95 is based on the
+reported sample count and is unstable with small samples. Samples within a
+trial are not independent.
+
+Each measured sample's snapshot and `finalSnapshot` contain `collectionCount`
+for every symbol combined and `symbols` with per-symbol counts and ordered
+identity hashes. For example, 10,000 BTC plus one
+untouched ETH is collection count 10,001, not a BTC cap violation. Validation
+occurs after every successful operation, not just on the final snapshot.
+Failure snapshots report post-failure and post-retry states separately. A
+mismatch aborts with an error and nonzero exit rather than emitting a successful
+JSON summary.
+
+For each measured trial's first step, selection explain reports recognized
+winning-plan stages, index names/key patterns, scan directions, blocking SORT
+status, raw winning plans, and execution statistics; `planComparisons` flags
+observed differences in the stage structure, scan details and counts. The
+comparison does not assert equality of every planner property.
+Missing or unrecognized plan structures are explicitly marked uninterpretable
+with warnings. These sampled explains are not plans for every operation and
+MongoDB's explain planning can differ from cached execution. Explain statistics
+cover selection, not delete execution. The benchmark does not prove that equal
+keys examined imply equal cost, or that a latency difference is a reproducible
+production speedup. Evaluate repeated paired results and plans before proposing
+any production change.

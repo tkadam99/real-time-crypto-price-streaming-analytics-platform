@@ -1,4 +1,5 @@
 const { createHash } = require("node:crypto");
+const { performance } = require("node:perf_hooks");
 
 const SORT = { timestamp: -1, receivedAt: -1, _id: -1 };
 const INDEXES = [
@@ -35,21 +36,29 @@ function olderThan(symbol, boundary) {
 
 async function reference(collection, symbol, target, hooks = {}, hinted = false) {
   if (hooks.beforeRead) await hooks.beforeRead();
+  const queryStart = performance.now();
   const oldDocs = await referenceQuery(collection, symbol, target, hinted).toArray();
+  if (hooks.timings) hooks.timings.queryMs = performance.now() - queryStart;
   if (oldDocs.length === 0) return { deleted: 0 };
   const filter = { symbol, _id: { $in: oldDocs.map((doc) => doc._id) } };
   if (hooks.beforeDelete) await hooks.beforeDelete(filter);
+  const deleteStart = performance.now();
   const result = await collection.deleteMany(filter);
+  if (hooks.timings) hooks.timings.deleteMs = performance.now() - deleteStart;
   return { deleted: result.deletedCount };
 }
 
 async function boundary(collection, symbol, target, hooks = {}) {
   if (hooks.beforeRead) await hooks.beforeRead();
+  const queryStart = performance.now();
   const [cutoff] = await boundaryQuery(collection, symbol, target).toArray();
+  if (hooks.timings) hooks.timings.queryMs = performance.now() - queryStart;
   if (!cutoff) return { deleted: 0 };
   const filter = olderThan(symbol, cutoff);
   if (hooks.beforeDelete) await hooks.beforeDelete(filter);
+  const deleteStart = performance.now();
   const result = await collection.deleteMany(filter);
+  if (hooks.timings) hooks.timings.deleteMs = performance.now() - deleteStart;
   return { deleted: result.deletedCount };
 }
 
@@ -82,6 +91,37 @@ function signature(documents) {
   return createHash("sha256").update(JSON.stringify(documents.map((doc) => doc._id))).digest("hex");
 }
 
+function validateRetention(before, after, symbol, target, context = "") {
+  const expected = before.filter((doc) => doc.symbol === symbol).slice(0, target);
+  const actual = after.filter((doc) => doc.symbol === symbol);
+  const prefix = context ? `${context}: ` : "";
+  if (actual.length > target) {
+    throw new Error(`${prefix}strict cap exceeded for ${symbol}: ${actual.length} > ${target}`);
+  }
+  if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+    throw new Error(`${prefix}retained identities/order/content differ from independent newest-N expectation for ${symbol}`);
+  }
+  const otherBefore = before.filter((doc) => doc.symbol !== symbol);
+  const otherAfter = after.filter((doc) => doc.symbol !== symbol);
+  if (JSON.stringify(otherBefore) !== JSON.stringify(otherAfter)) {
+    throw new Error(`${prefix}unrelated symbols changed while pruning ${symbol}`);
+  }
+}
+
+function snapshotSummary(documents) {
+  const groups = new Map();
+  for (const doc of documents) {
+    if (!groups.has(doc.symbol)) groups.set(doc.symbol, []);
+    groups.get(doc.symbol).push(doc);
+  }
+  return {
+    collectionCount: documents.length,
+    symbols: Object.fromEntries([...groups].map(([symbol, docs]) => [
+      symbol, { count: docs.length, identitySha256: signature(docs) },
+    ])),
+  };
+}
+
 async function historyInputs(collection, symbol) {
   const recent = await collection.find({ symbol }).sort({ timestamp: -1, receivedAt: 1, _id: 1 })
     .limit(5).toArray();
@@ -102,5 +142,6 @@ async function historyInputs(collection, symbol) {
 
 module.exports = {
   SORT, INDEXES, algorithms, boundaryQuery, createIndexes, event,
-  historyInputs, olderThan, ordered, referenceQuery, signature, upsertEvent,
+  historyInputs, olderThan, ordered, referenceQuery, signature, snapshotSummary,
+  upsertEvent, validateRetention,
 };

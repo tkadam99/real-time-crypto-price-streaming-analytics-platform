@@ -3,9 +3,10 @@ const { randomUUID } = require("node:crypto");
 const { performance } = require("node:perf_hooks");
 const { MongoClient } = require("mongodb");
 const {
-  INDEXES, algorithms, boundaryQuery, createIndexes, event, olderThan,
-  ordered, referenceQuery, signature, upsertEvent,
+  INDEXES, algorithms, boundaryQuery, createIndexes, event,
+  ordered, referenceQuery, snapshotSummary, upsertEvent, validateRetention,
 } = require("./retentionHarness");
+const { orderFor, extractPlan, comparePlans } = require("./retentionBenchmarkUtils");
 
 const uri = process.env.MONGO_INTEGRATION_URI;
 if (!uri) {
@@ -49,37 +50,28 @@ async function explain(collection, name, target) {
   const query = name === "boundary"
     ? boundaryQuery(collection, "BTC-USD", target)
     : referenceQuery(collection, "BTC-USD", target, name === "hinted");
-  const plan = await query.explain("executionStats");
-  const result = {
-    selection: {
-      keysExamined: plan.executionStats.totalKeysExamined,
-      documentsExamined: plan.executionStats.totalDocsExamined,
-      returned: plan.executionStats.nReturned,
-    },
-  };
-  if (name === "boundary") {
-    const [cutoff] = await boundaryQuery(collection, "BTC-USD", target).toArray();
-    if (cutoff) {
-      const proxy = await collection.find(olderThan("BTC-USD", cutoff))
-        .project({ _id: 1 }).explain("executionStats");
-      result.deletePredicateFindProxy = {
-        keysExamined: proxy.executionStats.totalKeysExamined,
-        documentsExamined: proxy.executionStats.totalDocsExamined,
-        returned: proxy.executionStats.nReturned,
-      };
-    }
+  return extractPlan(await query.explain("executionStats"));
+}
+
+function integerSetting(name, fallback, minimum, maximum) {
+  const value = process.env[name];
+  if (value === undefined) return fallback;
+  if (!/^(0|[1-9]\d*)$/.test(value) || Number(value) < minimum || Number(value) > maximum) {
+    throw new Error(`${name} must be an integer from ${minimum} to ${maximum}`);
   }
-  return result;
+  return Number(value);
 }
 
 async function failureCases(collections, names) {
   const cases = [];
   for (const failure of ["read", "delete", "partial"]) {
-    const seed = Array.from({ length: 10 }, (_, index) => event("BTC-USD", index));
+    const seed = [...Array.from({ length: 10 }, (_, index) => event("BTC-USD", index)), event("ETH-USD", 1)];
+    const originals = {};
     for (const name of names) {
       const collection = collections[name];
       await collection.deleteMany({});
       await collection.insertMany(seed);
+      originals[name] = await ordered(collection);
       const expectedMessage = `injected ${failure}`;
       const hooks = failure === "read"
         ? { beforeRead: async () => { throw new Error(expectedMessage); } }
@@ -101,7 +93,13 @@ async function failureCases(collections, names) {
     }
     for (const phase of ["afterFailure", "afterFreshInvocation"]) {
       if (phase === "afterFreshInvocation") {
-        for (const name of names) await algorithms[name](collections[name], "BTC-USD", 3);
+        for (const name of names) {
+          const before = await ordered(collections[name]);
+          await algorithms[name](collections[name], "BTC-USD", 3);
+          const after = await ordered(collections[name]);
+          validateRetention(before, after, "BTC-USD", 3, `${name} ${failure} retry`);
+          validateRetention(originals[name], after, "BTC-USD", 3, `${name} ${failure} recovery`);
+        }
       }
       const reference = await ordered(collections.reference);
       const snapshots = {};
@@ -110,7 +108,11 @@ async function failureCases(collections, names) {
         if (JSON.stringify(actual) !== JSON.stringify(reference)) {
           throw new Error(`Failure recovery mismatch: ${name}, failure=${failure}, phase=${phase}`);
         }
-        snapshots[name] = { count: actual.length, identitySha256: signature(actual) };
+        if (phase === "afterFailure" && JSON.stringify(actual.filter((doc) => doc.symbol !== "BTC-USD")) !==
+            JSON.stringify(originals[name].filter((doc) => doc.symbol !== "BTC-USD"))) {
+          throw new Error(`Unrelated symbols changed after failure: ${name}, failure=${failure}`);
+        }
+        snapshots[name] = snapshotSummary(actual);
       }
       cases.push({ failure, phase, snapshots });
     }
@@ -119,6 +121,10 @@ async function failureCases(collections, names) {
 }
 
 async function main() {
+  const warmupTrials = integerSetting("RETENTION_BENCH_WARMUP", 2, 0, 10);
+  const measuredTrials = integerSetting("RETENTION_BENCH_TRIALS", 8, 1, 50);
+  const seed = process.env.RETENTION_BENCH_SEED === undefined ? "20261113" : process.env.RETENTION_BENCH_SEED;
+  if (!seed || seed.length > 128) throw new Error("RETENTION_BENCH_SEED must contain 1 to 128 characters");
   const client = new MongoClient(uri, { monitorCommands: true });
   const dbName = `retention_benchmark_${randomUUID().replace(/-/g, "")}`;
   let db;
@@ -140,70 +146,89 @@ async function main() {
     }
     const output = {
       database: dbName, mongodbVersion: version.version,
-      settings: { targets: [100, 10000], warmupTrials: 1, measuredTrials: 3, requestedIndexes: INDEXES, actualIndexes: await collections.reference.listIndexes().toArray(), collation: "simple" },
-      note: "Latency covers the test-only upsert and retention, not the complete historical consumer. Explain statistics are sampled before the first step; delete predicate find is a proxy, not a delete execution plan.",
+      settings: { targets: [100, 10000], warmupTrials, measuredTrials, seed, requestedIndexes: INDEXES, actualIndexes: await collections.reference.listIndexes().toArray(), collation: "simple" },
+      note: "Test-only measurements do not prove a production speedup. Explain runs before the first measured step and can affect cache; query and deletion timings are client wall time.",
+      boundaryWarning: "The boundary candidate is non-equivalent under concurrent old insertion and is not production eligible.",
       injectedFailureRecovery: await failureCases(collections, names),
       results: [],
     };
     for (const target of output.settings.targets) {
       for (const workload of workloads(target)) {
         const buckets = Object.fromEntries(names.map((name) => [name, {
-          retentionMs: [], processingMs: [], commands: { find: 0, getMore: 0, delete: 0 },
-          deletedDocuments: 0, explain: [], finalCount: null, finalIdentitySha256: null, correctnessFailures: 0,
+          samples: [], commands: { find: 0, getMore: 0, delete: 0 },
+          deletedDocuments: 0, plans: [], finalSnapshot: null,
         }]));
-        for (let trial = -1; trial < output.settings.measuredTrials; trial++) {
+        const planComparisons = [];
+        for (let trial = -warmupTrials; trial < measuredTrials; trial++) {
           for (const name of names) {
             await collections[name].deleteMany({});
             await collections[name].insertMany(workload.seed);
           }
           for (let step = 0; step < workload.steps.length; step++) {
-            for (const name of names) {
+            const executionOrder = orderFor(seed, trial, step, names);
+            const afterByName = {};
+            const stepPlans = {};
+            for (const name of executionOrder) {
               const collection = collections[name];
               const start = performance.now();
               await upsertEvent(collection, workload.steps[step]);
               const afterUpsert = performance.now();
-              if (trial >= 0 && step === 0) buckets[name].explain.push(await explain(collection, name, target));
+              const before = await ordered(collection);
+              if (trial >= 0 && step === 0) {
+                stepPlans[name] = await explain(collection, name, target);
+                buckets[name].plans.push({ trial, ...stepPlans[name] });
+              }
               counter = { find: 0, getMore: 0, delete: 0 };
               const retentionStart = performance.now();
+              const timings = { queryMs: 0, deleteMs: 0 };
               let result;
               try {
-                result = await algorithms[name](collection, "BTC-USD", target);
+                result = await algorithms[name](collection, "BTC-USD", target, { timings });
               } finally {
                 const elapsed = performance.now() - retentionStart;
                 if (trial >= 0) {
-                  buckets[name].retentionMs.push(elapsed);
-                  // Exclude the deliberately separate explain from processing time.
-                  buckets[name].processingMs.push(afterUpsert - start + elapsed);
+                  buckets[name].samples.push({
+                    trial, step, executionOrder, queryMs: timings.queryMs, deleteMs: timings.deleteMs,
+                    retentionMs: elapsed, simulatedProcessingMs: afterUpsert - start + elapsed,
+                  });
                   for (const key of Object.keys(counter)) buckets[name].commands[key] += counter[key];
                 }
                 counter = null;
               }
               if (trial >= 0) buckets[name].deletedDocuments += result.deleted;
+              const after = await ordered(collection);
+              validateRetention(before, after, "BTC-USD", target, `${name}, target=${target}, workload=${workload.name}, trial=${trial}, step=${step}`);
+              if (trial >= 0) {
+                buckets[name].samples[buckets[name].samples.length - 1].snapshot = snapshotSummary(after);
+              }
+              afterByName[name] = after;
             }
-            const reference = await ordered(collections.reference);
+            if (trial >= 0 && step === 0) planComparisons.push({ trial, ...comparePlans(stepPlans.reference, stepPlans.hinted) });
+            const reference = afterByName.reference;
             for (const name of names) {
-              const actual = await ordered(collections[name]);
+              const actual = afterByName[name];
               if (JSON.stringify(actual) !== JSON.stringify(reference)) {
-                buckets[name].correctnessFailures++;
                 throw new Error(`Identity/order/content mismatch: ${name}, target=${target}, workload=${workload.name}, trial=${trial}, step=${step}`);
               }
               if (trial >= 0 && step === workload.steps.length - 1) {
-                buckets[name].finalCount = actual.length;
-                buckets[name].finalIdentitySha256 = signature(actual);
+                buckets[name].finalSnapshot = snapshotSummary(actual);
               }
             }
           }
         }
         for (const name of names) {
           const bucket = buckets[name];
-          const totalProcessingMs = bucket.processingMs.reduce((sum, value) => sum + value, 0);
+          const totalProcessingMs = bucket.samples.reduce((sum, value) => sum + value.simulatedProcessingMs, 0);
           output.results.push({
             target, workload: workload.name, algorithm: name,
-            retentionLatency: stats(bucket.retentionMs), simulatedProcessingLatency: stats(bucket.processingMs),
-            simulatedEventsPerSecond: bucket.processingMs.length * 1000 / totalProcessingMs,
+            retentionLatency: stats(bucket.samples.map((item) => item.retentionMs)),
+            queryLatency: stats(bucket.samples.map((item) => item.queryMs)),
+            deleteLatency: stats(bucket.samples.map((item) => item.deleteMs)),
+            simulatedProcessingLatency: stats(bucket.samples.map((item) => item.simulatedProcessingMs)),
+            simulatedEventsPerSecond: bucket.samples.length * 1000 / totalProcessingMs,
             commands: bucket.commands, deletedDocuments: bucket.deletedDocuments,
-            explainSamples: bucket.explain, finalCount: bucket.finalCount,
-            finalIdentitySha256: bucket.finalIdentitySha256, correctnessFailures: bucket.correctnessFailures,
+            samples: bucket.samples, explainSamples: bucket.plans,
+            planComparisons, finalSnapshot: bucket.finalSnapshot, correctnessFailures: 0,
           });
         }
       }

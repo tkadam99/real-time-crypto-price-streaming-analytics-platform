@@ -1,6 +1,6 @@
 const { randomUUID } = require("node:crypto");
 const { MongoClient } = require("mongodb");
-const { algorithms, createIndexes, event, historyInputs, ordered, upsertEvent } = require("./retentionHarness");
+const { algorithms, createIndexes, event, historyInputs, ordered, upsertEvent, validateRetention } = require("./retentionHarness");
 
 const uri = process.env.MONGO_INTEGRATION_URI;
 const describeMongo = uri ? describe : describe.skip;
@@ -41,7 +41,11 @@ describeMongo("isolated strict retention candidate comparison", () => {
     }
   }
   async function prune(symbol) {
-    for (const name of names) await algorithms[name](collections[name], symbol, target);
+    for (const name of names) {
+      const before = await ordered(collections[name]);
+      await algorithms[name](collections[name], symbol, target);
+      validateRetention(before, await ordered(collections[name]), symbol, target, name);
+    }
     await compare();
   }
 
@@ -59,8 +63,10 @@ describeMongo("isolated strict retention candidate comparison", () => {
     await seed(Array.from({ length: count }, (_, index) => event("BTC-USD", index)));
     for (const name of names) {
       const beforeDelete = jest.fn();
+      const before = await ordered(collections[name]);
       await algorithms[name](collections[name], "BTC-USD", target, { beforeDelete });
       expect(beforeDelete).not.toHaveBeenCalled();
+      validateRetention(before, await ordered(collections[name]), "BTC-USD", target, name);
     }
     await compare();
   });
@@ -84,11 +90,32 @@ describeMongo("isolated strict retention candidate comparison", () => {
     expect((await ordered(collections.reference)).filter((doc) => doc.symbol === "ETH-USD")).toHaveLength(1);
   });
 
+  test("independent newest-N oracle enforces mixed receipt and ID ties while preserving another symbol", async () => {
+    const timestamp = "2025-01-01T00:00:10.000Z";
+    const early = "2025-01-01T00:00:11.000Z";
+    const late = "2025-01-01T00:00:12.000Z";
+    const docs = [
+      event("BTC-USD", 1, { timestamp, receivedAt: early }),
+      event("BTC-USD", 2, { timestamp, receivedAt: late }),
+      event("BTC-USD", 3, { timestamp, receivedAt: late }),
+      event("BTC-USD", 4, { timestamp, receivedAt: late }),
+      event("ETH-USD", 7),
+    ];
+    await seed(docs);
+    await prune("BTC-USD");
+    const after = await ordered(collections.reference);
+    expect(after.filter((doc) => doc.symbol === "BTC-USD").map((doc) => doc._id))
+      .toEqual([docs[3]._id, docs[2]._id, docs[1]._id]);
+    expect(after.filter((doc) => doc.symbol === "ETH-USD")).toEqual([docs[4]]);
+  });
+
   test.each(["read", "delete", "partial"])("propagates %s failure and converges after retry", async (failure) => {
-    await seed(Array.from({ length: 10 }, (_, index) => event("BTC-USD", index)));
+    await seed([...Array.from({ length: 10 }, (_, index) => event("BTC-USD", index)), event("ETH-USD", 1)]);
     const message = `injected ${failure}`;
+    const originals = {};
     for (const name of names) {
       const collection = collections[name];
+      originals[name] = await ordered(collection);
       const hooks = failure === "read"
         ? { beforeRead: async () => { throw new Error(message); } }
         : { beforeDelete: async (filter) => {
@@ -101,8 +128,13 @@ describeMongo("isolated strict retention candidate comparison", () => {
       await expect(algorithms[name](collection, "BTC-USD", target, hooks)).rejects.toThrow(message);
     }
     await compare();
+    expect(await collections.reference.countDocuments({ symbol: "BTC-USD" })).toBe(failure === "partial" ? 8 : 10);
+    expect(await collections.reference.countDocuments({ symbol: "ETH-USD" })).toBe(1);
     // A fresh invocation represents recovery without in-memory retention state.
     await prune("BTC-USD");
+    for (const name of names) {
+      validateRetention(originals[name], await ordered(collections[name]), "BTC-USD", target, `${name} recovery`);
+    }
     expect(await collections.reference.countDocuments({ symbol: "BTC-USD" })).toBe(target);
   });
 
