@@ -26,6 +26,11 @@ const SEED = 20261113;
 const POLL_MS = 100;
 const TIMEOUT_MS = 120000;
 const FIXED_DECISION_GROUP = "crypto-analytics-group";
+const OPERATIONS = [
+  "decisionPersistence", "rawPersistence", "recentHistory", "predecessor",
+  "metricsCalculation", "metricsPersistence", "retentionQuery",
+  "retentionDeletion", "alertPersistence",
+];
 
 function validateEnvironment(env) {
   if (env.RUN_DISPOSABLE_ANALYTICS_BENCHMARK !== "true") {
@@ -61,7 +66,7 @@ function percentile(samples, fraction) {
   return sorted[Math.ceil(sorted.length * fraction) - 1];
 }
 
-function createMeasurements(topic, warmup = WARMUP, measured = MEASURED, now = () => performance.now()) {
+function createMeasurements(topic, warmup = WARMUP, measured = MEASURED, now = () => performance.now(), operationTimings = null) {
   const seen = new Set();
   const successful = new Set();
   const samples = [];
@@ -92,8 +97,16 @@ function createMeasurements(topic, warmup = WARMUP, measured = MEASURED, now = (
       const isMeasured = offset >= BigInt(warmup);
       const started = now();
       if (isMeasured && firstStart === undefined) firstStart = started;
-      await callback(record);
-      const finished = now();
+      if (operationTimings) operationTimings.beginCallback(record, started, isMeasured);
+      let finished;
+      try {
+        await callback(record);
+        finished = now();
+        if (operationTimings) operationTimings.finishCallback(finished);
+      } catch (error) {
+        if (operationTimings) operationTimings.abortCallback();
+        throw error;
+      }
       successful.add(record.message.offset);
       if (isMeasured) {
         lastEnd = finished;
@@ -132,6 +145,151 @@ function durationBetween(start, end) {
     throw new Error("Invalid measurement boundaries.");
   }
   return end - start;
+}
+
+function intervalUnionDuration(intervals, callbackStart, callbackEnd) {
+  durationBetween(callbackStart, callbackEnd);
+  const sorted = intervals.map(({ startedMs, finishedMs }) => {
+    durationBetween(startedMs, finishedMs);
+    if (startedMs < callbackStart || finishedMs > callbackEnd) {
+      throw new Error("Operation interval is outside callback boundaries.");
+    }
+    return { startedMs, finishedMs };
+  }).sort((a, b) => a.startedMs - b.startedMs);
+  let total = 0;
+  let start;
+  let end;
+  for (const interval of sorted) {
+    if (start === undefined) {
+      start = interval.startedMs;
+      end = interval.finishedMs;
+    } else if (interval.startedMs <= end) {
+      end = Math.max(end, interval.finishedMs);
+    } else {
+      total += end - start;
+      start = interval.startedMs;
+      end = interval.finishedMs;
+    }
+  }
+  return start === undefined ? 0 : total + end - start;
+}
+
+function summarizeDurations(samples) {
+  return {
+    count: samples.length,
+    totalMs: samples.reduce((sum, value) => sum + value, 0),
+    p50Ms: samples.length ? percentile(samples, 0.5) : null,
+    p95Ms: samples.length ? percentile(samples, 0.95) : null,
+  };
+}
+
+function createOperationTimings(now = () => performance.now()) {
+  let current;
+  const samples = [];
+  return {
+    beginCallback(record, startedMs, measured) {
+      if (current) throw new Error("Overlapping analytics callbacks cannot be attributed safely.");
+      if (!Number.isFinite(startedMs)) throw new Error("Invalid callback start time.");
+      current = {
+        topic: record.topic, partition: record.partition, offset: record.message.offset,
+        startedMs, measured, event: null,
+      };
+    },
+    beginEvent() {
+      if (!current || current.event) throw new Error("Unexpected timing event boundary.");
+      const event = { startedMs: now(), classification: "unknown", intervals: [], active: null, finished: false };
+      durationBetween(current.startedMs, event.startedMs);
+      current.event = event;
+      function ensureOpen() {
+        if (!current || current.event !== event || event.finished) {
+          throw new Error("Timing event is not active.");
+        }
+      }
+      function endActive() {
+        const finishedMs = now();
+        const { name, startedMs } = event.active;
+        const durationMs = durationBetween(startedMs, finishedMs);
+        event.intervals.push({ name, startedMs, finishedMs, durationMs });
+        event.active = null;
+      }
+      return {
+        classify(value) {
+          ensureOpen();
+          if (!["new", "replay", "unknown"].includes(value)) throw new Error("Invalid timing classification.");
+          event.classification = value;
+        },
+        start(name) {
+          ensureOpen();
+          if (event.active || !OPERATIONS.includes(name)) throw new Error("Invalid or overlapping operation timing boundary.");
+          const startedMs = now();
+          const previous = event.intervals[event.intervals.length - 1];
+          durationBetween(previous ? previous.finishedMs : event.startedMs, startedMs);
+          event.active = { name, startedMs };
+        },
+        end() {
+          ensureOpen();
+          if (!event.active) throw new Error("Operation timing ended without a start.");
+          endActive();
+        },
+        finish(success) {
+          ensureOpen();
+          if (typeof success !== "boolean") throw new Error("Invalid timing outcome.");
+          if (event.active) endActive();
+          if (success) {
+            const finishedMs = now();
+            const previous = event.intervals[event.intervals.length - 1];
+            durationBetween(previous ? previous.finishedMs : event.startedMs, finishedMs);
+            event.successfulEvent = {
+              startedMs: event.startedMs, finishedMs,
+              durationMs: durationBetween(event.startedMs, finishedMs),
+            };
+          }
+          event.success = success;
+          event.finished = true;
+        },
+      };
+    },
+    finishCallback(finishedMs) {
+      if (!current || !current.event || !current.event.finished || !current.event.success) {
+        throw new Error("Callback returned without a successful timing event.");
+      }
+      const { topic, partition, offset, startedMs, measured, event } = current;
+      const callbackMs = durationBetween(startedMs, finishedMs);
+      const successful = event.successfulEvent;
+      if (successful.startedMs < startedMs || successful.finishedMs > finishedMs) {
+        throw new Error("Successful event is outside callback boundaries.");
+      }
+      const coveredMs = intervalUnionDuration(event.intervals, successful.startedMs, successful.finishedMs);
+      if (measured) {
+        samples.push({
+          topic, partition, offset, classification: event.classification,
+          callback: { startedMs, finishedMs, durationMs: callbackMs },
+          successfulEvent: successful, operations: event.intervals,
+          coveredOperationMs: coveredMs, uncoveredCallbackMs: callbackMs - coveredMs,
+        });
+      }
+      current = null;
+    },
+    abortCallback() { current = null; },
+    summarize(callbackSamples) {
+      if (current || samples.length !== callbackSamples.length ||
+          samples.some((sample, index) => sample.offset !== callbackSamples[index].offset ||
+            sample.callback.startedMs !== callbackSamples[index].startedMs ||
+            sample.callback.finishedMs !== callbackSamples[index].finishedMs)) {
+        throw new Error("Operation timings do not match successful callback samples.");
+      }
+      return {
+        operations: Object.fromEntries(OPERATIONS.map((name) => [
+          name, summarizeDurations(samples.flatMap((sample) =>
+            sample.operations.filter((operation) => operation.name === name).map((operation) => operation.durationMs))),
+        ])),
+        successfulEvent: summarizeDurations(samples.map((sample) => sample.successfulEvent.durationMs)),
+        uncoveredCallback: summarizeDurations(samples.map((sample) => sample.uncoveredCallbackMs)),
+        uncoveredDefinition: "Callback time outside the union of operation intervals; includes uninstrumented application, wrapper and instrumentation overhead.",
+        samples,
+      };
+    },
+  };
 }
 
 function verifyIdentities(documents, expectedIds, label) {
@@ -182,7 +340,7 @@ function verifyBacklog(offsets, committed, group, topic, groupId, callbacks, war
   return { committedOffset: committed, endOffset: offsets[0].high, queuedRecords: measured };
 }
 
-async function captureAnalyticsCallback(db, topic, broker) {
+async function captureAnalyticsCallback(db, topic, broker, operationTimings = null) {
   const filename = path.resolve(__dirname, "../src/kafkaConsumer.js");
   const nativeRequire = Module.createRequire(filename);
   const config = {
@@ -190,7 +348,7 @@ async function captureAnalyticsCallback(db, topic, broker) {
     kafkaBroker: broker,
     kafkaTopic: topic,
     dbName: db.databaseName,
-    processingTimings: false,
+    processingTimings: operationTimings !== null,
     verboseEventLogging: false,
     decisionCleanupEnabled: false,
     maxEventsPerSymbol: 10000,
@@ -227,6 +385,9 @@ async function captureAnalyticsCallback(db, topic, broker) {
     if (request === "kafkajs") return { Kafka: FakeKafka };
     if (request === "./mongoClient") return { getDB: () => db };
     if (request === "./config") return config;
+    if (request === "./processingTimings" && operationTimings) {
+      return { createProcessingTimings: () => operationTimings };
+    }
     return nativeRequire(request);
   };
   const localModule = { exports: {} };
@@ -291,8 +452,10 @@ async function runOnce(settings, run) {
         initialOffsets[0].low !== "0" || initialOffsets[0].high !== "0") {
       throw new Error("Generated topic is not an empty one-partition topic.");
     }
-    const { callback, config } = await captureAnalyticsCallback(db, topic, settings.broker);
-    const measurements = createMeasurements(topic);
+    const now = () => performance.now();
+    const operationTimings = createOperationTimings(now);
+    const { callback, config } = await captureAnalyticsCallback(db, topic, settings.broker, operationTimings);
+    const measurements = createMeasurements(topic, WARMUP, MEASURED, now, operationTimings);
     const isReady = trackConsumerReadiness(consumer, topic);
     consumer.on(consumer.events.CRASH, ({ payload: event }) => { fatal = event.error; });
     consumerAttempted = true;
@@ -411,6 +574,7 @@ async function runOnce(settings, run) {
           alertWindowMs: config.alertWindowMs, alertBaselineToleranceMs: config.alertBaselineToleranceMs,
           alertCooldownMs: config.alertCooldownMs, movingAverageWindow: config.movingAverageWindow,
           maxEventsPerSymbol: config.maxEventsPerSymbol, decisionCleanupEnabled: false,
+          processingTimings: config.processingTimings,
         },
       },
       producer: {
@@ -419,6 +583,7 @@ async function runOnce(settings, run) {
         acknowledgedPerSecond: timings.acknowledgedPerSecond,
       },
       processing,
+      operationTimings: operationTimings.summarize(processing.samples),
       backlog: { ...backlog, restartRequestedMs: restartRequestedAt },
       commit: {
         finalOffset, observedAtMs: commitObservedAt, pollingIntervalMs: POLL_MS,
@@ -458,6 +623,8 @@ async function main() {
       "The consumer is stopped after warm-up and restarted after backlog verification, unlike continuous production.",
       "Callback throughput is an observed backlogged rate, not maximum capacity.",
       "Restart-to-commit includes rejoining, processing, commits and polling observation delay.",
+      "Operation timings include client-side waiting and are not MongoDB server execution times.",
+      "Operation collection adds measurement overhead to callback time and throughput.",
       "Kafka broker version is not exposed by the KafkaJS admin API used here.",
     ],
     versions: { node: process.version, kafkaBroker: null, kafkaJS: require("kafkajs/package.json").version },
@@ -476,6 +643,6 @@ if (require.main === module) {
 }
 
 module.exports = {
-  captureAnalyticsCallback, createMeasurements, payload, percentile,
+  captureAnalyticsCallback, createMeasurements, createOperationTimings, intervalUnionDuration, payload, percentile,
   summarizeSendAndCommit, trackConsumerReadiness, validateEnvironment, verifyBacklog, verifyIdentities,
 };

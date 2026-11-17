@@ -1,6 +1,8 @@
 const {
   captureAnalyticsCallback,
   createMeasurements,
+  createOperationTimings,
+  intervalUnionDuration,
   payload,
   percentile,
   summarizeSendAndCommit,
@@ -102,19 +104,151 @@ describe("analytics benchmark safety", () => {
     const log = jest.spyOn(console, "log").mockImplementation(() => {});
     const warn = jest.spyOn(console, "warn").mockImplementation(() => {});
     try {
-      const { callback } = await captureAnalyticsCallback(db, "test-topic", "127.0.0.1:9092");
-      await callback({
+      const collector = createOperationTimings();
+      const { callback, config } = await captureAnalyticsCallback(db, "test-topic", "127.0.0.1:9092", collector);
+      expect(config.processingTimings).toBe(true);
+      const measurements = createMeasurements("test-topic", 0, 1, undefined, collector);
+      measurements.startMeasured();
+      await measurements.process({
         topic: "test-topic", partition: 0,
         message: { offset: "0", value: Buffer.from(payload(0)) },
-      });
+      }, callback);
+      const result = collector.summarize(measurements.verify().samples);
       expect(decisions.findOneAndUpdate).toHaveBeenCalledTimes(1);
       expect(raw.updateOne).toHaveBeenCalledTimes(1);
       expect(metrics.updateOne).toHaveBeenCalledTimes(1);
       expect(rawDocument._id).toBe(JSON.stringify(["test-topic", 0, "0"]));
+      expect(result.samples[0]).toMatchObject({
+        topic: "test-topic", partition: 0, offset: "0", classification: "new",
+      });
+      expect(result.operations.decisionPersistence.count).toBe(1);
+      expect(result.operations.retentionQuery.count).toBe(1);
+      expect(result.operations.alertPersistence.count).toBe(0);
     } finally {
       log.mockRestore();
       warn.mockRestore();
     }
+  });
+});
+
+describe("analytics benchmark operation timings", () => {
+  test("implements the production interface, excludes warm-up, and attributes raw intervals", async () => {
+    let time = 0;
+    const now = () => time;
+    const collector = createOperationTimings(now);
+    const measurements = createMeasurements("test-topic", 1, 2, now, collector);
+    const callback = async ({ message }) => {
+      const timing = collector.beginEvent();
+      time += 1;
+      timing.start("decisionPersistence");
+      time += message.offset === "1" ? 2 : 4;
+      timing.end();
+      timing.start("rawPersistence");
+      timing.classify("new");
+      time += 2;
+      timing.end();
+      time += 1;
+      timing.finish(true);
+      time += 1;
+    };
+    await measurements.process(record(0), callback);
+    measurements.startMeasured();
+    await measurements.process(record(1), callback);
+    await measurements.process(record(2), callback);
+    const processing = measurements.verify();
+    const result = collector.summarize(processing.samples);
+    expect(result.samples.map(({ topic, partition, offset }) => ({ topic, partition, offset }))).toEqual([
+      { topic: "test-topic", partition: 0, offset: "1" },
+      { topic: "test-topic", partition: 0, offset: "2" },
+    ]);
+    expect(result.samples[0].operations).toEqual([
+      expect.objectContaining({ name: "decisionPersistence", durationMs: 2 }),
+      expect.objectContaining({ name: "rawPersistence", durationMs: 2 }),
+    ]);
+    expect(result.operations.decisionPersistence).toEqual({ count: 2, totalMs: 6, p50Ms: 2, p95Ms: 4 });
+    expect(result.operations.rawPersistence).toEqual({ count: 2, totalMs: 4, p50Ms: 2, p95Ms: 2 });
+    expect(result.operations.retentionDeletion).toEqual({ count: 0, totalMs: 0, p50Ms: null, p95Ms: null });
+    expect(result.successfulEvent).toEqual({ count: 2, totalMs: 14, p50Ms: 6, p95Ms: 8 });
+    expect(result.uncoveredCallback).toEqual({ count: 2, totalMs: 6, p50Ms: 3, p95Ms: 3 });
+    expect(result.samples.map((sample) => sample.callback.durationMs)).toEqual([7, 9]);
+    expect(processing.observedBackloggedCallbacksPerSecond).toBeCloseTo(2000 / 16);
+  });
+
+  test("uses the union of overlapping and nested intervals", () => {
+    const intervals = [
+      { startedMs: 7, finishedMs: 10 },
+      { startedMs: 3, finishedMs: 4 },
+      { startedMs: 2, finishedMs: 8 },
+      { startedMs: 12, finishedMs: 14 },
+    ];
+    expect(intervalUnionDuration(intervals, 0, 20)).toBe(10);
+    expect(20 - intervalUnionDuration(intervals, 0, 20)).toBe(10);
+    expect(intervalUnionDuration([], 0, 20)).toBe(0);
+    expect(() => intervalUnionDuration([{ startedMs: 5, finishedMs: 4 }], 0, 20)).toThrow();
+    expect(() => intervalUnionDuration([{ startedMs: -1, finishedMs: 4 }], 0, 20)).toThrow();
+    expect(() => intervalUnionDuration([{ startedMs: 1, finishedMs: 21 }], 0, 20)).toThrow();
+    expect(() => intervalUnionDuration([{ startedMs: NaN, finishedMs: 4 }], 0, 20)).toThrow();
+  });
+
+  test("rejects mismatched timing boundaries and an invalid clock", () => {
+    let time = 1;
+    const collector = createOperationTimings(() => time);
+    expect(() => collector.beginEvent()).toThrow("boundary");
+    collector.beginCallback(record(0), 0, true);
+    const event = collector.beginEvent();
+    expect(() => collector.beginEvent()).toThrow("boundary");
+    expect(() => event.end()).toThrow("without a start");
+    event.start("rawPersistence");
+    expect(() => event.start("decisionPersistence")).toThrow("overlapping");
+    time = 0;
+    expect(() => event.end()).toThrow("boundaries");
+    collector.abortCallback();
+    expect(() => event.finish(true)).toThrow("not active");
+  });
+
+  test("rejects unexpected concurrent callbacks without misattributing the first", async () => {
+    let time = 0;
+    const now = () => time++;
+    const collector = createOperationTimings(now);
+    const measurements = createMeasurements("test-topic", 0, 2, now, collector);
+    measurements.startMeasured();
+    let release;
+    const pending = new Promise((resolve) => { release = resolve; });
+    const first = measurements.process(record(0), async () => {
+      const timing = collector.beginEvent();
+      timing.start("rawPersistence");
+      await pending;
+      timing.end();
+      timing.finish(true);
+    });
+    await expect(measurements.process(record(1), jest.fn())).rejects.toThrow("Overlapping");
+    release();
+    await first;
+    expect(collector.summarize([{ offset: "0", startedMs: 0, finishedMs: 6 }]).samples[0].offset).toBe("0");
+    expect(() => measurements.verify()).toThrow("counts");
+  });
+
+  test("does not report failed or untimed callbacks as successful", async () => {
+    let time = 0;
+    const now = () => time++;
+    const collector = createOperationTimings(now);
+    const measurements = createMeasurements("test-topic", 0, 3, now, collector);
+    measurements.startMeasured();
+    const failure = new Error("database failure");
+    await expect(measurements.process(record(0), async () => {
+      const timing = collector.beginEvent();
+      timing.start("decisionPersistence");
+      timing.finish(false);
+      throw failure;
+    })).rejects.toBe(failure);
+    await expect(measurements.process(record(1), async () => {}))
+      .rejects.toThrow("without a successful timing event");
+    await expect(measurements.process(record(2), async () => {
+      collector.beginEvent().finish(true);
+      throw failure;
+    })).rejects.toBe(failure);
+    expect(collector.summarize([]).successfulEvent.count).toBe(0);
+    expect(() => measurements.verify()).toThrow("counts");
   });
 });
 
