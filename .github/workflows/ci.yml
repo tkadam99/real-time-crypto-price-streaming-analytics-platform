@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate ${{ matrix.service }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service:
+          - producer
+          - consumer
+          - api-server
+          - frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: ${{ matrix.service }}/package-lock.json
+
+      # Do not set MONGO_INTEGRATION_URI or KAFKA_INTEGRATION_BROKER;
+      # integration suites remain skipped without test infrastructure.
+      - run: npm ci
+        working-directory: ${{ matrix.service }}
+
+      - run: npm test
+        working-directory: ${{ matrix.service }}
+
+      - if: matrix.service == 'frontend'
+        run: npm run lint
+        working-directory: frontend
+
+      - if: matrix.service == 'frontend'
+        run: npm run build
+        working-directory: frontend
