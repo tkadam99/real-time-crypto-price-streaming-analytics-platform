@@ -2,6 +2,7 @@ const {
   captureAnalyticsCallback,
   createMeasurements,
   createOperationTimings,
+  instrumentDecisionDatabase,
   intervalUnionDuration,
   payload,
   percentile,
@@ -12,6 +13,7 @@ const {
   verifyIdentities,
 } = require("./analyticsBenchmark");
 const { EventEmitter } = require("node:events");
+const { Long } = require("mongodb");
 
 const safeEnv = {
   RUN_DISPOSABLE_ANALYTICS_BENCHMARK: "true",
@@ -101,6 +103,7 @@ describe("analytics benchmark safety", () => {
     const metrics = { ...common, updateOne: jest.fn().mockResolvedValue({}) };
     const collections = { price_events: raw, alert_decisions: decisions, metrics, alerts: common };
     const db = { databaseName: "test_database", collection: (name) => collections[name] };
+    const decisionUpsert = decisions.findOneAndUpdate;
     const log = jest.spyOn(console, "log").mockImplementation(() => {});
     const warn = jest.spyOn(console, "warn").mockImplementation(() => {});
     try {
@@ -114,7 +117,7 @@ describe("analytics benchmark safety", () => {
         message: { offset: "0", value: Buffer.from(payload(0)) },
       }, callback);
       const result = collector.summarize(measurements.verify().samples);
-      expect(decisions.findOneAndUpdate).toHaveBeenCalledTimes(1);
+      expect(decisionUpsert).toHaveBeenCalledTimes(1);
       expect(raw.updateOne).toHaveBeenCalledTimes(1);
       expect(metrics.updateOne).toHaveBeenCalledTimes(1);
       expect(rawDocument._id).toBe(JSON.stringify(["test-topic", 0, "0"]));
@@ -124,10 +127,279 @@ describe("analytics benchmark safety", () => {
       expect(result.operations.decisionPersistence.count).toBe(1);
       expect(result.operations.retentionQuery.count).toBe(1);
       expect(result.operations.alertPersistence.count).toBe(0);
+      expect(result.decisionCalls.categories.decisionLookup.count).toBe(1);
+      expect(result.decisionCalls.categories.legacyRawLookup.count).toBe(1);
+      expect(result.decisionCalls.categories.decisionUpsert.count).toBe(1);
     } finally {
       log.mockRestore();
       warn.mockRestore();
     }
+  });
+});
+
+describe("analytics benchmark decision call timings", () => {
+  test("preserves calls and BSON values, filters phases and warm-up, and identifies duplicate recovery", async () => {
+    let time = 0;
+    const now = () => time;
+    const collector = createOperationTimings(now);
+    const winner = { offset: Long.fromString("9007199254740993") };
+    const duplicate = Object.assign(new Error("duplicate"), { code: 11000 });
+    const initialFilter = { _id: "decision" };
+    const options = { promoteLongs: false };
+    const update = { $setOnInsert: { offset: winner.offset } };
+    const rawFilter = { _id: "raw" };
+    const rawResult = { _id: "raw", offset: winner.offset };
+    let lookups = 0;
+    const decisions = {
+      findOne: jest.fn(async function () {
+        expect(this).toBe(decisions);
+        lookups++;
+        time += lookups === 4 ? 4 : 2;
+        return lookups === 3 ? winner : null;
+      }),
+      findOneAndUpdate: jest.fn(async function () {
+        expect(this).toBe(decisions);
+        time += 5;
+        throw duplicate;
+      }),
+    };
+    const raw = {
+      findOne: jest.fn(async function () {
+        expect(this).toBe(raw);
+        time += 3;
+        return rawResult;
+      }),
+      updateOne: jest.fn(),
+    };
+    const untouched = { findOne: jest.fn() };
+    const db = { collection: jest.fn((name) => ({ alert_decisions: decisions, price_events: raw, metrics: untouched })[name]) };
+    const originalLookup = decisions.findOne;
+    const originalUpsert = decisions.findOneAndUpdate;
+    const originalRaw = raw.findOne;
+    const originalUpdate = raw.updateOne;
+    const wrapped = instrumentDecisionDatabase(db, collector);
+    const decisionCollection = wrapped.collection("alert_decisions");
+    const rawCollection = wrapped.collection("price_events");
+    expect(wrapped.collection("metrics")).toBe(untouched);
+    expect(raw.updateOne).toBe(originalUpdate);
+    expect(wrapped.collection("alert_decisions")).toBe(decisionCollection);
+    const measurements = createMeasurements("test-topic", 1, 2, now, collector);
+    const callback = async ({ message }) => {
+      const timing = collector.beginEvent();
+      timing.start("decisionPersistence");
+      expect(await decisionCollection.findOne(initialFilter, options)).toBeNull();
+      if (message.offset === "1") {
+        expect(await rawCollection.findOne(rawFilter)).toBe(rawResult);
+        try {
+          await decisionCollection.findOneAndUpdate(initialFilter, update, options);
+          throw new Error("expected duplicate");
+        } catch (error) {
+          expect(error).toBe(duplicate);
+        }
+        expect(await decisionCollection.findOne(initialFilter, options)).toBe(winner);
+      }
+      timing.end();
+      timing.start("rawPersistence");
+      if (message.offset === "1") expect(await rawCollection.findOne(rawFilter)).toBe(rawResult);
+      timing.end();
+      time += 1;
+      timing.finish(true);
+    };
+    await measurements.process(record(0), callback);
+    measurements.startMeasured();
+    await measurements.process(record(1), callback);
+    await measurements.process(record(2), callback);
+    const result = collector.summarize(measurements.verify().samples).decisionCalls;
+    expect(originalLookup.mock.calls[0][0]).toBe(initialFilter);
+    expect(originalLookup.mock.calls[0][1]).toBe(options);
+    expect(originalUpsert.mock.calls[0]).toEqual([initialFilter, update, options]);
+    expect(originalUpsert.mock.calls[0][1]).toBe(update);
+    expect(originalRaw.mock.calls).toEqual([[rawFilter], [rawFilter]]);
+    expect(Long.isLong(winner.offset)).toBe(true);
+    expect(result.samples.map(({ offset, category, outcome }) => ({ offset, category, outcome }))).toEqual([
+      { offset: "1", category: "decisionLookup", outcome: "success" },
+      { offset: "1", category: "legacyRawLookup", outcome: "success" },
+      { offset: "1", category: "decisionUpsert", outcome: "failure" },
+      { offset: "1", category: "duplicateKeyRecoveryLookup", outcome: "success" },
+      { offset: "2", category: "decisionLookup", outcome: "success" },
+    ]);
+    expect(result.samples.every((sample) => sample.topic === "test-topic" && sample.partition === 0)).toBe(true);
+    expect(result.categories.decisionLookup).toEqual({
+      count: 2, totalMs: 6, p50Ms: 2, p95Ms: 4, successfulCount: 2, failedCount: 0,
+    });
+    expect(result.categories.decisionUpsert).toEqual({
+      count: 1, totalMs: 5, p50Ms: 5, p95Ms: 5, successfulCount: 0, failedCount: 1,
+    });
+    expect(result.categories.unclassifiedDecisionLookup).toEqual({
+      count: 0, totalMs: 0, p50Ms: null, p95Ms: null, successfulCount: 0, failedCount: 0,
+    });
+  });
+
+  test("preserves the original error and excludes calls from failed callbacks", async () => {
+    let time = 0;
+    const now = () => time++;
+    const collector = createOperationTimings(now);
+    const failure = new Error("database failure");
+    const collection = { findOne: jest.fn().mockRejectedValue(failure), findOneAndUpdate: jest.fn() };
+    const db = instrumentDecisionDatabase({ collection: () => collection }, collector);
+    const decisions = db.collection("alert_decisions");
+    const measurements = createMeasurements("test-topic", 0, 1, now, collector);
+    measurements.startMeasured();
+    await expect(measurements.process(record(0), async () => {
+      const timing = collector.beginEvent();
+      timing.start("decisionPersistence");
+      await decisions.findOne({ _id: "test" });
+    })).rejects.toBe(failure);
+    expect(collector.summarize([]).decisionCalls.samples).toEqual([]);
+    expect(() => measurements.verify()).toThrow("counts");
+  });
+
+  test("preserves a duplicate error when recovery finds no winner", async () => {
+    let time = 0;
+    const now = () => time++;
+    const collector = createOperationTimings(now);
+    const duplicate = Object.assign(new Error("duplicate"), { code: 11000 });
+    const collection = {
+      findOne: jest.fn().mockResolvedValue(null),
+      findOneAndUpdate: jest.fn().mockRejectedValue(duplicate),
+    };
+    const decisions = instrumentDecisionDatabase({ collection: () => collection }, collector)
+      .collection("alert_decisions");
+    const measurements = createMeasurements("test-topic", 0, 1, now, collector);
+    measurements.startMeasured();
+    await expect(measurements.process(record(0), async () => {
+      const timing = collector.beginEvent();
+      timing.start("decisionPersistence");
+      await decisions.findOne({ _id: "test" });
+      try {
+        await decisions.findOneAndUpdate({ _id: "test" }, {});
+      } catch (error) {
+        if (error.code !== 11000 || await decisions.findOne({ _id: "test" }) === null) throw error;
+      }
+    })).rejects.toBe(duplicate);
+    expect(collector.summarize([]).decisionCalls.samples).toEqual([]);
+  });
+
+  test("preserves a database error if recording its timing also fails", async () => {
+    let time = 10;
+    const now = () => time;
+    const collector = createOperationTimings(now);
+    const failure = new Error("database failure");
+    const collection = {
+      findOne: jest.fn(async () => { time = 9; throw failure; }),
+      findOneAndUpdate: jest.fn(),
+    };
+    const decisions = instrumentDecisionDatabase({ collection: () => collection }, collector)
+      .collection("alert_decisions");
+    const measurements = createMeasurements("test-topic", 0, 1, now, collector);
+    const log = jest.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      measurements.startMeasured();
+      await expect(measurements.process(record(0), async () => {
+        const timing = collector.beginEvent();
+        timing.start("decisionPersistence");
+        await decisions.findOne({ _id: "test" });
+      })).rejects.toBe(failure);
+      expect(log).toHaveBeenCalledWith("Decision call timing failed:", expect.any(Error));
+      expect(collector.summarize([]).decisionCalls.samples).toEqual([]);
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  test("rejects a recovered callback if call timing failed", async () => {
+    let time = 10;
+    const now = () => time;
+    const collector = createOperationTimings(now);
+    const failure = Object.assign(new Error("duplicate"), { code: 11000 });
+    const collection = {
+      findOne: jest.fn().mockResolvedValue({ _id: "winner" }),
+      findOneAndUpdate: jest.fn(async () => { time = 9; throw failure; }),
+    };
+    const decisions = instrumentDecisionDatabase({ collection: () => collection }, collector)
+      .collection("alert_decisions");
+    const measurements = createMeasurements("test-topic", 0, 1, now, collector);
+    const log = jest.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      measurements.startMeasured();
+      await expect(measurements.process(record(0), async () => {
+        const timing = collector.beginEvent();
+        timing.start("decisionPersistence");
+        try {
+          await decisions.findOneAndUpdate({ _id: "test" }, {});
+        } catch (error) {
+          expect(error).toBe(failure);
+          time = 11;
+          await decisions.findOne({ _id: "test" });
+        }
+        timing.end();
+        timing.finish(true);
+      })).rejects.toThrow("Invalid measurement boundaries.");
+      expect(log).toHaveBeenCalledWith("Decision call timing failed:", expect.any(Error));
+      expect(collector.summarize([]).decisionCalls.samples).toEqual([]);
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  test("leaves independently created verification handles and unrelated methods untouched", () => {
+    const collector = createOperationTimings();
+    const updateOne = jest.fn();
+    const findOne = jest.fn();
+    const db = { collection: jest.fn(() => ({ findOne, updateOne })) };
+    const wrapped = instrumentDecisionDatabase(db, collector);
+    const consumerHandle = wrapped.collection("price_events");
+    const verificationHandle = db.collection("price_events");
+    expect(db.collection.mock.contexts[0]).toBe(db);
+    expect(consumerHandle.updateOne).toBe(updateOne);
+    expect(verificationHandle.findOne).toBe(findOne);
+    expect(verificationHandle.updateOne).toBe(updateOne);
+  });
+
+  test("rejects operation completion while a timed MongoDB call is still pending", async () => {
+    const collector = createOperationTimings();
+    let release;
+    const waiting = new Promise((resolve) => { release = resolve; });
+    const collection = { findOne: () => waiting, findOneAndUpdate: jest.fn() };
+    const decisions = instrumentDecisionDatabase({ collection: () => collection }, collector)
+      .collection("alert_decisions");
+    collector.beginCallback(record(0), performance.now(), true);
+    const timing = collector.beginEvent();
+    timing.start("decisionPersistence");
+    const pending = decisions.findOne({ _id: "test" });
+    expect(() => timing.end()).toThrow("active MongoDB call");
+    release(null);
+    await pending;
+    timing.end();
+    timing.finish(true);
+    collector.finishCallback(performance.now());
+  });
+
+  test("rejects concurrent callbacks while a proxied database call is pending", async () => {
+    let time = 0;
+    const now = () => time++;
+    const collector = createOperationTimings(now);
+    let release;
+    const waiting = new Promise((resolve) => { release = resolve; });
+    const collection = {
+      findOne: jest.fn(() => waiting),
+      findOneAndUpdate: jest.fn(),
+    };
+    const db = instrumentDecisionDatabase({ collection: () => collection }, collector);
+    const decisions = db.collection("alert_decisions");
+    const measurements = createMeasurements("test-topic", 0, 2, now, collector);
+    measurements.startMeasured();
+    const first = measurements.process(record(0), async () => {
+      const timing = collector.beginEvent();
+      timing.start("decisionPersistence");
+      await decisions.findOne({ _id: "first" });
+      timing.end();
+      timing.finish(true);
+    });
+    await expect(measurements.process(record(1), jest.fn())).rejects.toThrow("Overlapping");
+    release(null);
+    await first;
+    expect(() => measurements.verify()).toThrow("counts");
   });
 });
 

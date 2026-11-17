@@ -31,6 +31,10 @@ const OPERATIONS = [
   "metricsCalculation", "metricsPersistence", "retentionQuery",
   "retentionDeletion", "alertPersistence",
 ];
+const DECISION_CALL_CATEGORIES = [
+  "decisionLookup", "legacyRawLookup", "decisionUpsert",
+  "duplicateKeyRecoveryLookup", "unclassifiedDecisionLookup",
+];
 
 function validateEnvironment(env) {
   if (env.RUN_DISPOSABLE_ANALYTICS_BENCHMARK !== "true") {
@@ -186,6 +190,7 @@ function summarizeDurations(samples) {
 function createOperationTimings(now = () => performance.now()) {
   let current;
   const samples = [];
+  const decisionCallSamples = [];
   return {
     beginCallback(record, startedMs, measured) {
       if (current) throw new Error("Overlapping analytics callbacks cannot be attributed safely.");
@@ -197,7 +202,10 @@ function createOperationTimings(now = () => performance.now()) {
     },
     beginEvent() {
       if (!current || current.event) throw new Error("Unexpected timing event boundary.");
-      const event = { startedMs: now(), classification: "unknown", intervals: [], active: null, finished: false };
+      const event = {
+        startedMs: now(), classification: "unknown", intervals: [], active: null, finished: false,
+        calls: [], activeCall: null, decisionLookupCount: 0, upsertSeen: false, recoveryExpected: false,
+      };
       durationBetween(current.startedMs, event.startedMs);
       current.event = event;
       function ensureOpen() {
@@ -206,6 +214,7 @@ function createOperationTimings(now = () => performance.now()) {
         }
       }
       function endActive() {
+        if (event.activeCall) throw new Error("Operation ended with an active MongoDB call.");
         const finishedMs = now();
         const { name, startedMs } = event.active;
         const durationMs = durationBetween(startedMs, finishedMs);
@@ -249,7 +258,63 @@ function createOperationTimings(now = () => performance.now()) {
         },
       };
     },
+    beginDecisionCall(collection, method) {
+      const event = current?.event;
+      if (!event || event.finished || event.active?.name !== "decisionPersistence") return null;
+      if (event.activeCall) throw new Error("Overlapping decision persistence calls cannot be attributed safely.");
+      let category;
+      if (collection === "price_events" && method === "findOne") {
+        category = "legacyRawLookup";
+      } else if (collection === "alert_decisions" && method === "findOneAndUpdate") {
+        category = "decisionUpsert";
+        event.upsertSeen = true;
+      } else if (collection === "alert_decisions" && method === "findOne") {
+        if (event.recoveryExpected) {
+          category = "duplicateKeyRecoveryLookup";
+          event.recoveryExpected = false;
+        } else {
+          category = event.decisionLookupCount === 0 && !event.upsertSeen
+            ? "decisionLookup" : "unclassifiedDecisionLookup";
+        }
+        event.decisionLookupCount += 1;
+      } else {
+        throw new Error("Unexpected decision persistence call.");
+      }
+      const startedMs = now();
+      durationBetween(event.active.startedMs, startedMs);
+      const token = {
+        event, operation: event.active, collection, method, category, startedMs,
+        topic: current.topic, partition: current.partition, offset: current.offset,
+      };
+      event.activeCall = token;
+      return token;
+    },
+    endDecisionCall(token, succeeded, error) {
+      const event = current?.event;
+      if (!event || event !== token.event || event.active !== token.operation || event.activeCall !== token) {
+        throw new Error("Mismatched decision persistence call boundary.");
+      }
+      const finishedMs = now();
+      const durationMs = durationBetween(token.startedMs, finishedMs);
+      const failed = !succeeded;
+      if (token.category === "decisionUpsert" && failed && error?.code === 11000) {
+        event.recoveryExpected = true;
+      }
+      event.calls.push({
+        topic: token.topic, partition: token.partition, offset: token.offset,
+        collection: token.collection, method: token.method, category: token.category,
+        startedMs: token.startedMs, finishedMs, durationMs,
+        outcome: failed ? "failure" : "success",
+      });
+      event.activeCall = null;
+    },
+    failDecisionCallTiming(token, error) {
+      token.event.measurementError = error;
+      if (token.event.activeCall === token) token.event.activeCall = null;
+      console.error("Decision call timing failed:", error);
+    },
     finishCallback(finishedMs) {
+      if (current?.event?.measurementError) throw current.event.measurementError;
       if (!current || !current.event || !current.event.finished || !current.event.success) {
         throw new Error("Callback returned without a successful timing event.");
       }
@@ -267,6 +332,7 @@ function createOperationTimings(now = () => performance.now()) {
           successfulEvent: successful, operations: event.intervals,
           coveredOperationMs: coveredMs, uncoveredCallbackMs: callbackMs - coveredMs,
         });
+        decisionCallSamples.push(...event.calls);
       }
       current = null;
     },
@@ -287,9 +353,70 @@ function createOperationTimings(now = () => performance.now()) {
         uncoveredCallback: summarizeDurations(samples.map((sample) => sample.uncoveredCallbackMs)),
         uncoveredDefinition: "Callback time outside the union of operation intervals; includes uninstrumented application, wrapper and instrumentation overhead.",
         samples,
+        decisionCalls: {
+          categories: Object.fromEntries(DECISION_CALL_CATEGORIES.map((category) => {
+            const calls = decisionCallSamples.filter((sample) => sample.category === category);
+            return [category, {
+              ...summarizeDurations(calls.map((sample) => sample.durationMs)),
+              successfulCount: calls.filter((sample) => sample.outcome === "success").length,
+              failedCount: calls.filter((sample) => sample.outcome === "failure").length,
+            }];
+          })),
+          samples: decisionCallSamples,
+          limitation: "Logical client-side calls include driver waiting and instrumentation overhead, not MongoDB server execution time.",
+        },
       };
     },
   };
+}
+
+function instrumentDecisionDatabase(db, operationTimings) {
+  const instrumented = new WeakSet();
+  function recordFailure(token, error) {
+    try {
+      operationTimings.endDecisionCall(token, false, error);
+    } catch (timingError) {
+      operationTimings.failDecisionCallTiming(token, timingError);
+    }
+  }
+  return new Proxy(db, {
+    get(target, property, receiver) {
+      if (property !== "collection") return Reflect.get(target, property, receiver);
+      return (...args) => {
+        const collection = Reflect.apply(target.collection, target, args);
+        const name = args[0];
+        const methods = name === "alert_decisions"
+          ? ["findOne", "findOneAndUpdate"]
+          : name === "price_events" ? ["findOne"] : [];
+        if (!methods.length || instrumented.has(collection)) return collection;
+        // MongoDB's Db.collection returns a fresh handle; verification uses separate handles.
+        for (const method of methods) {
+          const original = collection[method];
+          if (typeof original !== "function") throw new Error(`Missing MongoDB method ${name}.${method}.`);
+          Object.defineProperty(collection, method, {
+            configurable: true, writable: true,
+            value(...callArgs) {
+              const token = operationTimings.beginDecisionCall(name, method);
+              if (!token) return Reflect.apply(original, collection, callArgs);
+              let result;
+              try {
+                result = Reflect.apply(original, collection, callArgs);
+              } catch (error) {
+                recordFailure(token, error);
+                throw error;
+              }
+              return result.then(
+                (value) => { operationTimings.endDecisionCall(token, true); return value; },
+                (error) => { recordFailure(token, error); throw error; }
+              );
+            },
+          });
+        }
+        instrumented.add(collection);
+        return collection;
+      };
+    },
+  });
 }
 
 function verifyIdentities(documents, expectedIds, label) {
@@ -343,6 +470,7 @@ function verifyBacklog(offsets, committed, group, topic, groupId, callbacks, war
 async function captureAnalyticsCallback(db, topic, broker, operationTimings = null) {
   const filename = path.resolve(__dirname, "../src/kafkaConsumer.js");
   const nativeRequire = Module.createRequire(filename);
+  const consumerDb = operationTimings ? instrumentDecisionDatabase(db, operationTimings) : db;
   const config = {
     ...nativeRequire("./config"),
     kafkaBroker: broker,
@@ -383,7 +511,7 @@ async function captureAnalyticsCallback(db, topic, broker, operationTimings = nu
   }
   const load = (request) => {
     if (request === "kafkajs") return { Kafka: FakeKafka };
-    if (request === "./mongoClient") return { getDB: () => db };
+    if (request === "./mongoClient") return { getDB: () => consumerDb };
     if (request === "./config") return config;
     if (request === "./processingTimings" && operationTimings) {
       return { createProcessingTimings: () => operationTimings };
@@ -644,5 +772,5 @@ if (require.main === module) {
 
 module.exports = {
   captureAnalyticsCallback, createMeasurements, createOperationTimings, intervalUnionDuration, payload, percentile,
-  summarizeSendAndCommit, trackConsumerReadiness, validateEnvironment, verifyBacklog, verifyIdentities,
+  instrumentDecisionDatabase, summarizeSendAndCommit, trackConsumerReadiness, validateEnvironment, verifyBacklog, verifyIdentities,
 };
