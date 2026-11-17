@@ -47,3 +47,52 @@ jobs:
       - if: matrix.service == 'frontend'
         run: npm run build
         working-directory: frontend
+
+  mongodb-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      mongodb:
+        image: mongo:7.0.16
+        ports:
+          - "127.0.0.1:27017:27017"
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'quit(db.adminCommand({ping:1}).ok ? 0 : 1)'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      MONGO_INTEGRATION_URI: mongodb://127.0.0.1:27017
+      ALLOW_DESTRUCTIVE_INTEGRATION_TESTS: "true"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: |
+            consumer/package-lock.json
+            api-server/package-lock.json
+
+      - run: npm ci
+        working-directory: consumer
+
+      - run: npm ci
+        working-directory: api-server
+
+      - name: Test consumer MongoDB integration
+        working-directory: consumer
+        run: >-
+          npm test -- --runTestsByPath
+          tests/alertDecisionStore.mongo.integration.test.js
+          tests/commitReconciliation.mongo.integration.test.js
+          tests/currentPrice.mongo.integration.test.js
+          tests/decisionCleanup.mongo.integration.test.js
+          tests/decisionComparison.mongo.integration.test.js
+          tests/kafkaConsumer.mongo.integration.test.js
+          tests/retentionHarness.mongo.integration.test.js
+
+      - name: Test API MongoDB integration
+        working-directory: api-server
+        run: npm test -- --runTestsByPath tests/api/currentPrices.mongo.integration.test.js
