@@ -1,24 +1,28 @@
-const { randomUUID } = require("node:crypto");
+require("dotenv").config();
+const {
+  createMongoTestDatabase,
+  dropMongoTestDatabase,
+  getMongoIntegrationUri,
+} = require("../../test-utils/mongoIntegrationSafety");
 const { MongoClient, Long } = require("mongodb");
 const { inspectEligible } = require("../src/commitReconciliation");
 
-const uri = process.env.MONGO_INTEGRATION_URI;
+const uri = getMongoIntegrationUri(process.env);
 const describeWithMongo = uri ? describe : describe.skip;
 
 describeWithMongo("commit reconciliation MongoDB integration", () => {
-  const dbName = `commit_reconcile_test_${randomUUID().replace(/-/g, "")}`;
   let client;
   let db;
 
   beforeAll(async () => {
     client = new MongoClient(uri);
+    db = createMongoTestDatabase(client, "commit_reconcile_test");
     await client.connect();
-    db = client.db(dbName);
   });
 
   afterAll(async () => {
     try {
-      if (db) await db.dropDatabase();
+      if (db) await dropMongoTestDatabase(db);
     } finally {
       if (client) await client.close();
     }

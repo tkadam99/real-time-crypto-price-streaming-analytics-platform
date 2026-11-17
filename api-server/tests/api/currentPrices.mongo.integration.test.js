@@ -1,4 +1,10 @@
-const { randomUUID } = require("node:crypto");
+require("dotenv").config();
+const {
+  createMongoTestDatabase,
+  dropMongoTestDatabase,
+  getMongoIntegrationUri,
+} = require("../../../test-utils/mongoIntegrationSafety");
+const uri = getMongoIntegrationUri(process.env);
 const { MongoClient, Long } = require("mongodb");
 const request = require("supertest");
 const app = require("../../src/app");
@@ -6,11 +12,9 @@ const { getDB } = require("../../src/db");
 
 jest.mock("../../src/db", () => ({ getDB: jest.fn() }));
 
-const uri = process.env.MONGO_INTEGRATION_URI;
 const describeMongo = uri ? describe : describe.skip;
 
 describeMongo("current-price API with isolated MongoDB", () => {
-  const dbName = `current_price_api_test_${randomUUID().replace(/-/g, "")}`;
   let client, db, current, metrics;
   const snapshot = {
     _id: "BTC-USD", symbol: "BTC-USD", price: 68000.25,
@@ -22,14 +26,14 @@ describeMongo("current-price API with isolated MongoDB", () => {
 
   beforeAll(async () => {
     client = new MongoClient(uri);
+    db = createMongoTestDatabase(client, "current_price_api_test");
     await client.connect();
-    db = client.db(dbName);
     current = db.collection("current_prices");
     metrics = db.collection("metrics");
     getDB.mockReturnValue(db);
   });
   afterAll(async () => {
-    try { if (db) await db.dropDatabase(); } finally { if (client) await client.close(); }
+    try { if (db) await dropMongoTestDatabase(db); } finally { if (client) await client.close(); }
   });
   beforeEach(async () => {
     await current.deleteMany({});

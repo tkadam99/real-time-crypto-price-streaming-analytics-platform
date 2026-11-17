@@ -1,11 +1,17 @@
 const { EventEmitter } = require("node:events");
 const { randomUUID } = require("node:crypto");
+require("dotenv").config();
+const {
+  createMongoTestDatabase,
+  dropMongoTestDatabase,
+  getMongoIntegrationUri,
+} = require("../../test-utils/mongoIntegrationSafety");
 const { Kafka, logLevel } = require("kafkajs");
 const { MongoClient } = require("mongodb");
 const { createCurrentPriceService } = require("../src/currentPriceConsumer");
 
 const broker = process.env.KAFKA_INTEGRATION_BROKER;
-const uri = process.env.MONGO_INTEGRATION_URI;
+const uri = getMongoIntegrationUri(process.env);
 const describeIntegration = broker && uri ? describe : describe.skip;
 
 describeIntegration("current-price consumer Kafka and MongoDB integration", () => {
@@ -14,9 +20,8 @@ describeIntegration("current-price consumer Kafka and MongoDB integration", () =
   const topic = `current-price-test-${suffix}`;
   const group = `current-price-test-${suffix}`;
   const otherGroup = `current-price-other-${suffix}`;
-  const dbName = `current_price_kafka_test_${suffix}`;
   const kafka = new Kafka({ clientId: `current-price-test-${suffix}`, brokers: [broker], logLevel: logLevel.NOTHING });
-  let admin, producer, client, db, collection, service, other, topicCreated = false;
+  let admin, producer, client, db, dbName, collection, service, other, topicCreated = false;
   const services = [];
   const logs = [];
 
@@ -105,8 +110,9 @@ describeIntegration("current-price consumer Kafka and MongoDB integration", () =
 
   beforeAll(async () => {
     client = new MongoClient(uri);
+    db = createMongoTestDatabase(client, "current_price_kafka_test");
+    dbName = db.databaseName;
     await client.connect();
-    db = client.db(dbName);
     collection = db.collection("current_prices");
     admin = kafka.admin();
     await admin.connect();
@@ -128,7 +134,7 @@ describeIntegration("current-price consumer Kafka and MongoDB integration", () =
       await cleanup("topic", () => admin.deleteTopics({ topics: [topic] }));
     }
     if (admin) await cleanup("admin", () => admin.disconnect());
-    if (db) await cleanup("database", () => db.dropDatabase());
+    if (db) await cleanup("database", () => dropMongoTestDatabase(db));
     if (client) await cleanup("MongoDB", () => client.close());
     if (errors.length) throw new Error(errors.join("; "));
   });

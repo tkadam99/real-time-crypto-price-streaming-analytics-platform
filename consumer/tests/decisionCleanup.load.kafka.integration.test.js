@@ -1,11 +1,17 @@
 const { randomUUID } = require("node:crypto");
 const { performance } = require("node:perf_hooks");
+require("dotenv").config();
+const {
+  createMongoTestDatabase,
+  dropMongoTestDatabase,
+  getMongoIntegrationUri,
+} = require("../../test-utils/mongoIntegrationSafety");
 const { Kafka, logLevel } = require("kafkajs");
 const { MongoClient, Long } = require("mongodb");
 const { createCommitReconciliation } = require("../src/commitReconciliation");
 
 const broker = process.env.KAFKA_INTEGRATION_BROKER;
-const mongoUri = process.env.MONGO_INTEGRATION_URI;
+const mongoUri = getMongoIntegrationUri(process.env);
 const describeIntegration = broker && mongoUri ? describe : describe.skip;
 
 async function waitFor(label, predicate, timeout = 60000) {
@@ -33,7 +39,6 @@ describeIntegration("decision cleanup sustained Kafka workload", () => {
   const suffix = randomUUID().replace(/-/g, "");
   const topic = `cleanup-load-${suffix}`;
   const groupId = `cleanup-load-${suffix}`;
-  const dbName = `cleanup_load_${suffix}`;
   const kafka = new Kafka({ clientId: `cleanup-load-${suffix}`, brokers: [broker], logLevel: logLevel.NOTHING });
   let mongo;
   let db;
@@ -57,8 +62,8 @@ describeIntegration("decision cleanup sustained Kafka workload", () => {
       if (label === "Commit reconciliation:") reports.push(JSON.parse(payload));
     });
     mongo = new MongoClient(mongoUri);
+    db = createMongoTestDatabase(mongo, "cleanup_load");
     await mongo.connect();
-    db = mongo.db(dbName);
     collection = db.collection("alert_decisions");
     await collection.createIndex({ groupId: 1, topic: 1, partition: 1, offset: 1 }, { name: "decision_group_topic_partition_offset" });
     await collection.createIndex({ groupId: 1, topic: 1, partition: 1, offset: 1, _id: 1 }, { name: "decision_cleanup_pagination" });
@@ -119,7 +124,7 @@ describeIntegration("decision cleanup sustained Kafka workload", () => {
       await clean("topic", () => admin.deleteTopics({ topics: [topic] }));
     }
     if (admin) await clean("admin", () => admin.disconnect());
-    if (db) await clean("database", () => db.dropDatabase());
+    if (db) await clean("database", () => dropMongoTestDatabase(db));
     if (mongo) await clean("MongoDB", () => mongo.close());
     if (log) log.mockRestore();
     if (errors.length) throw new Error(errors.join("; "));

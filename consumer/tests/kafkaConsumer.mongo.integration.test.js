@@ -1,3 +1,10 @@
+require("dotenv").config();
+const {
+  createMongoTestDatabase,
+  dropMongoTestDatabase,
+  getMongoIntegrationUri,
+} = require("../../test-utils/mongoIntegrationSafety");
+
 const mockConsumer = {
   connect: jest.fn(),
   subscribe: jest.fn(),
@@ -16,29 +23,29 @@ jest.mock("../src/mongoClient", () => ({
   getDB: () => global.__consumerIntegrationDB,
 }));
 
-const integrationUri = process.env.MONGO_INTEGRATION_URI;
+const integrationUri = getMongoIntegrationUri(process.env);
 const describeWithMongo = integrationUri ? describe : describe.skip;
-const testDbName = `consumer_integration_${process.pid}_${Date.now()}`;
 
 describeWithMongo("Kafka consumer MongoDB integration", () => {
   let client;
   let db;
+  let testDbName;
   let eachMessage;
   let sequence = 0;
 
   beforeAll(async () => {
-    process.env.MONGO_URI = integrationUri;
-    process.env.DB_NAME = testDbName;
-
     const { MongoClient } = require("mongodb");
     client = new MongoClient(integrationUri, { monitorCommands: true });
+    db = createMongoTestDatabase(client, "consumer_integration");
+    testDbName = db.databaseName;
+    process.env.MONGO_URI = integrationUri;
+    process.env.DB_NAME = testDbName;
     await client.connect();
-    db = client.db(testDbName);
     global.__consumerIntegrationDB = db;
   });
 
   afterAll(async () => {
-    if (db) await db.dropDatabase();
+    if (db) await dropMongoTestDatabase(db);
     if (client) await client.close();
     delete global.__consumerIntegrationDB;
   });

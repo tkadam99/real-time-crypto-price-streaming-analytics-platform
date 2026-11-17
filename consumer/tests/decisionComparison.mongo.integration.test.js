@@ -1,13 +1,17 @@
-const { randomUUID } = require("node:crypto");
+require("dotenv").config();
+const {
+  createMongoTestDatabase,
+  dropMongoTestDatabase,
+  getMongoIntegrationUri,
+} = require("../../test-utils/mongoIntegrationSafety");
 const { MongoClient, Long } = require("mongodb");
 const { EMPTY, GROUP, POSITIVE, decide, experimental, idOf, identity, reference, setupIndexes } = require("./decisionComparisonHarness");
 
-const uri = process.env.MONGO_INTEGRATION_URI;
+const uri = getMongoIntegrationUri(process.env);
 const describeMongo = uri ? describe : describe.skip;
 
 describeMongo("isolated decision-store comparison", () => {
   jest.setTimeout(120000);
-  const dbName = `decision_comparison_test_${randomUUID().replace(/-/g, "")}`;
   let client, db, collections, raw;
   const variants = { reference, experimental };
   const item = identity("9007199254740993");
@@ -15,14 +19,14 @@ describeMongo("isolated decision-store comparison", () => {
 
   beforeAll(async () => {
     client = new MongoClient(uri);
+    db = createMongoTestDatabase(client, "decision_comparison_test");
     await client.connect();
-    db = client.db(dbName);
     collections = Object.fromEntries(Object.keys(variants).map((name) => [name, db.collection(name)]));
     raw = db.collection("legacy_raw");
     for (const collection of Object.values(collections)) await setupIndexes(collection);
   });
   afterAll(async () => {
-    try { if (db) await db.dropDatabase(); } finally { if (client) await client.close(); }
+    try { if (db) await dropMongoTestDatabase(db); } finally { if (client) await client.close(); }
   });
   beforeEach(async () => {
     await raw.deleteMany({});

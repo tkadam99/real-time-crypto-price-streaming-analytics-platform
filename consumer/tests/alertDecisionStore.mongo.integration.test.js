@@ -1,27 +1,31 @@
-const { randomUUID } = require("node:crypto");
+require("dotenv").config();
+const {
+  createMongoTestDatabase,
+  dropMongoTestDatabase,
+  getMongoIntegrationUri,
+} = require("../../test-utils/mongoIntegrationSafety");
 const { MongoClient, Long } = require("mongodb");
 const { createAlertDecisionStore } = require("../src/alertDecisionStore");
 const { buildAlert } = require("../src/analytics");
 
-const integrationUri = process.env.MONGO_INTEGRATION_URI;
+const integrationUri = getMongoIntegrationUri(process.env);
 const describeWithMongo = integrationUri ? describe : describe.skip;
 
 describeWithMongo("alert decision store MongoDB integration", () => {
-  const dbName = `decision_store_test_${randomUUID().replace(/-/g, "")}`;
   let client;
   let db;
   let store;
 
   beforeAll(async () => {
     client = new MongoClient(integrationUri);
+    db = createMongoTestDatabase(client, "decision_store_test");
     await client.connect();
-    db = client.db(dbName);
     store = createAlertDecisionStore(db.collection("alert_decisions"), "test-group");
   });
 
   afterAll(async () => {
     try {
-      if (db) await db.dropDatabase();
+      if (db) await dropMongoTestDatabase(db);
     } finally {
       if (client) await client.close();
     }

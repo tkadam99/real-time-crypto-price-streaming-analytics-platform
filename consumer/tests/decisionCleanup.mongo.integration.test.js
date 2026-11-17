@@ -1,13 +1,18 @@
 const { randomUUID } = require("node:crypto");
+require("dotenv").config();
+const {
+  createMongoTestDatabase,
+  dropMongoTestDatabase,
+  getMongoIntegrationUri,
+} = require("../../test-utils/mongoIntegrationSafety");
 const { MongoClient, Long } = require("mongodb");
 const { createCommitReconciliation } = require("../src/commitReconciliation");
 
-const uri = process.env.MONGO_INTEGRATION_URI;
+const uri = getMongoIntegrationUri(process.env);
 const describeWithMongo = uri ? describe : describe.skip;
 
 describeWithMongo("bounded decision cleanup with MongoDB", () => {
   jest.setTimeout(60000);
-  const dbName = `decision_cleanup_test_${randomUUID().replace(/-/g, "")}`;
   let client;
   let db;
   let collection;
@@ -35,8 +40,8 @@ describeWithMongo("bounded decision cleanup with MongoDB", () => {
 
   beforeAll(async () => {
     client = new MongoClient(uri);
+    db = createMongoTestDatabase(client, "decision_cleanup_test");
     await client.connect();
-    db = client.db(dbName);
   });
 
   beforeEach(async () => {
@@ -60,7 +65,7 @@ describeWithMongo("bounded decision cleanup with MongoDB", () => {
   });
 
   afterAll(async () => {
-    try { if (db) await db.dropDatabase(); } finally { if (client) await client.close(); }
+    try { if (db) await dropMongoTestDatabase(db); } finally { if (client) await client.close(); }
   });
 
   it("deletes only validated decisions strictly below the revalidated long boundary", async () => {

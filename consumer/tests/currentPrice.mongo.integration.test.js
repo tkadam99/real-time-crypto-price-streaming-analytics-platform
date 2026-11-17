@@ -1,12 +1,16 @@
-const { randomUUID } = require("node:crypto");
+require("dotenv").config();
+const {
+  createMongoTestDatabase,
+  dropMongoTestDatabase,
+  getMongoIntegrationUri,
+} = require("../../test-utils/mongoIntegrationSafety");
 const { MongoClient } = require("mongodb");
 const { parseEvent, createCurrentPriceProjection } = require("../src/currentPriceProjection");
 
-const uri = process.env.MONGO_INTEGRATION_URI;
+const uri = getMongoIntegrationUri(process.env);
 const describeMongo = uri ? describe : describe.skip;
 
 describeMongo("current price MongoDB projection", () => {
-  const dbName = `current_price_test_${randomUUID().replace(/-/g, "")}`;
   let client, db, collection, store;
   const now = Date.parse("2026-01-01T00:01:00Z");
   function snapshot(timestamp, partition, offset, price, topic = "topic") {
@@ -17,13 +21,13 @@ describeMongo("current price MongoDB projection", () => {
   }
   beforeAll(async () => {
     client = new MongoClient(uri);
+    db = createMongoTestDatabase(client, "current_price_test");
     await client.connect();
-    db = client.db(dbName);
     collection = db.collection("current_prices");
     store = createCurrentPriceProjection(collection);
   });
   afterAll(async () => {
-    try { if (db) await db.dropDatabase(); } finally { if (client) await client.close(); }
+    try { if (db) await dropMongoTestDatabase(db); } finally { if (client) await client.close(); }
   });
   beforeEach(async () => { await collection.deleteMany({}); });
 

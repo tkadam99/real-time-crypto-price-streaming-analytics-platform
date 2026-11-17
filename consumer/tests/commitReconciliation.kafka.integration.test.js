@@ -1,10 +1,16 @@
 const { randomUUID } = require("node:crypto");
+require("dotenv").config();
+const {
+  createMongoTestDatabase,
+  dropMongoTestDatabase,
+  getMongoIntegrationUri,
+} = require("../../test-utils/mongoIntegrationSafety");
 const { Kafka, logLevel } = require("kafkajs");
 const { MongoClient, Long } = require("mongodb");
 const { createCommitReconciliation } = require("../src/commitReconciliation");
 
 const broker = process.env.KAFKA_INTEGRATION_BROKER;
-const mongoUri = process.env.MONGO_INTEGRATION_URI;
+const mongoUri = getMongoIntegrationUri(process.env);
 const describeIntegration = broker && mongoUri ? describe : describe.skip;
 
 function deferred() {
@@ -36,7 +42,6 @@ describeIntegration("commit reconciliation with real Kafka and MongoDB", () => {
   const suffix = randomUUID().replace(/-/g, "");
   const topic = `reconcile-test-${suffix}`;
   const groupId = `reconcile-test-${suffix}`;
-  const dbName = `reconcile_test_${suffix}`;
   const kafka = new Kafka({ clientId: `reconcile-test-${suffix}`, brokers: [broker], logLevel: logLevel.NOTHING });
   const consumers = [];
   const workers = [];
@@ -97,8 +102,8 @@ describeIntegration("commit reconciliation with real Kafka and MongoDB", () => {
       if (label === "Commit reconciliation failed:") errors.push(JSON.parse(payload));
     });
     mongo = new MongoClient(mongoUri);
+    db = createMongoTestDatabase(mongo, "reconcile_test");
     await mongo.connect();
-    db = mongo.db(dbName);
     collection = db.collection("alert_decisions");
     await collection.createIndex({ groupId: 1, topic: 1, partition: 1, offset: 1 }, {
       name: "decision_group_topic_partition_offset",
@@ -127,7 +132,7 @@ describeIntegration("commit reconciliation with real Kafka and MongoDB", () => {
       await clean("test topic deletion", () => admin.deleteTopics({ topics: [topic] }));
     }
     if (admin) await clean("admin disconnect", () => admin.disconnect());
-    if (db) await clean("test database drop", () => db.dropDatabase());
+    if (db) await clean("test database drop", () => dropMongoTestDatabase(db));
     if (mongo) await clean("MongoDB disconnect", () => mongo.close());
     if (logSpy) logSpy.mockRestore();
     if (errorSpy) errorSpy.mockRestore();

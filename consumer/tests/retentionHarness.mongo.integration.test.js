@@ -1,26 +1,30 @@
-const { randomUUID } = require("node:crypto");
+require("dotenv").config();
+const {
+  createMongoTestDatabase,
+  dropMongoTestDatabase,
+  getMongoIntegrationUri,
+} = require("../../test-utils/mongoIntegrationSafety");
 const { MongoClient } = require("mongodb");
 const { algorithms, createIndexes, event, historyInputs, ordered, upsertEvent, validateRetention } = require("./retentionHarness");
 
-const uri = process.env.MONGO_INTEGRATION_URI;
+const uri = getMongoIntegrationUri(process.env);
 const describeMongo = uri ? describe : describe.skip;
 
 describeMongo("isolated strict retention candidate comparison", () => {
   jest.setTimeout(120000);
-  const dbName = `retention_harness_test_${randomUUID().replace(/-/g, "")}`;
   let client, db, collections;
   const target = 3;
   const names = Object.keys(algorithms);
 
   beforeAll(async () => {
     client = new MongoClient(uri);
+    db = createMongoTestDatabase(client, "retention_harness_test");
     await client.connect();
-    db = client.db(dbName);
     collections = Object.fromEntries(names.map((name) => [name, db.collection(name)]));
     for (const collection of Object.values(collections)) await createIndexes(collection);
   });
   afterAll(async () => {
-    try { if (db) await db.dropDatabase(); } finally { if (client) await client.close(); }
+    try { if (db) await dropMongoTestDatabase(db); } finally { if (client) await client.close(); }
   });
   beforeEach(async () => {
     for (const collection of Object.values(collections)) await collection.deleteMany({});
