@@ -96,3 +96,65 @@ jobs:
       - name: Test API MongoDB integration
         working-directory: api-server
         run: npm test -- --runTestsByPath tests/api/currentPrices.mongo.integration.test.js
+
+  kafka-mongodb-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      mongodb:
+        image: mongo:7.0.16
+        ports:
+          - "127.0.0.1:27017:27017"
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'quit(db.adminCommand({ping:1}).ok ? 0 : 1)'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 12
+      kafka:
+        image: apache/kafka:3.9.0
+        ports:
+          - "127.0.0.1:9092:9092"
+        env:
+          KAFKA_NODE_ID: "1"
+          KAFKA_PROCESS_ROLES: broker,controller
+          KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+          KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+          KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://127.0.0.1:9092
+          KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+          KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+          KAFKA_CONTROLLER_QUORUM_VOTERS: 1@127.0.0.1:9093
+          KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+          KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
+          KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+          KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+          KAFKA_LOG_DIRS: /tmp/kraft-combined-logs
+          CLUSTER_ID: 4L6g3nShT-eMCtK--X86sw
+        options: >-
+          --health-cmd "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server 127.0.0.1:9092"
+          --health-interval 10s
+          --health-timeout 15s
+          --health-retries 18
+          --health-start-period 30s
+    env:
+      KAFKA_INTEGRATION_BROKER: 127.0.0.1:9092
+      MONGO_INTEGRATION_URI: mongodb://127.0.0.1:27017
+      ALLOW_DESTRUCTIVE_INTEGRATION_TESTS: "true"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: consumer/package-lock.json
+
+      - run: npm ci
+        working-directory: consumer
+
+      - name: Test Kafka and MongoDB integration
+        working-directory: consumer
+        run: >-
+          npm test -- --runTestsByPath
+          tests/commitReconciliation.kafka.integration.test.js
+          tests/currentPrice.kafka.integration.test.js
+          tests/decisionCleanup.load.kafka.integration.test.js
