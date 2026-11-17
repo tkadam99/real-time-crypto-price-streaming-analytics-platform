@@ -1,0 +1,107 @@
+name: Analytics benchmark
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  analytics-benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      mongodb:
+        image: mongo:7.0.16
+        ports:
+          - "127.0.0.1:27017:27017"
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'quit(db.adminCommand({ping:1}).ok ? 0 : 1)'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 12
+      kafka:
+        image: apache/kafka:3.9.0
+        ports:
+          - "127.0.0.1:9092:9092"
+        env:
+          KAFKA_NODE_ID: "1"
+          KAFKA_PROCESS_ROLES: broker,controller
+          KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+          KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://127.0.0.1:9093
+          KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://127.0.0.1:9092
+          KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+          KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+          KAFKA_CONTROLLER_QUORUM_VOTERS: 1@127.0.0.1:9093
+          KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+          KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
+          KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+          KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+          KAFKA_LOG_DIRS: /tmp/kraft-combined-logs
+          CLUSTER_ID: 4L6g3nShT-eMCtK--X86sw
+        options: >-
+          --health-cmd "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server 127.0.0.1:9092"
+          --health-interval 10s
+          --health-timeout 15s
+          --health-retries 18
+          --health-start-period 30s
+    env:
+      KAFKA_INTEGRATION_BROKER: 127.0.0.1:9092
+      MONGO_INTEGRATION_URI: mongodb://127.0.0.1:27017
+      ALLOW_DESTRUCTIVE_INTEGRATION_TESTS: "true"
+      RUN_DISPOSABLE_ANALYTICS_BENCHMARK: "true"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: consumer/package-lock.json
+
+      - run: npm ci
+        working-directory: consumer
+
+      - name: Record execution metadata
+        run: |
+          mkdir -p benchmark-results
+          node <<'NODE'
+          const fs = require('node:fs');
+          const crypto = require('node:crypto');
+          const script = 'consumer/tests/analyticsBenchmark.js';
+          const metadata = {
+            commit: process.env.GITHUB_SHA,
+            runnerOs: process.env.RUNNER_OS,
+            node: process.version,
+            kafkaImage: 'apache/kafka:3.9.0',
+            mongoImage: 'mongo:7.0.16',
+            benchmark: {
+              command: 'node tests/analyticsBenchmark.js',
+              script,
+              scriptSha256: crypto.createHash('sha256').update(fs.readFileSync(script)).digest('hex'),
+              kafkaBroker: process.env.KAFKA_INTEGRATION_BROKER,
+              mongoUri: process.env.MONGO_INTEGRATION_URI,
+              destructiveOptIn: process.env.ALLOW_DESTRUCTIVE_INTEGRATION_TESTS,
+              benchmarkOptIn: process.env.RUN_DISPOSABLE_ANALYTICS_BENCHMARK,
+              workloadSettings: 'See runs[].settings and payload in analytics-benchmark.json when successful.',
+            },
+          };
+          fs.writeFileSync('benchmark-results/metadata.json', JSON.stringify(metadata, null, 2) + '\n');
+          NODE
+
+      - name: Run analytics benchmark
+        working-directory: consumer
+        run: node tests/analyticsBenchmark.js > ../benchmark-results/analytics-benchmark.json
+
+      - name: Validate benchmark result
+        run: |
+          node -e "const result = JSON.parse(require('node:fs').readFileSync('benchmark-results/analytics-benchmark.json', 'utf8')); if (result.success !== true) { throw new Error('Benchmark JSON does not report success=true'); }"
+
+      - name: Upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: analytics-benchmark-results
+          path: benchmark-results/
+          if-no-files-found: warn
+          retention-days: 14
