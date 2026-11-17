@@ -41,6 +41,119 @@ async function waitFor(description, check, timeoutMs = 20000) {
   throw new Error(`Timed out waiting for ${description}`);
 }
 
+async function waitForCoordinator(fetchOffsets, timeoutMs = 10000) {
+  const deadline = Date.now() + timeoutMs;
+  let lastError;
+  let lastProtocolError;
+  while (Date.now() < deadline) {
+    try {
+      return await fetchOffsets();
+    } catch (error) {
+      const protocolError = error.name === "KafkaJSNumberOfRetriesExceeded" ? error.cause : error;
+      const transient = protocolError && (
+        [14, 15, 16].includes(protocolError.code) ||
+        [
+          "GROUP_LOAD_IN_PROGRESS",
+          "GROUP_COORDINATOR_NOT_AVAILABLE",
+          "NOT_COORDINATOR_FOR_GROUP",
+          "COORDINATOR_LOAD_IN_PROGRESS",
+          "COORDINATOR_NOT_AVAILABLE",
+          "NOT_COORDINATOR",
+        ].includes(protocolError.type)
+      );
+      if (!transient) throw error;
+      lastError = error;
+      lastProtocolError = protocolError;
+      const remaining = deadline - Date.now();
+      if (remaining > 0) await new Promise((resolve) => setTimeout(resolve, Math.min(100, remaining)));
+    }
+  }
+  throw new Error(
+    `Timed out waiting for Kafka group coordinator after ${timeoutMs}ms: ` +
+    `${lastProtocolError.type || "unknown"} (code ${lastProtocolError.code}): ${lastProtocolError.message}`,
+    { cause: lastError },
+  );
+}
+
+function formatCleanupError(error) {
+  if (!Array.isArray(error.groups)) return error.message;
+  const groups = error.groups.map(({ groupId, errorCode, error: protocolError }) => ({
+    groupId,
+    errorCode,
+    error: protocolError && {
+      name: protocolError.name,
+      message: protocolError.message,
+      type: protocolError.type,
+      code: protocolError.code,
+    },
+  }));
+  return `${error.message}; groups: ${JSON.stringify(groups)}`;
+}
+
+describe("Kafka coordinator readiness and cleanup diagnostics", () => {
+  afterEach(() => jest.useRealTimers());
+
+  test.each([
+    { code: 14 },
+    { code: 15 },
+    { code: 16 },
+    { type: "GROUP_LOAD_IN_PROGRESS" },
+    { type: "GROUP_COORDINATOR_NOT_AVAILABLE" },
+    { type: "NOT_COORDINATOR_FOR_GROUP" },
+    { type: "COORDINATOR_LOAD_IN_PROGRESS" },
+    { type: "COORDINATOR_NOT_AVAILABLE" },
+    { type: "NOT_COORDINATOR" },
+  ])("retries transient coordinator errors: %j", async (error) => {
+    jest.useFakeTimers();
+    const fetchOffsets = jest.fn().mockRejectedValueOnce(error).mockResolvedValueOnce({ 0: "-1" });
+    const result = waitForCoordinator(fetchOffsets);
+    await jest.advanceTimersByTimeAsync(100);
+    await expect(result).resolves.toEqual({ 0: "-1" });
+    expect(fetchOffsets).toHaveBeenCalledTimes(2);
+  });
+
+  test("fails immediately for other errors", async () => {
+    const error = Object.assign(new Error("not authorized"), { code: 30 });
+    await expect(waitForCoordinator(jest.fn().mockRejectedValue(error))).rejects.toBe(error);
+  });
+
+  test("retries a coordinator error wrapped by KafkaJS", async () => {
+    jest.useFakeTimers();
+    const cause = Object.assign(new Error("not coordinator"), { code: 16 });
+    const error = Object.assign(new Error("retries exceeded"), {
+      name: "KafkaJSNumberOfRetriesExceeded", cause,
+    });
+    const fetchOffsets = jest.fn().mockRejectedValueOnce(error).mockResolvedValueOnce({ 0: "-1" });
+    const result = waitForCoordinator(fetchOffsets);
+    await jest.advanceTimersByTimeAsync(100);
+    await expect(result).resolves.toEqual({ 0: "-1" });
+  });
+
+  test("reports the final coordinator error on timeout", async () => {
+    jest.useFakeTimers();
+    const error = Object.assign(new Error("not coordinator"), { code: 16, type: "NOT_COORDINATOR_FOR_GROUP" });
+    const result = expect(waitForCoordinator(jest.fn().mockRejectedValue(error), 200)).rejects.toMatchObject({
+      message: expect.stringContaining("NOT_COORDINATOR_FOR_GROUP (code 16): not coordinator"),
+      cause: error,
+    });
+    await jest.advanceTimersByTimeAsync(200);
+    await result;
+  });
+
+  test("includes Kafka group deletion protocol details", () => {
+    const error = Object.assign(new Error("Error in DeleteGroups"), {
+      groups: [{
+        groupId: "test-group",
+        errorCode: 69,
+        error: Object.assign(new Error("group not found"), { type: "GROUP_ID_NOT_FOUND", code: 69 }),
+      }],
+    });
+    expect(formatCleanupError(error)).toContain('"errorCode":69');
+    expect(formatCleanupError(error)).toContain('"type":"GROUP_ID_NOT_FOUND"');
+    expect(formatCleanupError(error)).toContain('"code":69');
+  });
+});
+
 describeIntegration("commit reconciliation with real Kafka and MongoDB", () => {
   jest.setTimeout(120000);
   const resources = createKafkaTestResources();
@@ -128,7 +241,7 @@ describeIntegration("commit reconciliation with real Kafka and MongoDB", () => {
     for (const item of gates) item.resolve();
     const errors = [];
     async function clean(label, action) {
-      try { await action(); } catch (error) { errors.push(`${label}: ${error.message}`); }
+      try { await action(); } catch (error) { errors.push(`${label}: ${formatCleanupError(error)}`); }
     }
     for (const worker of workers) await clean("worker drain", () => worker.drain());
     for (const consumer of consumers) await clean("consumer disconnect", () => consumer.disconnect());
@@ -174,7 +287,8 @@ describeIntegration("commit reconciliation with real Kafka and MongoDB", () => {
       topic, messages: [0, 1].flatMap((partition) =>
         [0, 1, 2].map((value) => ({ partition, value: `${partition}-${value}` }))),
     });
-    expect(await offsets()).toEqual({ 0: "-1", 1: "-1" });
+    const initialOffsets = await waitForCoordinator(offsets);
+    expect(initialOffsets).toEqual({ 0: "-1", 1: "-1" });
 
     const worker = createCommitReconciliation({ admin: kafka.admin(), collection, groupId, topic });
     workers.push(worker);
