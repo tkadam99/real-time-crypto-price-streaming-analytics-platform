@@ -1,6 +1,10 @@
-const { randomUUID } = require("node:crypto");
 const { performance } = require("node:perf_hooks");
 require("dotenv").config();
+const {
+  createKafkaConnectionOptions,
+  createKafkaTestResources,
+  getKafkaIntegrationBroker,
+} = require("../../test-utils/kafkaIntegrationSafety");
 const {
   createMongoTestDatabase,
   dropMongoTestDatabase,
@@ -10,8 +14,8 @@ const { Kafka, logLevel } = require("kafkajs");
 const { MongoClient, Long } = require("mongodb");
 const { createCommitReconciliation } = require("../src/commitReconciliation");
 
-const broker = process.env.KAFKA_INTEGRATION_BROKER;
-const mongoUri = getMongoIntegrationUri(process.env);
+const broker = getKafkaIntegrationBroker(process.env);
+const mongoUri = broker ? getMongoIntegrationUri(process.env) : null;
 const describeIntegration = broker && mongoUri ? describe : describe.skip;
 
 async function waitFor(label, predicate, timeout = 60000) {
@@ -36,10 +40,12 @@ function stats(values) {
 
 describeIntegration("decision cleanup sustained Kafka workload", () => {
   jest.setTimeout(240000);
-  const suffix = randomUUID().replace(/-/g, "");
-  const topic = `cleanup-load-${suffix}`;
-  const groupId = `cleanup-load-${suffix}`;
-  const kafka = new Kafka({ clientId: `cleanup-load-${suffix}`, brokers: [broker], logLevel: logLevel.NOTHING });
+  const resources = createKafkaTestResources();
+  const topic = resources.createTopicName("cleanup-load");
+  const groupId = resources.createGroupName("cleanup-load");
+  const kafka = broker && new Kafka({
+    clientId: topic, ...createKafkaConnectionOptions(broker), logLevel: logLevel.NOTHING,
+  });
   let mongo;
   let db;
   let collection;
@@ -120,8 +126,8 @@ describeIntegration("decision cleanup sustained Kafka workload", () => {
     if (consumer) await clean("consumer", () => consumer.disconnect());
     if (producer) await clean("producer", () => producer.disconnect());
     if (admin && topicCreated) {
-      await clean("group", () => admin.deleteGroups([groupId]));
-      await clean("topic", () => admin.deleteTopics({ topics: [topic] }));
+      await clean("group", () => resources.deleteGroups(admin, [groupId]));
+      await clean("topic", () => resources.deleteTopic(admin, topic));
     }
     if (admin) await clean("admin", () => admin.disconnect());
     if (db) await clean("database", () => dropMongoTestDatabase(db));

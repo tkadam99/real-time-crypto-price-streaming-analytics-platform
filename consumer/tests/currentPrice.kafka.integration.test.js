@@ -1,6 +1,10 @@
 const { EventEmitter } = require("node:events");
-const { randomUUID } = require("node:crypto");
 require("dotenv").config();
+const {
+  createKafkaConnectionOptions,
+  createKafkaTestResources,
+  getKafkaIntegrationBroker,
+} = require("../../test-utils/kafkaIntegrationSafety");
 const {
   createMongoTestDatabase,
   dropMongoTestDatabase,
@@ -10,17 +14,19 @@ const { Kafka, logLevel } = require("kafkajs");
 const { MongoClient } = require("mongodb");
 const { createCurrentPriceService } = require("../src/currentPriceConsumer");
 
-const broker = process.env.KAFKA_INTEGRATION_BROKER;
-const uri = getMongoIntegrationUri(process.env);
+const broker = getKafkaIntegrationBroker(process.env);
+const uri = broker ? getMongoIntegrationUri(process.env) : null;
 const describeIntegration = broker && uri ? describe : describe.skip;
 
 describeIntegration("current-price consumer Kafka and MongoDB integration", () => {
   jest.setTimeout(120000);
-  const suffix = randomUUID().replace(/-/g, "");
-  const topic = `current-price-test-${suffix}`;
-  const group = `current-price-test-${suffix}`;
-  const otherGroup = `current-price-other-${suffix}`;
-  const kafka = new Kafka({ clientId: `current-price-test-${suffix}`, brokers: [broker], logLevel: logLevel.NOTHING });
+  const resources = createKafkaTestResources();
+  const topic = resources.createTopicName("current-price");
+  const group = resources.createGroupName("current-price");
+  const otherGroup = resources.createGroupName("current-price-other");
+  const kafka = broker && new Kafka({
+    clientId: topic, ...createKafkaConnectionOptions(broker), logLevel: logLevel.NOTHING,
+  });
   let admin, producer, client, db, dbName, collection, service, other, topicCreated = false;
   const services = [];
   const logs = [];
@@ -130,8 +136,8 @@ describeIntegration("current-price consumer Kafka and MongoDB integration", () =
     if (other) await cleanup("other group", () => other.disconnect());
     if (producer) await cleanup("producer", () => producer.disconnect());
     if (admin && topicCreated) {
-      await cleanup("groups", () => admin.deleteGroups([group, otherGroup]));
-      await cleanup("topic", () => admin.deleteTopics({ topics: [topic] }));
+      await cleanup("groups", () => resources.deleteGroups(admin, [group, otherGroup]));
+      await cleanup("topic", () => resources.deleteTopic(admin, topic));
     }
     if (admin) await cleanup("admin", () => admin.disconnect());
     if (db) await cleanup("database", () => dropMongoTestDatabase(db));

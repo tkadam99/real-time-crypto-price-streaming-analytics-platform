@@ -1,5 +1,9 @@
-const { randomUUID } = require("node:crypto");
 require("dotenv").config();
+const {
+  createKafkaConnectionOptions,
+  createKafkaTestResources,
+  getKafkaIntegrationBroker,
+} = require("../../test-utils/kafkaIntegrationSafety");
 const {
   createMongoTestDatabase,
   dropMongoTestDatabase,
@@ -9,8 +13,8 @@ const { Kafka, logLevel } = require("kafkajs");
 const { MongoClient, Long } = require("mongodb");
 const { createCommitReconciliation } = require("../src/commitReconciliation");
 
-const broker = process.env.KAFKA_INTEGRATION_BROKER;
-const mongoUri = getMongoIntegrationUri(process.env);
+const broker = getKafkaIntegrationBroker(process.env);
+const mongoUri = broker ? getMongoIntegrationUri(process.env) : null;
 const describeIntegration = broker && mongoUri ? describe : describe.skip;
 
 function deferred() {
@@ -39,10 +43,12 @@ async function waitFor(description, check, timeoutMs = 20000) {
 
 describeIntegration("commit reconciliation with real Kafka and MongoDB", () => {
   jest.setTimeout(120000);
-  const suffix = randomUUID().replace(/-/g, "");
-  const topic = `reconcile-test-${suffix}`;
-  const groupId = `reconcile-test-${suffix}`;
-  const kafka = new Kafka({ clientId: `reconcile-test-${suffix}`, brokers: [broker], logLevel: logLevel.NOTHING });
+  const resources = createKafkaTestResources();
+  const topic = resources.createTopicName("reconcile");
+  const groupId = resources.createGroupName("reconcile");
+  const kafka = broker && new Kafka({
+    clientId: topic, ...createKafkaConnectionOptions(broker), logLevel: logLevel.NOTHING,
+  });
   const consumers = [];
   const workers = [];
   const gates = [];
@@ -128,8 +134,8 @@ describeIntegration("commit reconciliation with real Kafka and MongoDB", () => {
     for (const consumer of consumers) await clean("consumer disconnect", () => consumer.disconnect());
     if (producer) await clean("producer disconnect", () => producer.disconnect());
     if (admin && topicCreated) {
-      await clean("test group deletion", () => admin.deleteGroups([groupId]));
-      await clean("test topic deletion", () => admin.deleteTopics({ topics: [topic] }));
+      await clean("test group deletion", () => resources.deleteGroups(admin, [groupId]));
+      await clean("test topic deletion", () => resources.deleteTopic(admin, topic));
     }
     if (admin) await clean("admin disconnect", () => admin.disconnect());
     if (db) await clean("test database drop", () => dropMongoTestDatabase(db));
@@ -436,7 +442,7 @@ describeIntegration("commit reconciliation with real Kafka and MongoDB", () => {
     restartGate.resolve();
     await restarted.disconnect();
 
-    await admin.setOffsets({
+    await resources.setOffsets(admin, {
       groupId, topic, partitions: [{ partition: 0, offset: "0" }, { partition: 1, offset: "3" }],
     });
     expect(await offsets()).toEqual({ 0: "0", 1: "3" });
