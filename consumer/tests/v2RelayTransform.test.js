@@ -7,13 +7,11 @@ const sourceRecord = {
   topic: "crypto-prices",
   partition: 2,
   offset: "9007199254740993",
-  message: {
-    value: Buffer.from(JSON.stringify({
-      symbol: "BTC-USD",
-      price: 105.5,
-      timestamp: "2026-01-01T00:01:00+00:00",
-    })),
-  },
+  value: Buffer.from(JSON.stringify({
+    symbol: "BTC-USD",
+    price: 105.5,
+    timestamp: "2026-01-01T00:01:00+00:00",
+  })),
 };
 
 test.each([
@@ -23,13 +21,11 @@ test.each([
 ])("transforms %s to its fixed V2 partition", (symbol, expectedPartition) => {
   const record = {
     ...sourceRecord,
-    message: {
-      value: JSON.stringify({
-        symbol,
-        price: 105.5,
-        timestamp: "2026-01-01T00:01:00+00:00",
-      }),
-    },
+    value: JSON.stringify({
+      symbol,
+      price: 105.5,
+      timestamp: "2026-01-01T00:01:00+00:00",
+    }),
   };
   const output = transformV1Record(
     record, sourceClusterId, sourceTopicGenerationId, 6,
@@ -62,7 +58,7 @@ test("preserves the original source identity and exact offset string", () => {
 test("rejects malformed JSON", () => {
   const record = {
     ...sourceRecord,
-    message: { value: Buffer.from("{") },
+    value: Buffer.from("{"),
   };
 
   expect(() => transformV1Record(
@@ -73,13 +69,11 @@ test("rejects malformed JSON", () => {
 test("rejects unsupported symbols", () => {
   const record = {
     ...sourceRecord,
-    message: {
-      value: JSON.stringify({
-        symbol: "DOGE-USD",
-        price: 105.5,
-        timestamp: "2026-01-01T00:01:00+00:00",
-      }),
-    },
+    value: JSON.stringify({
+      symbol: "DOGE-USD",
+      price: 105.5,
+      timestamp: "2026-01-01T00:01:00+00:00",
+    }),
   };
 
   expect(() => transformV1Record(

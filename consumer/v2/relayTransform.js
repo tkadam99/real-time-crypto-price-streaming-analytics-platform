@@ -8,11 +8,7 @@ function transformV1Record(record, clusterId, topicGenerationId, partitionCount)
   if (record === null || typeof record !== "object" || Array.isArray(record)) {
     throw new Error("Invalid V1 Kafka record.");
   }
-  if (record.message === null || typeof record.message !== "object") {
-    throw new Error("Invalid V1 Kafka message.");
-  }
-
-  const { value } = record.message;
+  const { value } = record;
   let serializedEvent;
   if (Buffer.isBuffer(value)) {
     serializedEvent = value.toString("utf8");
