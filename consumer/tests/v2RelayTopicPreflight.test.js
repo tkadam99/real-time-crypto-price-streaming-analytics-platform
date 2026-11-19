@@ -4,6 +4,7 @@ const { verifyV1TopicId } = require("../v2/relayTopicPreflight");
 const relayConfig = loadRelayConfig({
   V1_SOURCE_CLUSTER_ID: "0jtOiYT4QmShqPK0HjBpQA",
   V1_SOURCE_TOPIC_GENERATION_ID: "9ShfnW90Th-vI4A2Jl1O4Q",
+  V2_DESTINATION_CLUSTER_ID: "4L6g3nShT-eMCtK--X86sw",
 });
 const topicId = relayConfig.sourceIdentity.topicGenerationId;
 const describeOutput = `Topic: crypto-prices    TopicId: ${topicId} PartitionCount: 1 ReplicationFactor: 1 Configs: cleanup.policy=delete
