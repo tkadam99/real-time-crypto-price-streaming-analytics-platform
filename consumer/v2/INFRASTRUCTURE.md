@@ -42,6 +42,26 @@ Direct connection bypasses replica-set member discovery. Verify MongoDB driver
 transaction support using this URI before relying on transactions from host-run
 applications; prefer running those applications inside the V2 network.
 
+## Planned V2 history persistence contract
+
+The offline contract in `consumer/v2/historyContract.js` defines two separate
+document shapes; it does not connect to MongoDB, write documents, or create
+indexes. Both documents use the same deterministic `_id`, derived from the
+JSON serialization of the ordered source identity tuple:
+`clusterId`, `topicGenerationId`, `topic`, `partition`, and the exact string
+`offset`.
+
+The price-history document contains `_id`, `symbol`, `price`, the original
+event `timestamp`, `source`, and insertion-time `createdAt`. The event timestamp
+is not an insertion time. The replay-receipt document contains `_id` and
+`source`, retaining the source identity independently after history expires.
+
+The intended indexes are a unique `_id` index on each collection and a
+`{ createdAt: 1 }` TTL index on price history with `expireAfterSeconds: 86400`.
+The receipt collection must have no TTL index. MongoDB applies TTL deletion
+asynchronously after the 24-hour expiration; this is not an exact-time
+deletion guarantee.
+
 ## Verify
 
 ```powershell
