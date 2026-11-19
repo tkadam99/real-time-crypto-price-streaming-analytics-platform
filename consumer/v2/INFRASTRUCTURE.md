@@ -75,6 +75,25 @@ $env:V1_SOURCE_TOPIC_GENERATION_ID = "9ShfnW90Th-vI4A2Jl1O4Q"
 $env:V2_DESTINATION_CLUSTER_ID = "4L6g3nShT-eMCtK--X86sw"
 ```
 
+### First-run offset boundary
+
+The V1 topic `crypto-prices` was observed to have one partition. Before the
+first relay run, the dedicated group `crypto-v2-relay-group` was verified
+absent. A read-only offset snapshot returned
+`crypto-prices:0:3023582`; this is a historical observation, not a fixed
+startup offset.
+
+The relay subscribes with `fromBeginning: false`. A new group therefore starts
+from Kafka's latest position when its partition is assigned. Earlier V1 history
+and records arriving before assignment are not backfilled. The initial run is
+deliberately a live-only smoke test, not a complete or gap-free migration.
+After the group commits offsets, subsequent runs resume from those committed
+positions.
+
+Before the initial live run, recheck that `crypto-v2-relay-group` has no
+committed offsets. Before every live run, verify that both Kafka cluster
+identities remain correct. Never reset or alter existing V1 consumer groups.
+
 From the repository root, start the relay explicitly:
 
 ```powershell
