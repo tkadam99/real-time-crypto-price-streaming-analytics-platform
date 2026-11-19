@@ -1,6 +1,7 @@
 const V1_TOPIC = "crypto-prices";
 const TOPIC_ID_PATTERN = /^[A-Za-z0-9_-]{22}$/;
-const APPROVED_ARGS = Object.freeze([
+const TOPIC_PREFLIGHT_COMMAND = "docker";
+const TOPIC_PREFLIGHT_ARGS = Object.freeze([
   "exec",
   "kafka",
   "kafka-topics",
@@ -73,7 +74,11 @@ async function verifyV1TopicId(relayConfig, executeCommand) {
 
   let result;
   try {
-    result = await executeCommand("docker", [...APPROVED_ARGS], { shell: false });
+    result = await executeCommand(
+      TOPIC_PREFLIGHT_COMMAND,
+      [...TOPIC_PREFLIGHT_ARGS],
+      { shell: false },
+    );
   } catch {
     throw new Error("V1 Kafka topic-ID preflight command failed.");
   }
@@ -93,4 +98,8 @@ async function verifyV1TopicId(relayConfig, executeCommand) {
   return true;
 }
 
-module.exports = { verifyV1TopicId };
+module.exports = {
+  TOPIC_PREFLIGHT_COMMAND,
+  TOPIC_PREFLIGHT_ARGS,
+  verifyV1TopicId,
+};

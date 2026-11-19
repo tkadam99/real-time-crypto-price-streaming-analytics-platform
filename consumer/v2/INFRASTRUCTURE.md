@@ -55,6 +55,32 @@ Confirm both init services exited successfully, the broker and MongoDB are
 healthy, the topic reports six partitions with replication factor one, and
 `rs.status()` reports `rs-v2` with one `PRIMARY` member.
 
+## Host-only V2 Kafka relay
+
+The relay runs on the Windows host, not in Compose. It uses separate KafkaJS
+clients for V1 at `127.0.0.1:9092` and V2 at `127.0.0.1:19092`. The existing V1
+container must be running with the Docker name `kafka`; before starting its
+consumer, the relay uses the Docker CLI for a bounded, shell-disabled,
+read-only topic-ID preflight. Both the V1 cluster ID and topic-generation ID
+must match before the relay consumer connects or subscribes.
+
+Set the mandatory V1 source identifiers in PowerShell:
+
+```powershell
+$env:V1_SOURCE_CLUSTER_ID = "0jtOiYT4QmShqPK0HjBpQA"
+$env:V1_SOURCE_TOPIC_GENERATION_ID = "9ShfnW90Th-vI4A2Jl1O4Q"
+```
+
+From the repository root, start the relay explicitly:
+
+```powershell
+node consumer/v2/relayMain.js
+```
+
+The relay uses group `crypto-v2-relay-group`. SIGINT and SIGTERM trigger
+graceful shutdown; no relay starts when configuration or either identity check
+fails.
+
 ## Stop and persistence
 
 ```powershell
