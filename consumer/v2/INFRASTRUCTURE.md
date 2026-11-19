@@ -12,7 +12,7 @@ initialization fails without changing it.
 From the repository root:
 
 ```powershell
-docker compose -f docker-compose.v2.yml up -d
+docker compose -p crypto-v2 -f docker-compose.v2.yml up -d
 ```
 
 Kafka host clients use `127.0.0.1:19092`; future V2 containers on this Compose
@@ -45,10 +45,10 @@ applications; prefer running those applications inside the V2 network.
 ## Verify
 
 ```powershell
-docker compose -f docker-compose.v2.yml ps
-docker compose -f docker-compose.v2.yml logs v2-mongo-init v2-topic-init
-docker compose -f docker-compose.v2.yml exec v2-kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server v2-kafka:29092 --describe --topic crypto-prices-v2
-docker compose -f docker-compose.v2.yml exec v2-mongodb mongosh --quiet --eval "rs.status()"
+docker compose -p crypto-v2 -f docker-compose.v2.yml ps
+docker compose -p crypto-v2 -f docker-compose.v2.yml logs v2-mongo-init v2-topic-init
+docker compose -p crypto-v2 -f docker-compose.v2.yml exec v2-kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server v2-kafka:29092 --describe --topic crypto-prices-v2
+docker compose -p crypto-v2 -f docker-compose.v2.yml exec v2-mongodb mongosh --quiet --eval "rs.status()"
 ```
 
 Confirm both init services exited successfully, the broker and MongoDB are
@@ -61,14 +61,18 @@ The relay runs on the Windows host, not in Compose. It uses separate KafkaJS
 clients for V1 at `127.0.0.1:9092` and V2 at `127.0.0.1:19092`. The existing V1
 container must be running with the Docker name `kafka`; before starting its
 consumer, the relay uses the Docker CLI for a bounded, shell-disabled,
-read-only topic-ID preflight. Both the V1 cluster ID and topic-generation ID
-must match before the relay consumer connects or subscribes.
+read-only topic-ID preflight. Before connecting the V1 consumer or V2 producer,
+the relay verifies the V1 topic ID and cluster ID, then verifies the V2 cluster
+ID and `crypto-prices-v2` metadata (exactly six partitions, with partitions
+0-2 having leaders). It uses separate V1 and V2 Kafka admin clients and
+disconnects both after verification, including on failure or cancellation.
 
-Set the mandatory V1 source identifiers in PowerShell:
+Set the mandatory V1 source and V2 destination identifiers in PowerShell:
 
 ```powershell
 $env:V1_SOURCE_CLUSTER_ID = "0jtOiYT4QmShqPK0HjBpQA"
 $env:V1_SOURCE_TOPIC_GENERATION_ID = "9ShfnW90Th-vI4A2Jl1O4Q"
+$env:V2_DESTINATION_CLUSTER_ID = "4L6g3nShT-eMCtK--X86sw"
 ```
 
 From the repository root, start the relay explicitly:
@@ -78,13 +82,13 @@ node consumer/v2/relayMain.js
 ```
 
 The relay uses group `crypto-v2-relay-group`. SIGINT and SIGTERM trigger
-graceful shutdown; no relay starts when configuration or either identity check
-fails.
+graceful shutdown; no relay starts when configuration or any of the three
+identity and destination checks fails.
 
 ## Stop and persistence
 
 ```powershell
-docker compose -f docker-compose.v2.yml down
+docker compose -p crypto-v2 -f docker-compose.v2.yml down
 ```
 
 This stops/removes only this Compose project's containers and network. It keeps

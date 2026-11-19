@@ -6,6 +6,7 @@ const {
 
 const SOURCE_CLUSTER_ID = "0jtOiYT4QmShqPK0HjBpQA";
 const SOURCE_TOPIC_GENERATION_ID = "9ShfnW90Th-vI4A2Jl1O4Q";
+const DESTINATION_CLUSTER_ID = "4L6g3nShT-eMCtK--X86sw";
 const V1_CONSUMER_GROUPS = new Set([
   "crypto-analytics-group",
   "crypto-current-price-group",
@@ -30,6 +31,9 @@ function loadRelayConfig(env) {
   }
   if (env.V1_SOURCE_TOPIC_GENERATION_ID !== SOURCE_TOPIC_GENERATION_ID) {
     throw new Error("V1_SOURCE_TOPIC_GENERATION_ID is missing or does not match the expected topic generation.");
+  }
+  if (env.V2_DESTINATION_CLUSTER_ID !== DESTINATION_CLUSTER_ID) {
+    throw new Error("V2_DESTINATION_CLUSTER_ID is missing or does not match the expected destination cluster.");
   }
 
   const partitionValue = env.V2_KAFKA_PARTITION_COUNT === undefined
@@ -68,6 +72,9 @@ function loadRelayConfig(env) {
     sourceIdentity: {
       clusterId: SOURCE_CLUSTER_ID,
       topicGenerationId: SOURCE_TOPIC_GENERATION_ID,
+    },
+    destinationIdentity: {
+      clusterId: DESTINATION_CLUSTER_ID,
     },
   };
 }

@@ -73,6 +73,7 @@ function createRelayApplication({
     brokers: [relayConfig.v2KafkaBroker],
   });
   const admin = v1Kafka.admin();
+  const destinationAdmin = v2Kafka.admin();
   const consumer = v1Kafka.consumer({
     groupId: relayConfig.consumerGroupId,
     allowAutoTopicCreation: false,
@@ -148,6 +149,7 @@ function createRelayApplication({
   const startup = createRelayStartup({
     relayConfig,
     admin,
+    destinationAdmin,
     executeCommand: runCommand,
     createRunner: createManagedRunner,
   });

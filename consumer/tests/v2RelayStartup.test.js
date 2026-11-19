@@ -4,14 +4,27 @@ const { createRelayStartup } = require("../v2/relayStartup");
 const relayConfig = loadRelayConfig({
   V1_SOURCE_CLUSTER_ID: "0jtOiYT4QmShqPK0HjBpQA",
   V1_SOURCE_TOPIC_GENERATION_ID: "9ShfnW90Th-vI4A2Jl1O4Q",
+  V2_DESTINATION_CLUSTER_ID: "4L6g3nShT-eMCtK--X86sw",
 });
 const topicId = relayConfig.sourceIdentity.topicGenerationId;
 const topicOutput = `Topic: crypto-prices TopicId: ${topicId} PartitionCount: 1 ReplicationFactor: 1 Configs: cleanup.policy=delete
   Topic: crypto-prices Partition: 0 Leader: 1 Replicas: 1 Isr: 1`;
+const destinationTopicMetadata = {
+  topics: [{
+    name: relayConfig.v2Topic,
+    partitions: [0, 1, 2, 3, 4, 5].map((partitionId) => ({
+      partitionId,
+      leader: 1,
+      partitionErrorCode: 0,
+    })),
+  }],
+};
 
 function createHarness({
   command = jest.fn().mockResolvedValue({ stdout: topicOutput, stderr: "", exitCode: 0 }),
   clusterId = relayConfig.sourceIdentity.clusterId,
+  destinationClusterId = relayConfig.destinationIdentity.clusterId,
+  destinationMetadata = destinationTopicMetadata,
   runnerStart = jest.fn().mockResolvedValue(),
 } = {}) {
   const events = [];
@@ -21,6 +34,18 @@ function createHarness({
     describeCluster: jest.fn(async () => {
       events.push("admin.describeCluster");
       return { clusterId };
+    }),
+  };
+  const destinationAdmin = {
+    connect: jest.fn(async () => events.push("destinationAdmin.connect")),
+    disconnect: jest.fn(async () => events.push("destinationAdmin.disconnect")),
+    describeCluster: jest.fn(async () => {
+      events.push("destinationAdmin.describeCluster");
+      return { clusterId: destinationClusterId };
+    }),
+    fetchTopicMetadata: jest.fn(async () => {
+      events.push("destinationAdmin.fetchTopicMetadata");
+      return destinationMetadata;
     }),
   };
   const runner = {
@@ -37,14 +62,23 @@ function createHarness({
   const startup = createRelayStartup({
     relayConfig,
     admin,
+    destinationAdmin,
     executeCommand: command,
     createRunner,
   });
 
-  return { admin, command, createRunner, events, runner, startup };
+  return {
+    admin,
+    command,
+    createRunner,
+    destinationAdmin,
+    events,
+    runner,
+    startup,
+  };
 }
 
-test("completes both identity checks before creating and starting the runner", async () => {
+test("completes all three identity checks and disconnects both admins before starting the runner", async () => {
   const harness = createHarness();
   harness.command.mockImplementation(async () => {
     harness.events.push("topic.preflight");
@@ -54,8 +88,13 @@ test("completes both identity checks before creating and starting the runner", a
 
   expect(harness.events).toEqual([
     "admin.connect",
+    "destinationAdmin.connect",
     "topic.preflight",
     "admin.describeCluster",
+    "destinationAdmin.describeCluster",
+    "destinationAdmin.fetchTopicMetadata",
+    "admin.disconnect",
+    "destinationAdmin.disconnect",
     "runner.create",
     "runner.start",
   ]);
@@ -77,6 +116,7 @@ test("topic-ID failure prevents runner creation and disconnects the admin", asyn
   expect(harness.createRunner).not.toHaveBeenCalled();
   expect(harness.admin.describeCluster).not.toHaveBeenCalled();
   expect(harness.admin.disconnect).toHaveBeenCalledTimes(1);
+  expect(harness.destinationAdmin.disconnect).toHaveBeenCalledTimes(1);
   expect(harness.events).toContain("admin.disconnect");
 });
 
@@ -88,6 +128,63 @@ test("cluster-ID failure prevents runner creation", async () => {
 
   expect(harness.createRunner).not.toHaveBeenCalled();
   expect(harness.admin.disconnect).toHaveBeenCalledTimes(1);
+  expect(harness.destinationAdmin.disconnect).toHaveBeenCalledTimes(1);
+});
+
+test.each([
+  [
+    "wrong V2 cluster",
+    { destinationClusterId: relayConfig.sourceIdentity.clusterId },
+    "V2 destination identity verification",
+  ],
+  [
+    "missing V2 topic",
+    { destinationMetadata: { topics: [] } },
+    "V2 destination identity verification",
+  ],
+  [
+    "wrong V2 partition count",
+    {
+      destinationMetadata: {
+        topics: [{
+          name: relayConfig.v2Topic,
+          partitions: destinationTopicMetadata.topics[0].partitions.slice(0, 5),
+        }],
+      },
+    },
+    "V2 destination identity verification",
+  ],
+])("%s prevents relay startup and disconnects both admins", async (
+  _name,
+  options,
+  stage,
+) => {
+  const harness = createHarness(options);
+
+  await expect(harness.startup.start())
+    .rejects.toThrow(`Relay startup failed during ${stage}.`);
+
+  expect(harness.createRunner).not.toHaveBeenCalled();
+  expect(harness.runner.start).not.toHaveBeenCalled();
+  expect(harness.admin.disconnect).toHaveBeenCalledTimes(1);
+  expect(harness.destinationAdmin.disconnect).toHaveBeenCalledTimes(1);
+});
+
+test("V2 metadata failure prevents relay startup and sanitizes the error", async () => {
+  const destinationAdminOptions = {
+    destinationMetadata: null,
+  };
+  const harness = createHarness(destinationAdminOptions);
+  harness.destinationAdmin.fetchTopicMetadata.mockRejectedValue(
+    new Error("credential=secret"),
+  );
+
+  await expect(harness.startup.start())
+    .rejects.toThrow("Relay startup failed during V2 destination identity verification.");
+
+  expect(harness.createRunner).not.toHaveBeenCalled();
+  expect(harness.admin.disconnect).toHaveBeenCalledTimes(1);
+  expect(harness.destinationAdmin.disconnect).toHaveBeenCalledTimes(1);
 });
 
 test("cleans up a partially started runner and admin after startup failure", async () => {
@@ -100,7 +197,16 @@ test("cleans up a partially started runner and admin after startup failure", asy
 
   expect(harness.runner.stop).toHaveBeenCalledTimes(1);
   expect(harness.admin.disconnect).toHaveBeenCalledTimes(1);
-  expect(harness.events.slice(-2)).toEqual(["runner.stop", "admin.disconnect"]);
+  expect(harness.destinationAdmin.disconnect).toHaveBeenCalledTimes(1);
+  expect(harness.events.indexOf("admin.disconnect"))
+    .toBeLessThan(harness.events.indexOf("runner.create"));
+  expect(harness.events.indexOf("destinationAdmin.disconnect"))
+    .toBeLessThan(harness.events.indexOf("runner.create"));
+  expect(harness.events.slice(-3)).toEqual([
+    "runner.create",
+    "runner.start",
+    "runner.stop",
+  ]);
 });
 
 test("duplicate starts share one startup and one relay runner", async () => {
@@ -112,8 +218,13 @@ test("duplicate starts share one startup and one relay runner", async () => {
   await Promise.all([firstStart, secondStart]);
 
   expect(harness.admin.connect).toHaveBeenCalledTimes(1);
+  expect(harness.destinationAdmin.connect).toHaveBeenCalledTimes(1);
   expect(harness.command).toHaveBeenCalledTimes(1);
   expect(harness.admin.describeCluster).toHaveBeenCalledTimes(1);
+  expect(harness.destinationAdmin.describeCluster).toHaveBeenCalledTimes(1);
+  expect(harness.destinationAdmin.fetchTopicMetadata).toHaveBeenCalledTimes(1);
+  expect(harness.admin.disconnect).toHaveBeenCalledTimes(1);
+  expect(harness.destinationAdmin.disconnect).toHaveBeenCalledTimes(1);
   expect(harness.createRunner).toHaveBeenCalledTimes(1);
   expect(harness.runner.start).toHaveBeenCalledTimes(1);
 });
@@ -140,6 +251,7 @@ test("shutdown during topic preflight cancels startup and waits for cleanup", as
   void shutdownPromise.then(() => { shutdownCompleted = true; });
   expect(shutdownCompleted).toBe(false);
   expect(harness.admin.disconnect).not.toHaveBeenCalled();
+  expect(harness.destinationAdmin.disconnect).not.toHaveBeenCalled();
 
   resolvePreflight({ stdout: topicOutput, stderr: "", exitCode: 0 });
 
@@ -148,6 +260,7 @@ test("shutdown during topic preflight cancels startup and waits for cleanup", as
   expect(harness.createRunner).not.toHaveBeenCalled();
   expect(harness.runner.start).not.toHaveBeenCalled();
   expect(harness.admin.disconnect).toHaveBeenCalledTimes(1);
+  expect(harness.destinationAdmin.disconnect).toHaveBeenCalledTimes(1);
 });
 
 test("shutdown is safe and idempotent", async () => {
@@ -161,5 +274,6 @@ test("shutdown is safe and idempotent", async () => {
 
   expect(harness.runner.stop).toHaveBeenCalledTimes(1);
   expect(harness.admin.disconnect).toHaveBeenCalledTimes(1);
+  expect(harness.destinationAdmin.disconnect).toHaveBeenCalledTimes(1);
   await expect(harness.startup.start()).rejects.toThrow("Relay startup has been stopped.");
 });

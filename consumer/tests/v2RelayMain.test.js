@@ -4,14 +4,28 @@ const { createRelayApplication, createBoundedTopicCommandExecutor } = require(".
 const env = {
   V1_SOURCE_CLUSTER_ID: "0jtOiYT4QmShqPK0HjBpQA",
   V1_SOURCE_TOPIC_GENERATION_ID: "9ShfnW90Th-vI4A2Jl1O4Q",
+  V2_DESTINATION_CLUSTER_ID: "4L6g3nShT-eMCtK--X86sw",
 };
 const topicId = env.V1_SOURCE_TOPIC_GENERATION_ID;
 const topicOutput = `Topic: crypto-prices TopicId: ${topicId} PartitionCount: 1 ReplicationFactor: 1 Configs: cleanup.policy=delete
   Topic: crypto-prices Partition: 0 Leader: 1 Replicas: 1 Isr: 1`;
 const successResult = { stdout: topicOutput, stderr: "", exitCode: 0 };
+const destinationMetadata = {
+  topics: [{
+    name: "crypto-prices-v2",
+    partitions: [0, 1, 2, 3, 4, 5].map((partitionId) => ({
+      partitionId,
+      leader: 1,
+      partitionErrorCode: 0,
+    })),
+  }],
+};
 
 function createHarness({
+  relayEnv = env,
   clusterId = env.V1_SOURCE_CLUSTER_ID,
+  destinationClusterId = env.V2_DESTINATION_CLUSTER_ID,
+  destinationTopicMetadata = destinationMetadata,
   commandResult = successResult,
   executeCommand,
   producerConnect = jest.fn(async () => {}),
@@ -25,6 +39,18 @@ function createHarness({
     describeCluster: jest.fn(async () => {
       events.push("admin.describeCluster");
       return { clusterId };
+    }),
+  };
+  const destinationAdmin = {
+    connect: jest.fn(async () => { events.push("destinationAdmin.connect"); }),
+    disconnect: jest.fn(async () => { events.push("destinationAdmin.disconnect"); }),
+    describeCluster: jest.fn(async () => {
+      events.push("destinationAdmin.describeCluster");
+      return { clusterId: destinationClusterId };
+    }),
+    fetchTopicMetadata: jest.fn(async () => {
+      events.push("destinationAdmin.fetchTopicMetadata");
+      return destinationTopicMetadata;
     }),
   };
   const consumer = {
@@ -45,11 +71,14 @@ function createHarness({
   };
   class KafkaMock {
     constructor(config) {
+      this.clientId = config.clientId;
       kafkaConfigs.push(config);
     }
 
     admin() {
-      return admin;
+      return this.clientId === "crypto-v2-relay-v2"
+        ? destinationAdmin
+        : admin;
     }
 
     consumer(config) {
@@ -68,7 +97,7 @@ function createHarness({
   const processObject = new EventEmitter();
   const logger = { error: jest.fn() };
   const application = createRelayApplication({
-    env,
+    env: relayEnv,
     KafkaConstructor: KafkaMock,
     executeCommand: command,
     processObject,
@@ -81,6 +110,7 @@ function createHarness({
     command,
     consumer,
     consumerConfig: () => consumerConfig,
+    destinationAdmin,
     events,
     kafkaConfigs,
     logger,
@@ -105,8 +135,13 @@ test("wires separate V1 and V2 clients and verifies identities before relay acti
 
   expect(harness.events).toEqual([
     "admin.connect",
+    "destinationAdmin.connect",
     "topic.preflight",
     "admin.describeCluster",
+    "destinationAdmin.describeCluster",
+    "destinationAdmin.fetchTopicMetadata",
+    "admin.disconnect",
+    "destinationAdmin.disconnect",
     "producer.connect",
     "consumer.connect",
     "consumer.subscribe",
@@ -135,6 +170,7 @@ test("topic-ID verification failure prevents V1 consumer startup", async () => {
   expect(harness.consumer.subscribe).not.toHaveBeenCalled();
   expect(harness.producer.connect).not.toHaveBeenCalled();
   expect(harness.admin.disconnect).toHaveBeenCalledTimes(1);
+  expect(harness.destinationAdmin.disconnect).toHaveBeenCalledTimes(1);
 });
 
 test("cluster-ID verification failure prevents V1 consumer startup", async () => {
@@ -147,6 +183,79 @@ test("cluster-ID verification failure prevents V1 consumer startup", async () =>
   expect(harness.consumer.subscribe).not.toHaveBeenCalled();
   expect(harness.producer.connect).not.toHaveBeenCalled();
   expect(harness.admin.disconnect).toHaveBeenCalledTimes(1);
+  expect(harness.destinationAdmin.disconnect).toHaveBeenCalledTimes(1);
+});
+
+test("reversed broker overrides fail the V1 identity check before relay activity", async () => {
+  const harness = createHarness({
+    relayEnv: {
+      ...env,
+      V1_KAFKA_BROKER: "127.0.0.1:19092",
+      V2_KAFKA_BROKER: "127.0.0.1:9092",
+    },
+    clusterId: env.V2_DESTINATION_CLUSTER_ID,
+    destinationClusterId: env.V1_SOURCE_CLUSTER_ID,
+  });
+
+  await expect(harness.application.start())
+    .rejects.toThrow("Relay startup failed during V1 cluster-ID verification.");
+
+  expect(harness.kafkaConfigs).toEqual([
+    { clientId: "crypto-v2-relay-v1", brokers: ["127.0.0.1:19092"] },
+    { clientId: "crypto-v2-relay-v2", brokers: ["127.0.0.1:9092"] },
+  ]);
+  expect(harness.producer.connect).not.toHaveBeenCalled();
+  expect(harness.consumer.subscribe).not.toHaveBeenCalled();
+  expect(harness.admin.disconnect).toHaveBeenCalledTimes(1);
+  expect(harness.destinationAdmin.disconnect).toHaveBeenCalledTimes(1);
+});
+
+test.each([
+  [
+    "wrong V2 cluster",
+    { destinationClusterId: env.V1_SOURCE_CLUSTER_ID },
+  ],
+  [
+    "missing V2 topic",
+    { destinationTopicMetadata: { topics: [] } },
+  ],
+  [
+    "wrong V2 partition count",
+    {
+      destinationTopicMetadata: {
+        topics: [{
+          name: "crypto-prices-v2",
+          partitions: destinationMetadata.topics[0].partitions.slice(0, 5),
+        }],
+      },
+    },
+  ],
+])("%s prevents all relay activity", async (_name, options) => {
+  const harness = createHarness(options);
+
+  await expect(harness.application.start())
+    .rejects.toThrow("Relay startup failed during V2 destination identity verification.");
+
+  expect(harness.producer.connect).not.toHaveBeenCalled();
+  expect(harness.consumer.connect).not.toHaveBeenCalled();
+  expect(harness.consumer.subscribe).not.toHaveBeenCalled();
+  expect(harness.admin.disconnect).toHaveBeenCalledTimes(1);
+  expect(harness.destinationAdmin.disconnect).toHaveBeenCalledTimes(1);
+});
+
+test("V2 metadata failure prevents relay activity and cleans up both admins", async () => {
+  const harness = createHarness();
+  harness.destinationAdmin.fetchTopicMetadata.mockRejectedValue(
+    new Error("sensitive metadata detail"),
+  );
+
+  await expect(harness.application.start())
+    .rejects.toThrow("Relay startup failed during V2 destination identity verification.");
+
+  expect(harness.producer.connect).not.toHaveBeenCalled();
+  expect(harness.consumer.subscribe).not.toHaveBeenCalled();
+  expect(harness.admin.disconnect).toHaveBeenCalledTimes(1);
+  expect(harness.destinationAdmin.disconnect).toHaveBeenCalledTimes(1);
 });
 
 test("connection failure cleans up attempted clients without subscribing or committing", async () => {
@@ -162,6 +271,7 @@ test("connection failure cleans up attempted clients without subscribing or comm
   expect(harness.consumer.subscribe).not.toHaveBeenCalled();
   expect(harness.consumer.commitOffsets).not.toHaveBeenCalled();
   expect(harness.admin.disconnect).toHaveBeenCalledTimes(1);
+  expect(harness.destinationAdmin.disconnect).toHaveBeenCalledTimes(1);
 });
 
 test("SIGTERM shuts down all clients and removes the signal handlers", async () => {
@@ -176,6 +286,7 @@ test("SIGTERM shuts down all clients and removes the signal handlers", async () 
   expect(harness.consumer.disconnect).toHaveBeenCalledTimes(1);
   expect(harness.producer.disconnect).toHaveBeenCalledTimes(1);
   expect(harness.admin.disconnect).toHaveBeenCalledTimes(1);
+  expect(harness.destinationAdmin.disconnect).toHaveBeenCalledTimes(1);
   expect(harness.processObject.exitCode).toBe(143);
   expect(harness.processObject.listenerCount("SIGINT")).toBe(0);
   expect(harness.processObject.listenerCount("SIGTERM")).toBe(0);
@@ -210,6 +321,7 @@ test("SIGINT during startup cancels before connecting the relay producer or cons
   expect(harness.consumer.subscribe).not.toHaveBeenCalled();
   expect(harness.producer.connect).not.toHaveBeenCalled();
   expect(harness.admin.disconnect).toHaveBeenCalledTimes(1);
+  expect(harness.destinationAdmin.disconnect).toHaveBeenCalledTimes(1);
   expect(harness.processObject.exitCode).toBe(130);
 });
 

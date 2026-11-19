@@ -1,15 +1,28 @@
 const { verifyV1ClusterIdentity } = require("./relayIdentityGuard");
 const { verifyV1TopicId } = require("./relayTopicPreflight");
+const { verifyV2Destination } = require("./relayDestinationGuard");
 
-function createRelayStartup({ relayConfig, admin, executeCommand, createRunner }) {
+function createRelayStartup({
+  relayConfig,
+  admin,
+  destinationAdmin,
+  executeCommand,
+  createRunner,
+}) {
   if (!relayConfig || relayConfig.v1Topic !== "crypto-prices" ||
-      !relayConfig.sourceIdentity) {
+      !relayConfig.sourceIdentity || !relayConfig.destinationIdentity) {
     throw new Error("Invalid validated relay configuration.");
   }
   if (!admin || typeof admin.connect !== "function" ||
       typeof admin.disconnect !== "function" ||
       typeof admin.describeCluster !== "function") {
-    throw new Error("Invalid Kafka admin client.");
+    throw new Error("Invalid V1 Kafka admin client.");
+  }
+  if (!destinationAdmin || typeof destinationAdmin.connect !== "function" ||
+      typeof destinationAdmin.disconnect !== "function" ||
+      typeof destinationAdmin.describeCluster !== "function" ||
+      typeof destinationAdmin.fetchTopicMetadata !== "function") {
+    throw new Error("Invalid V2 Kafka admin client.");
   }
   if (typeof executeCommand !== "function") {
     throw new Error("Invalid topic preflight command executor.");
@@ -22,7 +35,9 @@ function createRelayStartup({ relayConfig, admin, executeCommand, createRunner }
   let stopPromise;
   let runner;
   let adminConnectionAttempted = false;
+  let destinationAdminConnectionAttempted = false;
   let adminDisconnectPromise;
+  let destinationAdminDisconnectPromise;
   let runnerStopPromise;
   let stopRequested = false;
 
@@ -32,6 +47,15 @@ function createRelayStartup({ relayConfig, admin, executeCommand, createRunner }
       adminDisconnectPromise = Promise.resolve().then(() => admin.disconnect());
     }
     return adminDisconnectPromise;
+  }
+
+  function disconnectDestinationAdmin() {
+    if (!destinationAdminConnectionAttempted) return Promise.resolve();
+    if (!destinationAdminDisconnectPromise) {
+      destinationAdminDisconnectPromise = Promise.resolve()
+        .then(() => destinationAdmin.disconnect());
+    }
+    return destinationAdminDisconnectPromise;
   }
 
   function stopRunner() {
@@ -52,7 +76,12 @@ function createRelayStartup({ relayConfig, admin, executeCommand, createRunner }
     try {
       await disconnectAdmin();
     } catch {
-      failures.push("Kafka admin disconnect");
+      failures.push("V1 Kafka admin disconnect");
+    }
+    try {
+      await disconnectDestinationAdmin();
+    } catch {
+      failures.push("V2 Kafka admin disconnect");
     }
     return failures;
   }
@@ -68,12 +97,42 @@ function createRelayStartup({ relayConfig, admin, executeCommand, createRunner }
         await admin.connect();
         if (stopRequested) throw new Error("Startup cancelled.");
 
+        stage = "V2 Kafka admin connection";
+        destinationAdminConnectionAttempted = true;
+        await destinationAdmin.connect();
+        if (stopRequested) throw new Error("Startup cancelled.");
+
         stage = "V1 topic-ID preflight";
         await verifyV1TopicId(relayConfig, executeCommand);
         if (stopRequested) throw new Error("Startup cancelled.");
 
         stage = "V1 cluster-ID verification";
         await verifyV1ClusterIdentity(admin, relayConfig);
+        if (stopRequested) throw new Error("Startup cancelled.");
+
+        stage = "V2 destination identity verification";
+        await verifyV2Destination(
+          destinationAdmin,
+          relayConfig,
+          relayConfig.destinationIdentity.clusterId,
+        );
+        if (stopRequested) throw new Error("Startup cancelled.");
+
+        stage = "Kafka admin disconnect";
+        const adminDisconnectFailures = [];
+        try {
+          await disconnectAdmin();
+        } catch {
+          adminDisconnectFailures.push("V1 Kafka admin disconnect");
+        }
+        try {
+          await disconnectDestinationAdmin();
+        } catch {
+          adminDisconnectFailures.push("V2 Kafka admin disconnect");
+        }
+        if (adminDisconnectFailures.length) {
+          throw new Error("Kafka admin cleanup failed.");
+        }
         if (stopRequested) throw new Error("Startup cancelled.");
 
         stage = "relay runner creation";

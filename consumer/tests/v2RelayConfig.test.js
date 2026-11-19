@@ -3,6 +3,7 @@ const { loadRelayConfig } = require("../v2/relayConfig");
 const sourceEnvironment = {
   V1_SOURCE_CLUSTER_ID: "0jtOiYT4QmShqPK0HjBpQA",
   V1_SOURCE_TOPIC_GENERATION_ID: "9ShfnW90Th-vI4A2Jl1O4Q",
+  V2_DESTINATION_CLUSTER_ID: "4L6g3nShT-eMCtK--X86sw",
 };
 
 test("loads the Windows-host relay defaults and stable source identities", () => {
@@ -16,6 +17,9 @@ test("loads the Windows-host relay defaults and stable source identities", () =>
     sourceIdentity: {
       clusterId: "0jtOiYT4QmShqPK0HjBpQA",
       topicGenerationId: "9ShfnW90Th-vI4A2Jl1O4Q",
+    },
+    destinationIdentity: {
+      clusterId: "4L6g3nShT-eMCtK--X86sw",
     },
   });
 });
@@ -32,6 +36,9 @@ test("accepts non-empty broker overrides without changing relay identity", () =>
   expect(config.sourceIdentity).toEqual({
     clusterId: sourceEnvironment.V1_SOURCE_CLUSTER_ID,
     topicGenerationId: sourceEnvironment.V1_SOURCE_TOPIC_GENERATION_ID,
+  });
+  expect(config.destinationIdentity).toEqual({
+    clusterId: sourceEnvironment.V2_DESTINATION_CLUSTER_ID,
   });
 });
 
@@ -55,6 +62,26 @@ test.each([
   }
   expect(error.message).toContain(name);
   expect(error.message).not.toContain("wrong-");
+});
+
+test.each([
+  undefined,
+  "",
+  "wrong-destination-cluster",
+  sourceEnvironment.V1_SOURCE_CLUSTER_ID,
+])("rejects an invalid V2_DESTINATION_CLUSTER_ID %p", (clusterId) => {
+  const env = { ...sourceEnvironment };
+  if (clusterId === undefined) delete env.V2_DESTINATION_CLUSTER_ID;
+  else env.V2_DESTINATION_CLUSTER_ID = clusterId;
+
+  let error;
+  try {
+    loadRelayConfig(env);
+  } catch (caught) {
+    error = caught;
+  }
+  expect(error.message).toContain("V2_DESTINATION_CLUSTER_ID");
+  expect(error.message).not.toContain("wrong-destination-cluster");
 });
 
 test.each(["", "5", "7", "6.0", "six", 5, 7])(
