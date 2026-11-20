@@ -62,23 +62,32 @@ The receipt collection must have no TTL index. MongoDB applies TTL deletion
 asynchronously after the 24-hour expiration; this is not an exact-time
 deletion guarantee.
 
+The approved production database is `crypto_analytics_v2`, with
+`price_history` and `replay_receipts` as the history and receipt collections.
+Before selecting these collections, startup must read their metadata in the
+approved database. The initial deployment fails closed if either collection
+already exists; ownership must first be established through a separately
+approved mechanism. No ownership marker is defined by this project. If both
+collections are absent, inspection reports a first-run state but does not grant
+permission to create them. Inspection never creates, drops, renames, or alters
+collections or indexes.
+
 ## History consumer configuration boundary
 
 The offline history-consumer configuration requires
 `V2_HISTORY_CONSUMER_ENABLED=true` and a separate
 `V2_HISTORY_LIVE_START_ACK=I_ACKNOWLEDGE_V2_HISTORY_BACKFILL` for each live
 start. It pins the Kafka broker, cluster, topic, group, MongoDB loopback URI,
-replica-set identity, and `crypto_analytics_v2` database; it does not select
-production collection names.
+replica-set identity, the `crypto_analytics_v2` database, and the approved
+collection names above.
 
 The repository does not contain an independently established UUID for
 `crypto-prices-v2`. `V2_HISTORY_TOPIC_ID` is optional and is checked only when
 provided; without it, preflight still requires the pinned Kafka cluster and
 the exact six-partition topic metadata, but cannot detect replacement of the
-topic by another topic with the same name and layout. The `price_history` and
-`replay_receipts` names used in MongoDB integration tests are confined to
-generated disposable test databases and do not establish production schema
-names.
+topic by another topic with the same name and layout. MongoDB integration
+tests continue to use generated disposable databases; their collection data
+is separate from the approved production database.
 
 ## Verify
 
