@@ -29,6 +29,17 @@ function validateConfig(config) {
   }
 }
 
+function validateMongoIdentityConfig(config) {
+  const mongo = config && config.mongo;
+  if (!mongo ||
+      mongo.uri !== HISTORY_MONGO_URI ||
+      mongo.databaseName !== HISTORY_DATABASE_NAME ||
+      mongo.replicaSetName !== HISTORY_REPLICA_SET_NAME ||
+      mongo.member !== HISTORY_MONGO_MEMBER) {
+    throw new Error("Invalid pinned V2 history MongoDB identity configuration.");
+  }
+}
+
 function validateKafkaAdmin(admin) {
   if (!admin || typeof admin.describeCluster !== "function" ||
       typeof admin.fetchTopicMetadata !== "function") {
@@ -114,7 +125,7 @@ function resolveAdminDatabase({ mongoClient, adminDatabase }) {
 }
 
 async function verifyHistoryMongoIdentity({ mongoClient, adminDatabase, config }) {
-  validateConfig(config);
+  validateMongoIdentityConfig(config);
   const database = resolveAdminDatabase({ mongoClient, adminDatabase });
 
   let hello;

@@ -143,6 +143,45 @@ test("fails before any identity calls when preflight config is disabled or not p
   expect(mongoClient.db).not.toHaveBeenCalled();
 });
 
+test("consumer preflights still require the live-backfill acknowledgement", async () => {
+  const admin = createKafkaAdmin();
+  const { mongoClient } = mongoIdentity();
+
+  await expect(verifyHistoryConsumerPreflights({
+    admin,
+    mongoClient,
+    config: { ...config, liveStartAcknowledged: false },
+  })).rejects.toThrow("Invalid pinned V2 history identity configuration.");
+  expect(admin.describeCluster).not.toHaveBeenCalled();
+  expect(mongoClient.db).not.toHaveBeenCalled();
+});
+
+test("MongoDB identity preflight needs pinned Mongo settings but no consumer authorization", async () => {
+  const { mongoClient } = mongoIdentity();
+
+  await expect(verifyHistoryMongoIdentity({
+    mongoClient,
+    config: { mongo: config.mongo },
+  })).resolves.toEqual({
+    replicaSetName: "rs-v2",
+    member: "v2-mongodb:27017",
+    isWritablePrimary: true,
+  });
+  expect(mongoClient.db).toHaveBeenCalledWith("admin");
+});
+
+test("MongoDB identity preflight still rejects unpinned endpoints and replica-set identities", async () => {
+  const { mongoClient } = mongoIdentity();
+
+  await expect(verifyHistoryMongoIdentity({
+    mongoClient,
+    config: {
+      mongo: { ...config.mongo, uri: "mongodb://127.0.0.1:27017/crypto_analytics_v2" },
+    },
+  })).rejects.toThrow("Invalid pinned V2 history MongoDB identity configuration.");
+  expect(mongoClient.db).not.toHaveBeenCalled();
+});
+
 test("rejects Kafka cluster identity mismatches and sanitizes admin errors", async () => {
   const mismatchAdmin = createKafkaAdmin({ clusterId: "wrong-cluster" });
   await expect(verifyHistoryKafkaIdentity({
