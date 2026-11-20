@@ -12,6 +12,9 @@ const { verifyHistoryConsumerPreflights } = require("./historyConsumerPreflight"
 const { createHistoryConsumerRunner } = require("./historyConsumerRunner");
 const { persistHistoryBatch } = require("./historyBatch");
 const { ensureHistoryIndexes } = require("./historyIndexes");
+const { verifyHistoryCollectionOwnership } =
+  require("./historyCollectionOwnershipVerification");
+const { HISTORY_COLLECTION_NAMES } = require("./historyCollectionInspection");
 
 const SAFE_ERROR_NAMES = new Set([
   "Error",
@@ -95,6 +98,7 @@ function validateDependencies({
   createConsumer,
   ensureIndexes,
   verifyPreflights,
+  verifyOwnership,
   persistHistoryBatchImpl,
   createRunner,
   onFailure,
@@ -130,6 +134,7 @@ function validateDependencies({
   if (typeof createConsumer !== "function" ||
       typeof ensureIndexes !== "function" ||
       typeof verifyPreflights !== "function" ||
+  typeof verifyOwnership !== "function" ||
       typeof persistHistoryBatchImpl !== "function" ||
       typeof createRunner !== "function" ||
       typeof onFailure !== "function") {
@@ -191,6 +196,7 @@ function createHistoryConsumerStartup({
   createConsumer,
   ensureIndexes = ensureHistoryIndexes,
   verifyPreflights = verifyHistoryConsumerPreflights,
+  verifyOwnership = verifyHistoryCollectionOwnership,
   persistHistoryBatchImpl = persistHistoryBatch,
   createRunner = createHistoryConsumerRunner,
   onFailure,
@@ -205,6 +211,7 @@ function createHistoryConsumerStartup({
     createConsumer,
     ensureIndexes,
     verifyPreflights,
+    verifyOwnership,
     persistHistoryBatchImpl,
     createRunner,
     onFailure,
@@ -388,6 +395,27 @@ function createHistoryConsumerStartup({
           startupTimeoutMs,
           stage,
         );
+        checkCancellation();
+
+        stage = "history collection ownership verification";
+        const ownershipResult = await boundedCall(
+          () => verifyOwnership({
+            database: historyCollection.db,
+            mongoClient,
+            historyCollection,
+            receiptCollection,
+          }),
+          startupTimeoutMs,
+          stage,
+        );
+        if (!ownershipResult ||
+            ownershipResult.status !== "verified" ||
+            ownershipResult.databaseName !== HISTORY_DATABASE_NAME ||
+            !ownershipResult.collections ||
+            ownershipResult.collections.history !== HISTORY_COLLECTION_NAMES.history ||
+            ownershipResult.collections.receipts !== HISTORY_COLLECTION_NAMES.receipts) {
+          throw new Error("V2 history ownership verification returned an invalid result.");
+        }
         checkCancellation();
 
         stage = "Kafka admin disconnect";

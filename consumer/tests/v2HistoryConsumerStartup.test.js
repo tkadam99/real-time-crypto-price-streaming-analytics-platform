@@ -1,11 +1,13 @@
 const { Collection, Db, MongoClient } = require("mongodb");
 const {
   HISTORY_CONSUMER_GROUP_ID,
+  HISTORY_DATABASE_NAME,
   HISTORY_KAFKA_CLUSTER_ID,
   HISTORY_TOPIC,
   LIVE_START_ACKNOWLEDGEMENT,
   loadHistoryConsumerConfig,
 } = require("../v2/historyConsumerConfig");
+const { HISTORY_COLLECTION_NAMES } = require("../v2/historyCollectionInspection");
 const {
   createHistoryConsumerStartup,
 } = require("../v2/historyConsumerStartup");
@@ -40,10 +42,23 @@ function createHarness({
   verifyPreflights,
   historyCollectionOverride,
   receiptCollectionOverride,
+  verifyOwnership,
 } = {}) {
   const events = [];
   const ensureIndexesImpl = ensureIndexes ||
     jest.fn(async () => { events.push("indexes.ensure"); });
+  const verifyOwnershipImpl = verifyOwnership ||
+    jest.fn(async () => {
+      events.push("ownership.verify");
+      return {
+        databaseName: HISTORY_DATABASE_NAME,
+        status: "verified",
+        collections: {
+          history: HISTORY_COLLECTION_NAMES.history,
+          receipts: HISTORY_COLLECTION_NAMES.receipts,
+        },
+      };
+    });
   let resolveTerminal;
   const terminalSignal = new Promise((resolve) => {
     resolveTerminal = resolve;
@@ -145,6 +160,7 @@ function createHarness({
       createConsumer,
       ensureIndexes: ensureIndexesImpl,
       verifyPreflights,
+      verifyOwnership: verifyOwnershipImpl,
       persistHistoryBatchImpl,
       createRunner,
       onFailure,
@@ -168,6 +184,7 @@ function createHarness({
     resolveTerminal,
     receiptCollection,
     runner,
+    verifyOwnership: verifyOwnershipImpl,
     startup,
     startupError,
   };
@@ -190,6 +207,7 @@ test("completes identity checks and indexes before creating and starting the con
     "mongo.db:admin",
     "mongo.hello",
     "mongo.replSetGetStatus",
+    "ownership.verify",
     "kafka.admin.disconnect",
     "indexes.ensure",
     "consumer.create",
@@ -201,6 +219,14 @@ test("completes identity checks and indexes before creating and starting the con
     historyCollection: harness.historyCollection,
     receiptCollection: harness.receiptCollection,
   });
+  expect(harness.verifyOwnership).toHaveBeenCalledWith({
+    database: harness.historyCollection.db,
+    mongoClient: harness.mongoClient,
+    historyCollection: harness.historyCollection,
+    receiptCollection: harness.receiptCollection,
+  });
+  expect(harness.events.indexOf("ownership.verify"))
+    .toBeLessThan(harness.events.indexOf("indexes.ensure"));
   expect(harness.createConsumer).toHaveBeenCalledWith({
     broker: config.kafka.broker,
     connectionTimeout: config.kafka.options.connectionTimeout,
@@ -293,6 +319,80 @@ test("MongoDB identity failure prevents indexes and consumer creation", async ()
     .rejects.toThrow("V2 history startup failed during Kafka and MongoDB identity preflight.");
   expect(harness.ensureIndexes).not.toHaveBeenCalled();
   expect(harness.createConsumer).not.toHaveBeenCalled();
+  expect(harness.admin.disconnect).toHaveBeenCalledTimes(1);
+  expect(harness.mongoClient.close).toHaveBeenCalledTimes(1);
+});
+
+test("ownership verification failure is sanitized and prevents all later startup work", async () => {
+  const verifyOwnership = jest.fn().mockRejectedValue(
+    new Error("mongodb://private/secret with collection document"),
+  );
+  const harness = createHarness({ verifyOwnership });
+
+  await expect(harness.startup.start())
+    .rejects.toThrow("V2 history startup failed during history collection ownership verification.");
+
+  expect(verifyOwnership).toHaveBeenCalledTimes(1);
+  expect(harness.ensureIndexes).not.toHaveBeenCalled();
+  expect(harness.createConsumer).not.toHaveBeenCalled();
+  expect(harness.createRunner).not.toHaveBeenCalled();
+  expect(harness.events).not.toContain("indexes.ensure");
+  expect(harness.events).not.toContain("consumer.create");
+  expect(harness.admin.disconnect).toHaveBeenCalledTimes(1);
+  expect(harness.mongoClient.close).toHaveBeenCalledTimes(1);
+  expect(harness.consumer.disconnect).not.toHaveBeenCalled();
+  expect(harness.startupError).toBeUndefined();
+});
+
+test("missing collection verification failure prevents index setup and consumer creation", async () => {
+  const verifyOwnership = jest.fn().mockRejectedValue(
+    new Error("An approved V2 history collection is missing."),
+  );
+  const harness = createHarness({ verifyOwnership });
+
+  const failure = await harness.startup.start().catch((error) => error);
+
+  expect(failure.message)
+    .toBe("V2 history startup failed during history collection ownership verification.");
+  expect(failure.message).not.toContain("approved V2 history collection is missing");
+  expect(harness.ensureIndexes).not.toHaveBeenCalled();
+  expect(harness.createConsumer).not.toHaveBeenCalled();
+  expect(harness.createRunner).not.toHaveBeenCalled();
+  expect(harness.admin.disconnect).toHaveBeenCalledTimes(1);
+  expect(harness.mongoClient.close).toHaveBeenCalledTimes(1);
+});
+
+test("shutdown during ownership verification cancels startup and cleans up", async () => {
+  let releaseOwnership;
+  let notifyOwnership;
+  const ownershipStarted = new Promise((resolve) => {
+    notifyOwnership = resolve;
+  });
+  const verifyOwnership = jest.fn(() => {
+    notifyOwnership();
+    return new Promise((resolve) => {
+      releaseOwnership = resolve;
+    });
+  });
+  const harness = createHarness({ verifyOwnership });
+
+  const starting = harness.startup.start();
+  await ownershipStarted;
+  const shuttingDown = harness.startup.stop();
+  releaseOwnership({
+    databaseName: HISTORY_DATABASE_NAME,
+    status: "verified",
+    collections: {
+      history: HISTORY_COLLECTION_NAMES.history,
+      receipts: HISTORY_COLLECTION_NAMES.receipts,
+    },
+  });
+
+  await expect(starting).rejects.toThrow("V2 history startup cancelled.");
+  await expect(shuttingDown).resolves.toBeUndefined();
+  expect(harness.ensureIndexes).not.toHaveBeenCalled();
+  expect(harness.createConsumer).not.toHaveBeenCalled();
+  expect(harness.createRunner).not.toHaveBeenCalled();
   expect(harness.admin.disconnect).toHaveBeenCalledTimes(1);
   expect(harness.mongoClient.close).toHaveBeenCalledTimes(1);
 });
