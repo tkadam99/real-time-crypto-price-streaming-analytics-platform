@@ -72,6 +72,15 @@ collections are absent, inspection reports a first-run state but does not grant
 permission to create them. Inspection never creates, drops, renames, or alters
 collections or indexes.
 
+The planned ownership/schema contract assigns each collection a versioned
+`$jsonSchema` validator title and compares the complete validator together
+with `validationLevel: "strict"` and `validationAction: "error"`. The
+validators describe the BSON document shapes produced by the history
+contract. This metadata is a compatibility and application-ownership marker,
+not cryptographic proof of ownership; an administrator could copy or alter it.
+Provisioning and startup integration remain separate work and must continue to
+fail closed for missing or incompatible metadata.
+
 ## History consumer configuration boundary
 
 The offline history-consumer configuration requires
