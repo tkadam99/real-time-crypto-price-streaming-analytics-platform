@@ -1,3 +1,4 @@
+const { MongoClient } = require("mongodb");
 const {
   HISTORY_DATABASE_NAME,
   HISTORY_MONGO_MEMBER,
@@ -15,7 +16,27 @@ const {
   HISTORY_COLLECTION_PROVISION_ACKNOWLEDGEMENT,
   provisionHistoryCollections,
 } = require("../v2/historyCollectionProvisioning");
+const {
+  provisionHistoryCollectionsForNamespace,
+} = require("../v2/historyCollectionProvisioningInternal");
 const { verifyHistoryMongoIdentity } = require("../v2/historyConsumerPreflight");
+const { ensureHistoryIndexes } = require("../v2/historyIndexes");
+const {
+  createMongoTestDatabase,
+} = require("../../test-utils/mongoIntegrationSafety");
+const {
+  createHistoryProvisioningTestNamespacePolicy,
+} = require("../test-utils/historyProvisioningNamespacePolicy");
+
+const openClients = new Set();
+const IDENTITY_CONFIG = Object.freeze({
+  mongo: Object.freeze({
+    uri: HISTORY_MONGO_URI,
+    databaseName: HISTORY_DATABASE_NAME,
+    replicaSetName: HISTORY_REPLICA_SET_NAME,
+    member: HISTORY_MONGO_MEMBER,
+  }),
+});
 
 function clone(value) {
   return JSON.parse(JSON.stringify(value));
@@ -43,7 +64,8 @@ function createCollection(initialIndexes = [{ name: "_id_", key: { _id: 1 } }]) 
 
 function createHarness({
   databaseName = HISTORY_DATABASE_NAME,
-  databaseClientMatches = true,
+  generatedTestDatabase = false,
+  namespacePolicyFactory,
   initialCollections = [],
   hello = {
     setName: "rs-v2",
@@ -59,8 +81,8 @@ function createHarness({
     }],
   },
   provisionAcknowledgement = HISTORY_COLLECTION_PROVISION_ACKNOWLEDGEMENT,
-  ensureIndexes,
-  verifyMongoIdentity,
+  ensureIndexes = ensureHistoryIndexes,
+  verifyMongoIdentity = verifyHistoryMongoIdentity,
 } = {}) {
   const events = [];
   const metadata = initialCollections.map(({
@@ -82,72 +104,102 @@ function createHarness({
       createCollection(indexes),
     ]),
   );
-  const database = {
-    databaseName,
-    listCollections: jest.fn((filter) => {
-      events.push("database.listCollections");
-      const requestedNames = filter && filter.name && filter.name.$in;
-      return {
-        toArray: jest.fn(async () => metadata
-          .filter((entry) => !requestedNames || requestedNames.includes(entry.name))
-          .map(clone)),
-      };
-    }),
-    createCollection: jest.fn(async (name, options) => {
-      events.push(`database.createCollection:${name}`);
-      if (metadata.some((entry) => entry.name === name)) {
-        const error = new Error("namespace exists");
-        error.code = 48;
-        throw error;
-      }
-      metadata.push({
-        name,
-        type: "collection",
-        options: clone(options),
-      });
-      const collection = createCollection();
-      collections.set(name, collection);
-      return collection;
-    }),
-    collection: jest.fn((name) => {
-      events.push(`database.collection:${name}`);
-      return collections.get(name);
-    }),
-  };
+  const mongoClient = new MongoClient(HISTORY_MONGO_URI);
+  openClients.add(mongoClient);
+  const nativeDb = mongoClient.db.bind(mongoClient);
+  const database = generatedTestDatabase
+    ? createMongoTestDatabase(mongoClient, "v2_history")
+    : nativeDb(databaseName);
+  const dropDatabase = jest.spyOn(database, "dropDatabase");
+  const dropCollection = jest.spyOn(database, "dropCollection");
   const adminDatabase = {
     command: jest.fn(async (command) => {
       events.push(command.hello === 1 ? "mongo.hello" : "mongo.replSetGetStatus");
       return command.hello === 1 ? hello : status;
     }),
   };
-  const mongoClient = {
-    db: jest.fn((name) => {
-      events.push(`mongo.db:${name}`);
-      if (name !== "admin") throw new Error("unexpected database request");
-      return adminDatabase;
-    }),
-  };
-  database.client = databaseClientMatches ? mongoClient : { db: mongoClient.db };
-
-  const resultPromise = (options = {}) => provisionHistoryCollections({
-    database,
-    mongoClient,
-    provisionAcknowledgement,
-    ensureIndexes,
-    verifyMongoIdentity,
-    ...options,
+  mongoClient.db = jest.fn((name) => {
+    events.push(`mongo.db:${name}`);
+    if (name !== "admin") throw new Error("unexpected database request");
+    return adminDatabase;
   });
+  database.listCollections = jest.fn((filter) => {
+    events.push("database.listCollections");
+    const requestedNames = filter && filter.name && filter.name.$in;
+    return {
+      toArray: jest.fn(async () => metadata
+        .filter((entry) => !requestedNames || requestedNames.includes(entry.name))
+        .map(clone)),
+    };
+  });
+  database.createCollection = jest.fn(async (name, options) => {
+    events.push(`database.createCollection:${name}`);
+    if (metadata.some((entry) => entry.name === name)) {
+      const error = new Error("namespace exists");
+      error.code = 48;
+      throw error;
+    }
+    metadata.push({
+      name,
+      type: "collection",
+      options: clone(options),
+    });
+    const collection = createCollection();
+    collections.set(name, collection);
+    return collection;
+  });
+  database.collection = jest.fn((name) => {
+    events.push(`database.collection:${name}`);
+    return collections.get(name);
+  });
+  const namespacePolicy = namespacePolicyFactory
+    ? namespacePolicyFactory(database)
+    : Object.freeze({
+      kind: "production",
+      databaseName: HISTORY_DATABASE_NAME,
+      collections: Object.freeze({
+        history: HISTORY_COLLECTION_NAMES.history,
+        receipts: HISTORY_COLLECTION_NAMES.receipts,
+      }),
+    });
+
+  const resultPromise = (options = {}) =>
+    provisionHistoryCollectionsForNamespace({
+      namespacePolicy,
+      database,
+      mongoClient,
+      provisionAcknowledgement,
+      identityConfig: IDENTITY_CONFIG,
+      ensureIndexes,
+      verifyMongoIdentity,
+      ...options,
+    });
+  const productionResultPromise = (options = {}) =>
+    provisionHistoryCollections({
+      database,
+      mongoClient,
+      provisionAcknowledgement,
+      ...options,
+    });
 
   return {
     adminDatabase,
     collections,
     database,
+    dropCollection,
+    dropDatabase,
     events,
     metadata,
     mongoClient,
+    namespacePolicy,
     resultPromise,
+    productionResultPromise,
   };
 }
+
+afterAll(async () => {
+  await Promise.all([...openClients].map((client) => client.close()));
+});
 
 function markedCollection(name, options = expectedHistoryCollectionOptions(name)) {
   return {
@@ -164,6 +216,8 @@ test("requires its exact provisioning acknowledgement before preflight or inspec
 
   await expect(harness.resultPromise())
     .rejects.toThrow("V2 history collection provisioning acknowledgement is required.");
+  await expect(harness.productionResultPromise())
+    .rejects.toThrow("V2 history collection provisioning acknowledgement is required.");
   expect(harness.mongoClient.db).not.toHaveBeenCalled();
   expect(harness.database.listCollections).not.toHaveBeenCalled();
   expect(harness.database.createCollection).not.toHaveBeenCalled();
@@ -173,18 +227,110 @@ test("rejects a database other than crypto_analytics_v2 before identity checks",
   const harness = createHarness({ databaseName: "crypto_analytics" });
 
   await expect(harness.resultPromise())
-    .rejects.toThrow("approved MongoDB database");
+    .rejects.toThrow("matching MongoDB database");
   expect(harness.mongoClient.db).not.toHaveBeenCalled();
   expect(harness.database.listCollections).not.toHaveBeenCalled();
 });
 
 test("rejects a database object owned by a different MongoDB client", async () => {
-  const harness = createHarness({ databaseClientMatches: false });
+  const harness = createHarness();
+  const otherClient = new MongoClient(HISTORY_MONGO_URI);
+  openClients.add(otherClient);
 
-  await expect(harness.resultPromise())
-    .rejects.toThrow("approved MongoDB database");
+  await expect(harness.resultPromise({ mongoClient: otherClient }))
+    .rejects.toThrow("matching MongoDB database");
   expect(harness.mongoClient.db).not.toHaveBeenCalled();
   expect(harness.database.listCollections).not.toHaveBeenCalled();
+});
+
+test("rejects an internal provisioning call without its explicit authorization", async () => {
+  const harness = createHarness();
+
+  await expect(harness.resultPromise({
+    provisionAcknowledgement: undefined,
+  })).rejects.toThrow("provisioning acknowledgement is required");
+  expect(harness.mongoClient.db).not.toHaveBeenCalled();
+  expect(harness.database.listCollections).not.toHaveBeenCalled();
+});
+
+test("rejects an internal provisioning call without an identity verifier", async () => {
+  const harness = createHarness();
+
+  await expect(harness.resultPromise({
+    verifyMongoIdentity: undefined,
+  })).rejects.toThrow("identity verification and index dependencies");
+  expect(harness.mongoClient.db).not.toHaveBeenCalled();
+  expect(harness.database.listCollections).not.toHaveBeenCalled();
+});
+
+test("rejects an invalid identity verifier before preflight or inspection", async () => {
+  const harness = createHarness();
+
+  await expect(harness.resultPromise({
+    verifyMongoIdentity: {},
+  })).rejects.toThrow("identity verification and index dependencies");
+  expect(harness.mongoClient.db).not.toHaveBeenCalled();
+  expect(harness.database.listCollections).not.toHaveBeenCalled();
+});
+
+test("the public wrapper remains pinned to the production database", async () => {
+  const harness = createHarness({ databaseName: "v2_history_test_0123456789abcdef0123456789abcdef" });
+
+  await expect(harness.productionResultPromise())
+    .rejects.toThrow("matching MongoDB database and namespace policy");
+  expect(harness.mongoClient.db).not.toHaveBeenCalled();
+  expect(harness.database.listCollections).not.toHaveBeenCalled();
+});
+
+test("the public wrapper supplies the pinned production identity preflight", async () => {
+  const harness = createHarness();
+
+  const result = await harness.productionResultPromise();
+
+  expect(result.databaseName).toBe(HISTORY_DATABASE_NAME);
+  expect(harness.events.indexOf("mongo.replSetGetStatus"))
+    .toBeLessThan(harness.events.indexOf("database.listCollections"));
+  expect(result.collections.history.status).toBe("created");
+  expect(result.collections.receipts.status).toBe("created");
+});
+
+test("rejects a forged disposable policy for an unregistered Db with a matching name", async () => {
+  const databaseName = "v2_history_test_0123456789abcdef0123456789abcdef";
+  const harness = createHarness({
+    databaseName,
+    namespacePolicyFactory: (database) => Object.freeze({
+      kind: "disposable",
+      databaseName: database.databaseName,
+      collections: Object.freeze({
+        history: HISTORY_COLLECTION_NAMES.history,
+        receipts: HISTORY_COLLECTION_NAMES.receipts,
+      }),
+    }),
+  });
+
+  await expect(harness.resultPromise())
+    .rejects.toThrow("helper-generated MongoDB database");
+  expect(harness.database.databaseName).toBe(databaseName);
+  expect(harness.mongoClient.db).not.toHaveBeenCalled();
+  expect(harness.database.listCollections).not.toHaveBeenCalled();
+  expect(harness.database.createCollection).not.toHaveBeenCalled();
+});
+
+test("provisions using the genuine helper-generated disposable Db", async () => {
+  const harness = createHarness({
+    generatedTestDatabase: true,
+    namespacePolicyFactory: createHistoryProvisioningTestNamespacePolicy,
+  });
+
+  const result = await harness.resultPromise();
+
+  expect(result.databaseName).toBe(harness.database.databaseName);
+  expect(result.collections.history.status).toBe("created");
+  expect(result.collections.receipts.status).toBe("created");
+  expect(Object.isFrozen(harness.namespacePolicy)).toBe(true);
+  expect(Object.isFrozen(harness.namespacePolicy.collections)).toBe(true);
+  expect(harness.events.indexOf("mongo.replSetGetStatus"))
+    .toBeLessThan(harness.events.indexOf("database.listCollections"));
 });
 
 test("fails MongoDB identity preflight before inspection or writes", async () => {
@@ -347,8 +493,8 @@ test("reports index-manager failure without dropping or altering created collect
     "price_history",
     "replay_receipts",
   ]);
-  expect(harness.database).not.toHaveProperty("dropDatabase");
-  expect(harness.database).not.toHaveProperty("dropCollection");
+  expect(harness.dropDatabase).not.toHaveBeenCalled();
+  expect(harness.dropCollection).not.toHaveBeenCalled();
   expect(harness.database.createCollection).toHaveBeenCalledTimes(2);
   expect(ensureIndexes).toHaveBeenCalledTimes(1);
 });
