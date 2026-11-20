@@ -52,7 +52,8 @@ function safeErrorName(error) {
 }
 
 function isValidCoreProgress(result, partition, messages) {
-  if (!result || result.topic !== V2_TOPIC || result.partition !== partition ||
+  if (!result || result.cancelled === true ||
+      result.topic !== V2_TOPIC || result.partition !== partition ||
       !Number.isInteger(result.committableCount) || result.committableCount < 0 ||
       !Array.isArray(result.committablePrefix) ||
       result.committablePrefix.length !== result.committableCount ||
@@ -273,6 +274,7 @@ function createHistoryConsumerRunner({
   let runPromise;
   let runStarted = false;
   let stopRequested = false;
+  const cancellationController = new AbortController();
   let failureHandlerFailed = false;
   let terminalPauseFailed = false;
   let terminalFailure = null;
@@ -302,6 +304,7 @@ function createHistoryConsumerRunner({
         ? { errorName: failure.errorName }
         : {}),
     });
+    cancellationController.abort();
     resolveTerminalFailure(terminalFailure);
 
     try {
@@ -339,7 +342,7 @@ function createHistoryConsumerRunner({
       ? batch.messages[0].offset
       : null;
 
-    if (stopRequested || terminalFailure) {
+    if (stopRequested || terminalFailure || cancellationController.signal.aborted) {
       return;
     }
     if (!batch || batch.topic !== V2_TOPIC || !Array.isArray(batch.messages)) {
@@ -384,6 +387,7 @@ function createHistoryConsumerRunner({
         partition,
         messages: batch.messages,
         persistBatch,
+        signal: cancellationController.signal,
       });
     } catch (error) {
       coreError = error;
@@ -402,8 +406,16 @@ function createHistoryConsumerRunner({
       return;
     }
     if (coreError) {
+      if (cancellationController.signal.aborted) return;
       reportTerminalFailure(
         createFailure("history-processing-failed", partition, firstOffset, coreError),
+      );
+      return;
+    }
+    if (cancellationController.signal.aborted || stopRequested || terminalFailure) return;
+    if (coreResult && coreResult.cancelled === true) {
+      reportTerminalFailure(
+        createFailure("history-processing-failed", partition, firstOffset),
       );
       return;
     }
@@ -505,6 +517,7 @@ function createHistoryConsumerRunner({
   function stop() {
     if (stopPromise) return stopPromise;
     stopRequested = true;
+    cancellationController.abort();
     stopPromise = (async () => {
       const failures = [];
 

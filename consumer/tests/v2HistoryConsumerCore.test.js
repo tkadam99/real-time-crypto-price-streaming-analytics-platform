@@ -118,6 +118,55 @@ describe("offline V2 history consumer processing core", () => {
     expect(result.nextOffset).toBe("205");
   });
 
+  test("cancellation before processing begins starts no persistence batch", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const persistBatch = jest.fn();
+
+    const result = await processHistoryPartitionBatch({
+      partition: 0,
+      messages: [message("1"), message("2")],
+      persistBatch,
+      signal: controller.signal,
+    });
+
+    expect(result).toMatchObject({
+      cancelled: true,
+      committablePrefix: [],
+      committableCount: 0,
+      nextOffset: null,
+      failure: null,
+    });
+    expect(persistBatch).not.toHaveBeenCalled();
+  });
+
+  test("cancellation between persistence chunks prevents the next chunk from starting", async () => {
+    const controller = new AbortController();
+    const messages = Array.from({ length: 101 }, (_, index) =>
+      message(String(index), envelope("BTC-USD", String(index))));
+    const persistBatch = jest.fn(async (events) => {
+      const result = persistenceResult(events);
+      controller.abort();
+      return result;
+    });
+
+    const result = await processHistoryPartitionBatch({
+      partition: 0,
+      messages,
+      persistBatch,
+      signal: controller.signal,
+    });
+
+    expect(persistBatch).toHaveBeenCalledTimes(1);
+    expect(persistBatch.mock.calls[0][0]).toHaveLength(100);
+    expect(result).toMatchObject({
+      cancelled: true,
+      committableCount: 100,
+      nextOffset: "100",
+      failure: null,
+    });
+  });
+
   test.each([
     ["malformed JSON", "{PRIVATE-PAYLOAD-SENTINEL", "malformed-json", "PRIVATE-PAYLOAD-SENTINEL"],
     [

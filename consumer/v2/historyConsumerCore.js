@@ -3,6 +3,9 @@ const {
   partitionForSymbol,
   serializeSourceIdentity,
 } = require("./eventContract");
+const {
+  attachHistoryBatchCancellationSignal,
+} = require("./historyBatch");
 
 const V2_TOPIC = "crypto-prices-v2";
 const PARTITION_COUNT = 6;
@@ -64,6 +67,7 @@ async function processHistoryPartitionBatch({
   partition,
   messages,
   persistBatch,
+  signal,
 }) {
   const result = createResult(partition);
   if (!Number.isInteger(partition) || partition < 0 || partition >= PARTITION_COUNT) {
@@ -76,11 +80,19 @@ async function processHistoryPartitionBatch({
   if (typeof persistBatch !== "function") {
     throw new Error("A persistence-batch function is required.");
   }
+  if (signal !== undefined && (!signal || typeof signal.aborted !== "boolean")) {
+    throw new Error("History processing cancellation signal is invalid.");
+  }
+  if (signal && signal.aborted) {
+    result.cancelled = true;
+    return result;
+  }
 
   let previousOffset = null;
   let prefixOpen = true;
 
-  for (let start = 0; start < messages.length && prefixOpen;
+  for (let start = 0; start < messages.length && prefixOpen &&
+      !(signal && signal.aborted) && !result.cancelled;
     start += MAX_MESSAGES_PER_PERSISTENCE_CALL) {
     const messageChunk = messages.slice(
       start,
@@ -164,10 +176,19 @@ async function processHistoryPartitionBatch({
     if (validRecords.length > 0) {
       let persistenceResult;
       try {
-        persistenceResult = await persistBatch(
-          validRecords.map((record) => record.envelope),
-        );
+        const envelopes = validRecords.map((record) => record.envelope);
+        if (signal) {
+          attachHistoryBatchCancellationSignal(envelopes, signal);
+          persistenceResult = await persistBatch(envelopes, { signal });
+        } else {
+          persistenceResult = await persistBatch(envelopes);
+        }
       } catch (error) {
+        if (signal && signal.aborted) {
+          result.cancelled = true;
+          prefixOpen = false;
+          continue;
+        }
         result.failure = persistenceFailure(
           validRecords[0],
           "persistence-batch-failed",
@@ -182,8 +203,13 @@ async function processHistoryPartitionBatch({
         statuses.length === validRecords.length &&
         statuses.every((item, index) =>
           item && item.index === index &&
-          ["inserted", "replay", "failed"].includes(item.status));
+          ["inserted", "replay", "failed", "cancelled"].includes(item.status));
       if (!aligned) {
+        if (signal && signal.aborted) {
+          result.cancelled = true;
+          prefixOpen = false;
+          continue;
+        }
         result.failure = persistenceFailure(
           validRecords[0],
           "invalid-persistence-batch-result",
@@ -195,6 +221,11 @@ async function processHistoryPartitionBatch({
       for (let index = 0; index < validRecords.length; index += 1) {
         const record = validRecords[index];
         const status = statuses[index].status;
+        if (status === "cancelled") {
+          result.cancelled = true;
+          prefixOpen = false;
+          continue;
+        }
         if (status === "failed") {
           if (prefixOpen) {
             result.failure = persistenceFailure(
@@ -243,6 +274,7 @@ async function processHistoryPartitionBatch({
     }
   }
 
+  if (signal && signal.aborted) result.cancelled = true;
   return result;
 }
 

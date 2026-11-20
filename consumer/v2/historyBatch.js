@@ -6,6 +6,24 @@ const MAX_BATCH_SIZE = 100;
 const DEFAULT_CONCURRENCY = 2;
 const MAX_CONCURRENCY = 4;
 const MAX_ENVELOPES = 100;
+const HISTORY_BATCH_CANCELLATION_SIGNAL = Symbol("history batch cancellation signal");
+
+function validateCancellationSignal(signal) {
+  if (signal !== undefined && (!signal || typeof signal.aborted !== "boolean")) {
+    throw new Error("History batch cancellation signal is invalid.");
+  }
+}
+
+function attachHistoryBatchCancellationSignal(envelopes, signal) {
+  if (!Array.isArray(envelopes)) {
+    throw new Error("History batch envelopes must be an array.");
+  }
+  validateCancellationSignal(signal);
+  // The startup adapter forwards the envelope array but does not forward options.
+  Object.defineProperty(envelopes, HISTORY_BATCH_CANCELLATION_SIGNAL, {
+    value: signal,
+  });
+}
 
 function validateOptions({ envelopes, batchSize, concurrency, insertedAt }) {
   if (!Array.isArray(envelopes)) {
@@ -43,8 +61,13 @@ async function persistHistoryBatch({
   batchSize = DEFAULT_BATCH_SIZE,
   concurrency = DEFAULT_CONCURRENCY,
   insertedAt,
+  signal,
 }) {
   validateOptions({ envelopes, batchSize, concurrency, insertedAt });
+  signal = signal === undefined
+    ? envelopes[HISTORY_BATCH_CANCELLATION_SIGNAL]
+    : signal;
+  validateCancellationSignal(signal);
 
   const results = new Array(envelopes.length);
   const prepared = envelopes.map((envelope, index) => {
@@ -57,16 +80,19 @@ async function persistHistoryBatch({
   });
 
   for (let batchStart = 0; batchStart < prepared.length; batchStart += batchSize) {
+    if (signal && signal.aborted) break;
     const batchEnd = Math.min(batchStart + batchSize, prepared.length);
     let nextIndex = batchStart;
 
     async function worker() {
       while (nextIndex < batchEnd) {
+        if (signal && signal.aborted) break;
         const index = nextIndex;
         nextIndex += 1;
         const item = prepared[index];
         if (item === null) continue;
 
+        if (signal && signal.aborted) break;
         try {
           const persistenceResult = await persistHistoryEvent({
             client,
@@ -95,12 +121,33 @@ async function persistHistoryBatch({
     await Promise.all(Array.from({ length: workerCount }, () => worker()));
   }
 
+  let cancelledCount = 0;
+  for (let index = 0; index < results.length; index += 1) {
+    if (results[index] === undefined) {
+      results[index] = {
+        index,
+        status: "cancelled",
+      };
+      cancelledCount += 1;
+    }
+  }
+
   const counts = { inserted: 0, replay: 0, failed: 0 };
-  for (const result of results) counts[result.status] += 1;
-  return { ...counts, total: results.length, results };
+  for (const result of results) {
+    if (result.status !== "cancelled") counts[result.status] += 1;
+  }
+  return {
+    ...counts,
+    ...(cancelledCount > 0 || (signal && signal.aborted)
+      ? { cancelled: true, cancelledCount }
+      : {}),
+    total: results.length,
+    results,
+  };
 }
 
 module.exports = {
+  attachHistoryBatchCancellationSignal,
   DEFAULT_BATCH_SIZE,
   DEFAULT_CONCURRENCY,
   MAX_BATCH_SIZE,

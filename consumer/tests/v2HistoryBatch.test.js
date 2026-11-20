@@ -138,6 +138,126 @@ test("never exceeds the configured concurrency while processing bounded chunks",
   expect(persistHistoryEvent).toHaveBeenCalledTimes(11);
 });
 
+test("cancellation before work starts marks every record cancelled without transactions", async () => {
+  const controller = new AbortController();
+  controller.abort();
+
+  const result = await batch(
+    [envelope(30), envelope(31)],
+    { signal: controller.signal },
+  );
+
+  expect(result).toMatchObject({
+    inserted: 0,
+    replay: 0,
+    failed: 0,
+    cancelled: true,
+    cancelledCount: 2,
+    total: 2,
+  });
+  expect(result.results.map(({ status }) => status)).toEqual([
+    "cancelled",
+    "cancelled",
+  ]);
+  expect(persistHistoryEvent).not.toHaveBeenCalled();
+});
+
+test("waits for pending transactions and starts no more work after cancellation", async () => {
+  const controller = new AbortController();
+  let releaseTransactions;
+  let notifyTransactionsStarted;
+  const transactionsStarted = new Promise((resolve) => {
+    notifyTransactionsStarted = resolve;
+  });
+  const transactionBarrier = new Promise((resolve) => {
+    releaseTransactions = resolve;
+  });
+  persistHistoryEvent.mockImplementation(async ({ envelope: item }) => {
+    notifyTransactionsStarted();
+    await transactionBarrier;
+    return {
+      status: "inserted",
+      eventIdentity: deriveEventIdentity(item),
+    };
+  });
+
+  const pending = batch(
+    [envelope(40), envelope(41), envelope(42), envelope(43)],
+    { batchSize: 4, concurrency: 2, signal: controller.signal },
+  );
+  await transactionsStarted;
+  expect(persistHistoryEvent).toHaveBeenCalledTimes(2);
+
+  controller.abort();
+  releaseTransactions();
+  const result = await pending;
+
+  expect(persistHistoryEvent).toHaveBeenCalledTimes(2);
+  expect(result.results.map(({ status }) => status)).toEqual([
+    "inserted",
+    "inserted",
+    "cancelled",
+    "cancelled",
+  ]);
+  expect(result).toMatchObject({
+    inserted: 2,
+    failed: 0,
+    cancelled: true,
+    cancelledCount: 2,
+  });
+});
+
+test("cancellation between batch chunks prevents the next chunk from starting", async () => {
+  const controller = new AbortController();
+  persistHistoryEvent.mockImplementation(async ({ envelope: item }) => {
+    if (item.source.offset === "51") controller.abort();
+    return {
+      status: "inserted",
+      eventIdentity: deriveEventIdentity(item),
+    };
+  });
+
+  const result = await batch(
+    [envelope(50), envelope(51), envelope(52), envelope(53)],
+    { batchSize: 2, concurrency: 1, signal: controller.signal },
+  );
+
+  expect(persistHistoryEvent).toHaveBeenCalledTimes(2);
+  expect(result.results.map(({ status }) => status)).toEqual([
+    "inserted",
+    "inserted",
+    "cancelled",
+    "cancelled",
+  ]);
+  expect(result.cancelled).toBe(true);
+});
+
+test("captures a pending transaction rejection after cancellation without leaking a rejection", async () => {
+  const controller = new AbortController();
+  let rejectTransaction;
+  let notifyTransactionStarted;
+  const transactionStarted = new Promise((resolve) => {
+    notifyTransactionStarted = resolve;
+  });
+  persistHistoryEvent.mockImplementation(() => new Promise((_resolve, reject) => {
+    rejectTransaction = reject;
+    notifyTransactionStarted();
+  }));
+
+  const pending = batch(
+    [envelope(60), envelope(61)],
+    { batchSize: 2, concurrency: 1, signal: controller.signal },
+  );
+  await transactionStarted;
+  controller.abort();
+  rejectTransaction(new Error("transaction settled after cancellation"));
+  const result = await pending;
+
+  expect(result.results.map(({ status }) => status)).toEqual(["failed", "cancelled"]);
+  expect(result).toMatchObject({ failed: 1, cancelled: true, cancelledCount: 1 });
+  expect(persistHistoryEvent).toHaveBeenCalledTimes(1);
+});
+
 test("does not reclassify persistence errors or retry them", async () => {
   const transactionFailure = Object.assign(new Error("Transient transaction failure"), {
     errorLabels: ["TransientTransactionError"],

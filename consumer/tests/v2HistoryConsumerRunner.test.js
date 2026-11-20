@@ -1,7 +1,14 @@
+jest.mock("../v2/historyPersistence", () => ({
+  persistHistoryEvent: jest.fn(),
+}));
+
 const {
   createEnvelope,
   serializeSourceIdentity,
 } = require("../v2/eventContract");
+const { deriveEventIdentity } = require("../v2/historyContract");
+const { persistHistoryEvent } = require("../v2/historyPersistence");
+const { persistHistoryBatch } = require("../v2/historyBatch");
 const {
   HISTORY_CONSUMER_GROUP_ID,
   V2_TOPIC,
@@ -96,6 +103,7 @@ function createHarness({
 describe("dependency-injected V2 history consumer runner", () => {
   afterEach(() => {
     jest.useRealTimers();
+    persistHistoryEvent.mockReset();
   });
 
   test("subscribes only to V2 and disables Kafka auto-commit and batch resolution", async () => {
@@ -237,6 +245,52 @@ describe("dependency-injected V2 history consumer runner", () => {
     });
   });
 
+  test("heartbeat timeout stops admission of later persistence transactions", async () => {
+    jest.useFakeTimers();
+    let finishTransaction;
+    let notifyTransactionStarted;
+    const transactionStarted = new Promise((resolve) => {
+      notifyTransactionStarted = resolve;
+    });
+    persistHistoryEvent.mockImplementation(async ({ envelope: item }) => {
+      notifyTransactionStarted();
+      await new Promise((resolve) => {
+        finishTransaction = resolve;
+      });
+      return { status: "inserted", eventIdentity: deriveEventIdentity(item) };
+    });
+    const persistBatch = (envelopes) => persistHistoryBatch({
+      client: {},
+      historyCollection: {},
+      receiptCollection: {},
+      envelopes,
+      batchSize: envelopes.length,
+      concurrency: 1,
+    });
+    const harness = createHarness({
+      persistBatch,
+      config: { heartbeatIntervalMs: 100, heartbeatTimeoutMs: 50 },
+    });
+    await harness.runner.start();
+
+    const processing = harness.getRunOptions().eachBatch(batchContext({
+      offsets: ["80", "81", "82"],
+      heartbeat: () => new Promise(() => {}),
+    }));
+    await transactionStarted;
+    await jest.advanceTimersByTimeAsync(150);
+    expect(harness.runner.getTerminalFailure()).toMatchObject({
+      classification: "heartbeat-timeout",
+    });
+
+    finishTransaction();
+    await processing;
+
+    expect(persistHistoryEvent).toHaveBeenCalledTimes(1);
+    expect(harness.consumer.commitOffsets).not.toHaveBeenCalled();
+    await harness.runner.stop();
+  });
+
   test("does not commit if the assignment becomes stale before the commit", async () => {
     const harness = createHarness();
     await harness.runner.start();
@@ -251,6 +305,37 @@ describe("dependency-injected V2 history consumer runner", () => {
     expect(context.isStale).toHaveBeenCalledTimes(2);
     expect(harness.consumer.commitOffsets).not.toHaveBeenCalled();
     expect(harness.onFailure).not.toHaveBeenCalled();
+  });
+
+  test("reports unexpected cancellation as an observable terminal failure without committing", async () => {
+    const processBatch = jest.fn(async () => ({
+      topic: V2_TOPIC,
+      partition: 0,
+      committablePrefix: [{ offset: "25", status: "inserted" }],
+      committableCount: 1,
+      nextOffset: "26",
+      persistedAfterFailure: [],
+      failure: null,
+      cancelled: true,
+    }));
+    const harness = createHarness({ processBatch });
+    await harness.runner.start();
+    const terminalFailure = harness.runner.waitForTerminalFailure();
+
+    await harness.getRunOptions().eachBatch(batchContext({ offsets: ["25"] }));
+
+    await expect(terminalFailure).resolves.toMatchObject({
+      classification: "history-processing-failed",
+      topic: V2_TOPIC,
+      partition: 0,
+      offset: "25",
+    });
+    expect(harness.runner.getTerminalFailure()).toMatchObject({
+      classification: "history-processing-failed",
+      offset: "25",
+    });
+    expect(harness.onFailure).toHaveBeenCalledTimes(1);
+    expect(harness.consumer.commitOffsets).not.toHaveBeenCalled();
   });
 
   test("surfaces commit failures without retrying", async () => {
@@ -310,7 +395,7 @@ describe("dependency-injected V2 history consumer runner", () => {
     expect(harness.consumer.commitOffsets).not.toHaveBeenCalled();
   });
 
-  test("times out a hanging heartbeat and lets eachBatch and cleanup finish", async () => {
+  test("does not report duplicate failure for cancellation after heartbeat timeout", async () => {
     jest.useFakeTimers();
     let finishProcessing;
     const processBatch = jest.fn(() => new Promise((resolve) => {
@@ -337,11 +422,12 @@ describe("dependency-injected V2 history consumer runner", () => {
     finishProcessing({
       topic: V2_TOPIC,
       partition: 0,
-      committablePrefix: [{ offset: "60", status: "inserted" }],
-      committableCount: 1,
-      nextOffset: "61",
+      committablePrefix: [],
+      committableCount: 0,
+      nextOffset: null,
       persistedAfterFailure: [],
       failure: null,
+      cancelled: true,
     });
     await processing;
     expect(harness.runner.getTerminalFailure()).toMatchObject({
@@ -349,6 +435,7 @@ describe("dependency-injected V2 history consumer runner", () => {
       offset: "60",
     });
     expect(harness.consumer.commitOffsets).not.toHaveBeenCalled();
+    expect(harness.onFailure).toHaveBeenCalledTimes(1);
     expect(jest.getTimerCount()).toBe(0);
 
     await harness.runner.stop();
@@ -398,7 +485,7 @@ describe("dependency-injected V2 history consumer runner", () => {
     expect(harness.consumer.stop).toHaveBeenCalledTimes(1);
   });
 
-  test("shutdown drains in-flight work without committing after shutdown starts", async () => {
+  test("expected shutdown cancellation drains in-flight work without reporting failure", async () => {
     let finishProcessing;
     const processBatch = jest.fn(() => new Promise((resolve) => {
       finishProcessing = resolve;
@@ -413,14 +500,54 @@ describe("dependency-injected V2 history consumer runner", () => {
     finishProcessing({
       topic: V2_TOPIC,
       partition: 0,
-      committablePrefix: [{ offset: "40", status: "inserted" }],
-      committableCount: 1,
-      nextOffset: "41",
+      committablePrefix: [],
+      committableCount: 0,
+      nextOffset: null,
       persistedAfterFailure: [],
       failure: null,
+      cancelled: true,
     });
     await Promise.all([processing, shutdown]);
 
+    expect(harness.consumer.commitOffsets).not.toHaveBeenCalled();
+    expect(harness.runner.getTerminalFailure()).toBeNull();
+    expect(harness.onFailure).not.toHaveBeenCalled();
+    expect(harness.consumer.stop).toHaveBeenCalledTimes(1);
+  });
+
+  test("shutdown cancels later transaction admission in a multi-record batch", async () => {
+    let finishTransaction;
+    let notifyTransactionStarted;
+    const transactionStarted = new Promise((resolve) => {
+      notifyTransactionStarted = resolve;
+    });
+    persistHistoryEvent.mockImplementation(async ({ envelope: item }) => {
+      notifyTransactionStarted();
+      await new Promise((resolve) => {
+        finishTransaction = resolve;
+      });
+      return { status: "inserted", eventIdentity: deriveEventIdentity(item) };
+    });
+    const persistBatch = (envelopes) => persistHistoryBatch({
+      client: {},
+      historyCollection: {},
+      receiptCollection: {},
+      envelopes,
+      batchSize: envelopes.length,
+      concurrency: 1,
+    });
+    const harness = createHarness({ persistBatch });
+    await harness.runner.start();
+
+    const processing = harness.getRunOptions().eachBatch(batchContext({
+      offsets: ["90", "91", "92"],
+    }));
+    await transactionStarted;
+    const shutdown = harness.runner.stop();
+    finishTransaction();
+    await Promise.all([processing, shutdown]);
+
+    expect(persistHistoryEvent).toHaveBeenCalledTimes(1);
     expect(harness.consumer.commitOffsets).not.toHaveBeenCalled();
     expect(harness.consumer.stop).toHaveBeenCalledTimes(1);
   });
