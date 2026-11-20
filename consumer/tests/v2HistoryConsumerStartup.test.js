@@ -16,6 +16,27 @@ const config = loadHistoryConsumerConfig({
   V2_HISTORY_CONSUMER_ENABLED: "true",
   V2_HISTORY_LIVE_START_ACK: LIVE_START_ACKNOWLEDGEMENT,
 });
+function createDeferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, reject, resolve };
+}
+
+function createShortShutdownConfig() {
+  return {
+    ...config,
+    mongo: {
+      ...config.mongo,
+      options: { ...config.mongo.options, timeoutMS: 1000 },
+    },
+    consumer: { ...config.consumer, sessionTimeoutMs: 6000 },
+  };
+}
+
 const topicMetadata = {
   topics: [{
     name: HISTORY_TOPIC,
@@ -43,6 +64,7 @@ function createHarness({
   historyCollectionOverride,
   receiptCollectionOverride,
   verifyOwnership,
+  onMongoClose,
 } = {}) {
   const events = [];
   const ensureIndexesImpl = ensureIndexes ||
@@ -86,6 +108,10 @@ function createHarness({
   };
   const mongoClient = new MongoClient(startupConfig.mongo.uri);
   const getDatabase = mongoClient.db.bind(mongoClient);
+  let notifyMongoClose;
+  const mongoCloseStarted = new Promise((resolve) => {
+    notifyMongoClose = resolve;
+  });
   const historyDatabase = getDatabase(startupConfig.mongo.databaseName);
   mongoClient.db = jest.fn((name) => {
     events.push(`mongo.db:${name}`);
@@ -95,7 +121,11 @@ function createHarness({
     events.push("mongo.connect");
     return connectMongo();
   });
-  mongoClient.close = jest.fn(async () => { events.push("mongo.close"); });
+  mongoClient.close = jest.fn(async () => {
+    events.push("mongo.close");
+    notifyMongoClose();
+    if (onMongoClose) onMongoClose();
+  });
   const admin = {
     connect: jest.fn(async () => {
       events.push("kafka.admin.connect");
@@ -117,12 +147,19 @@ function createHarness({
     historyDatabase.collection("injected-history-collection");
   const receiptCollection = receiptCollectionOverride ||
     historyDatabase.collection("injected-receipt-collection");
+  let notifyConsumerDisconnect;
+  const consumerDisconnectStarted = new Promise((resolve) => {
+    notifyConsumerDisconnect = resolve;
+  });
   const consumer = {
     connect: jest.fn(async () => {
       events.push("consumer.connect");
       return connectConsumer();
     }),
-    disconnect: jest.fn(async () => { events.push("consumer.disconnect"); }),
+    disconnect: jest.fn(async () => {
+      events.push("consumer.disconnect");
+      notifyConsumerDisconnect();
+    }),
     stop: jest.fn(async () => { events.push("consumer.stop"); }),
   };
   const createConsumer = jest.fn((options) => {
@@ -173,12 +210,14 @@ function createHarness({
     admin,
     adminDatabase,
     consumer,
+    consumerDisconnectStarted,
     createConsumer,
     createRunner,
     events,
     ensureIndexes: ensureIndexesImpl,
     historyCollection,
     mongoClient,
+    mongoCloseStarted,
     onFailure,
     persistHistoryBatchImpl,
     resolveTerminal,
@@ -499,33 +538,297 @@ test("repeated shutdown shares cleanup and continues after one cleanup error", a
   expect(harness.mongoClient.close).toHaveBeenCalledTimes(1);
 });
 
-test("bounds shutdown waits and still attempts later cleanup after a runner hangs", async () => {
+test("keeps MongoDB open after runner timeout while persistence settles independently", async () => {
   jest.useFakeTimers();
-  const shortConfig = {
-    ...config,
-    mongo: {
-      ...config.mongo,
-      options: { ...config.mongo.options, timeoutMS: 1000 },
-    },
-    consumer: { ...config.consumer, sessionTimeoutMs: 6000 },
-  };
+  try {
+    const shortConfig = createShortShutdownConfig();
+    const transaction = createDeferred();
+    let batchPromise;
+    const harness = createHarness({
+      startupConfig: shortConfig,
+      persistHistoryBatchImpl: jest.fn(() => transaction.promise),
+      runnerStop: jest.fn(() => new Promise(() => {})),
+    });
+    await harness.startup.start();
+    batchPromise = harness.createRunner.mock.calls[0][0]
+      .persistBatch([{ event: "pending-persistence" }]);
+
+    const shuttingDown = harness.startup.stop().then(
+      () => null,
+      (error) => error,
+    );
+    await jest.advanceTimersByTimeAsync(7000);
+    const shutdownError = await shuttingDown;
+    expect(shutdownError).toBeInstanceOf(Error);
+    expect(shutdownError.message)
+      .toBe("V2 history shutdown cleanup failed: history runner stop.");
+    expect(harness.consumer.disconnect).not.toHaveBeenCalled();
+    expect(harness.admin.disconnect).toHaveBeenCalledTimes(1);
+    expect(harness.mongoClient.close).not.toHaveBeenCalled();
+    transaction.resolve();
+    await batchPromise;
+    expect(harness.mongoClient.close).not.toHaveBeenCalled();
+  } finally {
+    jest.useRealTimers();
+  }
+});
+
+test("does not close MongoDB with no tracked work until the timed-out runner settles", async () => {
+  jest.useFakeTimers();
+  try {
+    const runnerDrain = createDeferred();
+    const harness = createHarness({
+      startupConfig: createShortShutdownConfig(),
+      runnerStop: jest.fn(() => runnerDrain.promise),
+    });
+    await harness.startup.start();
+
+    const stopPromise = harness.startup.stop();
+    const firstStop = stopPromise.then(
+      () => null,
+      (error) => error,
+    );
+    const repeatedStop = harness.startup.stop();
+    expect(repeatedStop).toBe(stopPromise);
+    await jest.advanceTimersByTimeAsync(7000);
+    expect((await firstStop).message)
+      .toBe("V2 history shutdown cleanup failed: history runner stop.");
+    expect(harness.mongoClient.close).not.toHaveBeenCalled();
+    expect(harness.consumer.disconnect).not.toHaveBeenCalled();
+
+    runnerDrain.resolve();
+    await harness.mongoCloseStarted;
+    await harness.consumerDisconnectStarted;
+
+    expect(harness.runner.stop).toHaveBeenCalledTimes(1);
+    expect(harness.consumer.disconnect).toHaveBeenCalledTimes(1);
+    expect(harness.mongoClient.close).toHaveBeenCalledTimes(1);
+  } finally {
+    jest.useRealTimers();
+  }
+});
+
+test("closes MongoDB only after the runner drains before the shutdown deadline", async () => {
+  const transaction = createDeferred();
+  let batchPromise;
+  let persistencePending = false;
+  const closeWhilePersistencePending = [];
   const harness = createHarness({
-    startupConfig: shortConfig,
-    runnerStop: jest.fn(() => new Promise(() => {})),
+    persistHistoryBatchImpl: jest.fn(() => {
+      persistencePending = true;
+      return transaction.promise.finally(() => {
+        persistencePending = false;
+      });
+    }),
+    runnerStop: jest.fn(async () => {
+      if (batchPromise) await batchPromise;
+    }),
+    onMongoClose: () => closeWhilePersistencePending.push(persistencePending),
+  });
+
+  await harness.startup.start();
+  batchPromise = harness.createRunner.mock.calls[0][0]
+    .persistBatch([{ event: "pending-persistence" }]);
+  const stopping = harness.startup.stop();
+  transaction.resolve();
+
+  await expect(stopping).resolves.toBeUndefined();
+  expect(harness.mongoClient.close).toHaveBeenCalledTimes(1);
+  expect(closeWhilePersistencePending).toEqual([false]);
+});
+
+test("resumes cleanup once when the runner drains after a shutdown timeout", async () => {
+  jest.useFakeTimers();
+  try {
+    const transaction = createDeferred();
+    const runnerDrain = createDeferred();
+    let batchPromise;
+    let persistencePending = false;
+    const closeWhilePersistencePending = [];
+    const harness = createHarness({
+      startupConfig: createShortShutdownConfig(),
+      persistHistoryBatchImpl: jest.fn(() => {
+        persistencePending = true;
+        return transaction.promise.finally(() => {
+          persistencePending = false;
+        });
+      }),
+      runnerStop: jest.fn(() => runnerDrain.promise),
+      onMongoClose: () => closeWhilePersistencePending.push(persistencePending),
+    });
+
+    await harness.startup.start();
+    batchPromise = harness.createRunner.mock.calls[0][0]
+      .persistBatch([{ event: "pending-persistence" }]);
+    const stopping = harness.startup.stop().then(
+      () => null,
+      (error) => error,
+    );
+    await jest.advanceTimersByTimeAsync(7000);
+    const shutdownError = await stopping;
+    expect(shutdownError.message)
+      .toBe("V2 history shutdown cleanup failed: history runner stop.");
+    expect(harness.mongoClient.close).not.toHaveBeenCalled();
+
+    transaction.resolve();
+    await batchPromise;
+    expect(harness.mongoClient.close).not.toHaveBeenCalled();
+    runnerDrain.resolve();
+    await harness.mongoCloseStarted;
+    await harness.consumerDisconnectStarted;
+
+    expect(harness.mongoClient.close).toHaveBeenCalledTimes(1);
+    expect(harness.consumer.disconnect).toHaveBeenCalledTimes(1);
+    expect(harness.admin.disconnect).toHaveBeenCalledTimes(1);
+    expect(closeWhilePersistencePending).toEqual([false]);
+  } finally {
+    jest.useRealTimers();
+  }
+});
+
+test("continues cleanup safely when the runner rejects after a shutdown timeout", async () => {
+  jest.useFakeTimers();
+  try {
+    const transaction = createDeferred();
+    const runnerDrain = createDeferred();
+    let batchPromise;
+    const harness = createHarness({
+      startupConfig: createShortShutdownConfig(),
+      persistHistoryBatchImpl: jest.fn(() => transaction.promise),
+      runnerStop: jest.fn(() => runnerDrain.promise),
+    });
+
+    await harness.startup.start();
+    batchPromise = harness.createRunner.mock.calls[0][0]
+      .persistBatch([{ event: "pending-persistence" }]);
+    harness.resolveTerminal({
+      classification: "malformed-json",
+      topic: HISTORY_TOPIC,
+      partition: 3,
+      offset: "29",
+    });
+    const terminalCleanup = harness.startup.waitForTerminalCleanup();
+    const stopping = harness.startup.stop().then(
+      () => null,
+      (error) => error,
+    );
+    await jest.advanceTimersByTimeAsync(7000);
+    expect((await stopping).message)
+      .toBe("V2 history shutdown cleanup failed: history runner stop.");
+    expect(harness.mongoClient.close).not.toHaveBeenCalled();
+
+    transaction.reject(new Error("private persistence failure"));
+    await batchPromise.then(
+      () => undefined,
+      () => undefined,
+    );
+    expect(harness.mongoClient.close).not.toHaveBeenCalled();
+    runnerDrain.reject(new Error("private runner failure"));
+    await harness.mongoCloseStarted;
+    await harness.consumerDisconnectStarted;
+    const cleanupResult = await terminalCleanup;
+
+    expect(harness.mongoClient.close).toHaveBeenCalledTimes(1);
+    expect(harness.consumer.disconnect).toHaveBeenCalledTimes(1);
+    expect(harness.admin.disconnect).toHaveBeenCalledTimes(1);
+    expect(cleanupResult.cleanupFailure).toBeTruthy();
+    expect(JSON.stringify(cleanupResult)).not.toContain("private");
+  } finally {
+    jest.useRealTimers();
+  }
+});
+
+test("waits for a timed-out MongoDB startup operation before closing the client", async () => {
+  jest.useFakeTimers();
+  try {
+    const mongoConnect = createDeferred();
+    const harness = createHarness({
+      startupConfig: createShortShutdownConfig(),
+      connectMongo: jest.fn(() => mongoConnect.promise),
+    });
+    const starting = harness.startup.start().then(
+      () => null,
+      (error) => error,
+    );
+
+    await jest.advanceTimersByTimeAsync(1000);
+    await jest.advanceTimersByTimeAsync(7000);
+    const startupError = await starting;
+    expect(startupError.message).toBe(
+      "V2 history startup failed during MongoDB connection. Cleanup failed: MongoDB operations.",
+    );
+    expect(harness.mongoClient.close).not.toHaveBeenCalled();
+    mongoConnect.resolve();
+
+    await harness.mongoCloseStarted;
+    expect(harness.mongoClient.close).toHaveBeenCalledTimes(1);
+    expect(harness.events.indexOf("mongo.close"))
+      .toBeGreaterThan(harness.events.indexOf("mongo.connect"));
+  } finally {
+    jest.useRealTimers();
+  }
+});
+
+test("observes MongoDB startup rejection after its wrapper times out", async () => {
+  jest.useFakeTimers();
+  try {
+    const mongoConnect = createDeferred();
+    const harness = createHarness({
+      startupConfig: createShortShutdownConfig(),
+      connectMongo: jest.fn(() => mongoConnect.promise),
+    });
+    const starting = harness.startup.start().then(
+      () => null,
+      (error) => error,
+    );
+
+    await jest.advanceTimersByTimeAsync(1000);
+    await jest.advanceTimersByTimeAsync(7000);
+    const startupError = await starting;
+    expect(startupError.message).toBe(
+      "V2 history startup failed during MongoDB connection. Cleanup failed: MongoDB operations.",
+    );
+    expect(harness.mongoClient.close).not.toHaveBeenCalled();
+    mongoConnect.reject(new Error("mongodb://private/late failure"));
+
+    await harness.mongoCloseStarted;
+    expect(harness.mongoClient.close).toHaveBeenCalledTimes(1);
+    expect(harness.events).not.toContain("mongodb://private/late failure");
+  } finally {
+    jest.useRealTimers();
+  }
+});
+
+test("terminal failure followed by shutdown drains and cleans up only once", async () => {
+  const transaction = createDeferred();
+  let batchPromise;
+  const harness = createHarness({
+    persistHistoryBatchImpl: jest.fn(() => transaction.promise),
+    runnerStop: jest.fn(async () => {
+      if (batchPromise) await batchPromise;
+    }),
   });
   await harness.startup.start();
+  batchPromise = harness.createRunner.mock.calls[0][0]
+    .persistBatch([{ event: "pending-persistence" }]);
 
-  const shuttingDown = harness.startup.stop().then(
-    () => null,
-    (error) => error,
-  );
-  await jest.advanceTimersByTimeAsync(7000);
-  const shutdownError = await shuttingDown;
-  expect(shutdownError).toBeInstanceOf(Error);
-  expect(shutdownError.message)
-    .toBe("V2 history shutdown cleanup failed: history runner stop.");
+  harness.resolveTerminal({
+    classification: "malformed-json",
+    topic: HISTORY_TOPIC,
+    partition: 1,
+    offset: "18",
+  });
+  const terminalCleanup = harness.startup.waitForTerminalCleanup();
+  const explicitStop = harness.startup.stop();
+  transaction.resolve();
+
+  await expect(explicitStop).resolves.toBeUndefined();
+  await expect(terminalCleanup).resolves.toMatchObject({
+    failure: { classification: "malformed-json", partition: 1, offset: "18" },
+  });
+  expect(harness.runner.stop).toHaveBeenCalledTimes(1);
+  expect(harness.consumer.stop).toHaveBeenCalledTimes(1);
   expect(harness.consumer.disconnect).toHaveBeenCalledTimes(1);
   expect(harness.admin.disconnect).toHaveBeenCalledTimes(1);
   expect(harness.mongoClient.close).toHaveBeenCalledTimes(1);
-  jest.useRealTimers();
 });

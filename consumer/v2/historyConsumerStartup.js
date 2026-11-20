@@ -223,9 +223,15 @@ function createHistoryConsumerStartup({
   );
   const shutdownTimeoutMs =
     config.mongo.options.timeoutMS + config.consumer.sessionTimeoutMs;
+  const mongoOperations = new Set();
+  const kafkaStartupOperations = new Set();
   let startPromise;
   let stopPromise;
   let cleanupPromise;
+  let cleanupTailPromise;
+  let mongoCleanupPromise;
+  let deferredRunnerCleanupPromise;
+  let deferredMongoClosePromise;
   let adminConnectionAttempted = false;
   let mongoConnectionAttempted = false;
   let consumerConnectionAttempted = false;
@@ -237,6 +243,8 @@ function createHistoryConsumerStartup({
   let consumerDisconnectPromise;
   let consumerStopPromise;
   let runnerStopPromise;
+  let runnerStopOutcomePromise;
+  let runnerStopSettled = false;
   let runnerConsumer;
   let terminalFailure = null;
   let terminalCleanupFailure = null;
@@ -246,16 +254,54 @@ function createHistoryConsumerStartup({
     resolveTerminalFailure = resolve;
   });
 
+  function trackOperations(sets, operation) {
+    const pending = Promise.resolve().then(operation);
+    for (const operations of sets) operations.add(pending);
+    pending.then(
+      () => {
+        for (const operations of sets) operations.delete(pending);
+      },
+      () => {
+        for (const operations of sets) operations.delete(pending);
+      },
+    );
+    return pending;
+  }
+
+  function trackMongoOperation(operation) {
+    return trackOperations([mongoOperations], operation);
+  }
+
+  function trackKafkaStartupOperation(operation) {
+    return trackOperations([kafkaStartupOperations], operation);
+  }
+
+  function trackMongoAndKafkaStartupOperation(operation) {
+    return trackOperations([mongoOperations, kafkaStartupOperations], operation);
+  }
+
+  async function waitForOperations(operations) {
+    while (operations.size > 0) {
+      await Promise.allSettled([...operations]);
+    }
+  }
+
   function disconnectAdmin() {
     if (!adminConnectionAttempted) return Promise.resolve();
     if (!adminDisconnectPromise) {
-      adminDisconnectPromise = Promise.resolve().then(() => admin.disconnect());
+      adminDisconnectPromise = (async () => {
+        await waitForOperations(kafkaStartupOperations);
+        return admin.disconnect();
+      })();
     }
     return adminDisconnectPromise;
   }
 
   function closeMongoClient() {
     if (!mongoConnectionAttempted) return Promise.resolve();
+    if (!runnerStopSettled) {
+      return Promise.reject(new Error("V2 history runner has not settled."));
+    }
     if (!mongoClosePromise) {
       mongoClosePromise = Promise.resolve().then(() => mongoClient.close());
     }
@@ -265,7 +311,11 @@ function createHistoryConsumerStartup({
   function disconnectConsumer() {
     if (!consumerConnectionAttempted || !consumer) return Promise.resolve();
     if (!consumerDisconnectPromise) {
-      consumerDisconnectPromise = Promise.resolve().then(() => consumer.disconnect());
+      consumerDisconnectPromise = (async () => {
+        await waitForOperations(kafkaStartupOperations);
+        if (consumerStopPromise) await Promise.allSettled([consumerStopPromise]);
+        return consumer.disconnect();
+      })();
     }
     return consumerDisconnectPromise;
   }
@@ -273,7 +323,10 @@ function createHistoryConsumerStartup({
   function stopConsumerOnce() {
     if (!consumer || !consumerConnectionAttempted) return Promise.resolve();
     if (!consumerStopPromise) {
-      consumerStopPromise = Promise.resolve().then(() => consumer.stop());
+      consumerStopPromise = (async () => {
+        await waitForOperations(kafkaStartupOperations);
+        return consumer.stop();
+      })();
     }
     return consumerStopPromise;
   }
@@ -282,10 +335,136 @@ function createHistoryConsumerStartup({
     if (runner) {
       if (!runnerStopPromise) {
         runnerStopPromise = Promise.resolve().then(() => runner.stop());
+        runnerStopOutcomePromise = runnerStopPromise.then(
+          () => {
+            runnerStopSettled = true;
+            return "fulfilled";
+          },
+          () => {
+            runnerStopSettled = true;
+            return "rejected";
+          },
+        );
       }
       return runnerStopPromise;
     }
+    runnerStopSettled = true;
+    runnerStopOutcomePromise = Promise.resolve("fulfilled");
     return Promise.resolve();
+  }
+
+  function deferMongoCloseUntilOperationsSettle() {
+    if (deferredMongoClosePromise) return deferredMongoClosePromise;
+    deferredMongoClosePromise = waitForOperations(mongoOperations)
+      .then(() => closeMongoClient())
+      .then(
+        () => undefined,
+        () => {
+          terminalCleanupFailure = "V2 history deferred MongoDB cleanup failed.";
+        },
+      );
+    return deferredMongoClosePromise;
+  }
+
+  function cleanupKafka(deadline) {
+    return (async () => {
+      const failures = [];
+
+      async function attempt(label, operation) {
+        const remainingMs = deadline - Date.now();
+        if (remainingMs <= 0) {
+          Promise.resolve().then(operation).then(
+            () => undefined,
+            () => undefined,
+          );
+          failures.push(label);
+          return;
+        }
+        try {
+          await boundedCall(operation, remainingMs, label);
+        } catch {
+          failures.push(label);
+        }
+      }
+
+      await attempt("Kafka consumer stop", stopConsumerOnce);
+      await attempt("Kafka consumer disconnect", disconnectConsumer);
+      await attempt("Kafka admin disconnect", disconnectAdmin);
+      return failures;
+    })();
+  }
+
+  function cleanupMongo(deadline) {
+    if (mongoCleanupPromise) return mongoCleanupPromise;
+    mongoCleanupPromise = (async () => {
+      const failures = [];
+
+      async function attempt(label, operation) {
+        const remainingMs = deadline - Date.now();
+        if (remainingMs <= 0) {
+          Promise.resolve().then(operation).then(
+            () => undefined,
+            () => undefined,
+          );
+          failures.push(label);
+          return;
+        }
+        try {
+          await boundedCall(operation, remainingMs, label);
+        } catch {
+          failures.push(label);
+        }
+      }
+
+      try {
+        const remainingMs = deadline - Date.now();
+        if (mongoOperations.size > 0) {
+          if (remainingMs <= 0) throw new Error("MongoDB work is still active.");
+          await boundedCall(
+            () => waitForOperations(mongoOperations),
+            remainingMs,
+            "MongoDB operations",
+          );
+        }
+        await attempt("MongoDB client close", closeMongoClient);
+      } catch {
+        failures.push("MongoDB operations");
+        deferMongoCloseUntilOperationsSettle();
+      }
+      return failures;
+    })();
+    return mongoCleanupPromise;
+  }
+
+  function cleanupAfterRunner(deadline) {
+    if (cleanupTailPromise) return cleanupTailPromise;
+    cleanupTailPromise = Promise.all([
+      cleanupKafka(deadline),
+      cleanupMongo(deadline),
+    ]).then(([kafkaFailures, mongoFailures]) => [
+      ...kafkaFailures,
+      ...mongoFailures,
+    ]);
+    return cleanupTailPromise;
+  }
+
+  function deferCleanupUntilRunnerSettles() {
+    if (deferredRunnerCleanupPromise) return deferredRunnerCleanupPromise;
+    const runnerOutcome = runnerStopOutcomePromise || Promise.resolve("fulfilled");
+    deferredRunnerCleanupPromise = runnerOutcome
+      .then(async (outcome) => {
+        if (outcome === "rejected") {
+          terminalCleanupFailure = "V2 history runner stop failed after its shutdown deadline.";
+        }
+        const failures = await cleanupAfterRunner(Date.now() + shutdownTimeoutMs);
+        if (failures.length > 0) {
+          terminalCleanupFailure = "V2 history deferred shutdown cleanup failed.";
+        }
+      })
+      .catch(() => {
+        terminalCleanupFailure = "V2 history deferred shutdown cleanup failed.";
+      });
+    return deferredRunnerCleanupPromise;
   }
 
   async function cleanup() {
@@ -294,20 +473,25 @@ function createHistoryConsumerStartup({
       const failures = [];
       const deadline = Date.now() + shutdownTimeoutMs;
 
-      async function attempt(label, operation) {
-        try {
-          await boundedCall(operation, Math.max(0, deadline - Date.now()), label);
-        } catch {
-          failures.push(label);
+      stopRunner();
+      let runnerOutcome;
+      try {
+        runnerOutcome = await boundedCall(
+          () => runnerStopOutcomePromise,
+          Math.max(0, deadline - Date.now()),
+          "history runner stop",
+        );
+      } catch {
+        failures.push("history runner stop");
+        if (!runnerStopSettled) {
+          deferCleanupUntilRunnerSettles();
+          return failures;
         }
       }
 
-      await attempt("history runner stop", stopRunner);
-      await attempt("Kafka consumer stop", stopConsumerOnce);
-      await attempt("Kafka consumer disconnect", disconnectConsumer);
-      await attempt("Kafka admin disconnect", disconnectAdmin);
-      await attempt("MongoDB client close", closeMongoClient);
-      return failures;
+      if (runnerOutcome === "rejected") failures.push("history runner stop");
+      const tailFailures = await cleanupAfterRunner(deadline);
+      return [...failures, ...tailFailures];
     })();
     return cleanupPromise;
   }
@@ -374,7 +558,7 @@ function createHistoryConsumerStartup({
       try {
         adminConnectionAttempted = true;
         await boundedCall(
-          () => admin.connect(),
+          () => trackKafkaStartupOperation(() => admin.connect()),
           config.kafka.options.connectionTimeout,
           stage,
         );
@@ -383,7 +567,7 @@ function createHistoryConsumerStartup({
         stage = "MongoDB connection";
         mongoConnectionAttempted = true;
         await boundedCall(
-          () => mongoClient.connect(),
+          () => trackMongoOperation(() => mongoClient.connect()),
           config.mongo.options.timeoutMS,
           stage,
         );
@@ -391,7 +575,9 @@ function createHistoryConsumerStartup({
 
         stage = "Kafka and MongoDB identity preflight";
         await boundedCall(
-          () => verifyPreflights({ admin, mongoClient, config }),
+          () => trackMongoAndKafkaStartupOperation(
+            () => verifyPreflights({ admin, mongoClient, config }),
+          ),
           startupTimeoutMs,
           stage,
         );
@@ -399,12 +585,12 @@ function createHistoryConsumerStartup({
 
         stage = "history collection ownership verification";
         const ownershipResult = await boundedCall(
-          () => verifyOwnership({
+          () => trackMongoOperation(() => verifyOwnership({
             database: historyCollection.db,
             mongoClient,
             historyCollection,
             receiptCollection,
-          }),
+          })),
           startupTimeoutMs,
           stage,
         );
@@ -424,7 +610,9 @@ function createHistoryConsumerStartup({
 
         stage = "history index setup";
         await boundedCall(
-          () => ensureIndexes({ historyCollection, receiptCollection }),
+          () => trackMongoOperation(
+            () => ensureIndexes({ historyCollection, receiptCollection }),
+          ),
           config.mongo.options.timeoutMS,
           stage,
         );
@@ -462,10 +650,13 @@ function createHistoryConsumerStartup({
           batchSize: config.history.batchSize,
           concurrency: config.history.concurrency,
         });
+        const trackedPersistBatch = (envelopes) => trackMongoOperation(
+          () => persistBatch(envelopes),
+        );
         stage = "history runner creation";
         runner = createRunner({
           consumer: runnerConsumer,
-          persistBatch,
+          persistBatch: trackedPersistBatch,
           config: {
             groupId: config.consumer.groupId,
             partitionsConsumedConcurrently:
@@ -485,14 +676,18 @@ function createHistoryConsumerStartup({
         stage = "Kafka consumer connection";
         consumerConnectionAttempted = true;
         await boundedCall(
-          () => consumer.connect(),
+          () => trackKafkaStartupOperation(() => consumer.connect()),
           config.kafka.options.connectionTimeout,
           stage,
         );
         checkCancellation();
 
         stage = "history runner startup";
-        await boundedCall(() => runner.start(), config.kafka.options.requestTimeout, stage);
+        await boundedCall(
+          () => trackKafkaStartupOperation(() => runner.start()),
+          config.kafka.options.requestTimeout,
+          stage,
+        );
         checkCancellation();
         superviseRunnerTerminalFailure();
         return runner;
