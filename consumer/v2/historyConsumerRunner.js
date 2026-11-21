@@ -290,6 +290,9 @@ function createHistoryConsumerRunner({
       maxRecords: settings.firstRunSmoke.maxRecords,
     })
     : null;
+  const smokeMaxRuntimeMs = settings.firstRunSmoke
+    ? settings.firstRunSmoke.maxRuntimeMs
+    : null;
 
   let startPromise;
   let stopPromise;
@@ -300,11 +303,51 @@ function createHistoryConsumerRunner({
   let failureHandlerFailed = false;
   let terminalPauseFailed = false;
   let terminalFailure = null;
+  let smokeStartedAt = null;
+  let smokeStoppedElapsedMs = null;
+  let deadlineExpired = false;
+  let deadlineTimer = null;
   let resolveTerminalFailure;
   const terminalFailureSignal = new Promise((resolve) => {
     resolveTerminalFailure = resolve;
   });
   const inFlight = new Set();
+
+  function clearDeadlineTimer() {
+    if (deadlineTimer !== null) {
+      clearTimeout(deadlineTimer);
+      deadlineTimer = null;
+    }
+  }
+
+  function checkDeadline() {
+    if (smokeStartedAt === null || smokeStoppedElapsedMs !== null ||
+        deadlineExpired) {
+      return deadlineExpired;
+    }
+    if (performance.now() - smokeStartedAt >= smokeMaxRuntimeMs) {
+      deadlineExpired = true;
+      clearDeadlineTimer();
+      admissionController.close(CLOSE_REASONS.DEADLINE);
+      cancellationController.abort();
+    }
+    return deadlineExpired;
+  }
+
+  function scheduleDeadline() {
+    const remaining = smokeMaxRuntimeMs - (performance.now() - smokeStartedAt);
+    deadlineTimer = setTimeout(() => {
+      deadlineTimer = null;
+      if (!checkDeadline()) scheduleDeadline();
+    }, Math.max(1, Math.ceil(remaining)));
+  }
+
+  function stopDeadline() {
+    if (smokeStartedAt === null || smokeStoppedElapsedMs !== null) return;
+    checkDeadline();
+    smokeStoppedElapsedMs = Math.max(0, performance.now() - smokeStartedAt);
+    clearDeadlineTimer();
+  }
 
   function reportTerminalFailure(failure) {
     if (terminalFailure) return terminalFailure;
@@ -364,7 +407,8 @@ function createHistoryConsumerRunner({
       ? batch.messages[0].offset
       : null;
 
-    if (stopRequested || terminalFailure || cancellationController.signal.aborted) {
+    if (checkDeadline() || stopRequested || terminalFailure ||
+        cancellationController.signal.aborted) {
       return;
     }
     if (!batch || batch.topic !== V2_TOPIC || !Array.isArray(batch.messages)) {
@@ -422,6 +466,7 @@ function createHistoryConsumerRunner({
       coreError = error;
     }
     const heartbeatError = await heartbeatPump.stop();
+    checkDeadline();
 
     if (heartbeatError) {
       reportTerminalFailure(
@@ -458,6 +503,7 @@ function createHistoryConsumerRunner({
     if (coreResult.nextOffset !== null) {
       if (!assignmentIsCurrent(batchContext)) return;
       if (!assignmentIsCurrent(batchContext)) return;
+      if (checkDeadline()) return;
 
       try {
         await consumer.commitOffsets([{
@@ -521,6 +567,10 @@ function createHistoryConsumerRunner({
       if (stopRequested) return;
 
       runStarted = true;
+      if (admissionController) {
+        smokeStartedAt = performance.now();
+        scheduleDeadline();
+      }
       try {
         runPromise = Promise.resolve(consumer.run({
           autoCommit: false,
@@ -536,6 +586,7 @@ function createHistoryConsumerRunner({
           },
         );
       } catch {
+        stopDeadline();
         runStarted = false;
         throw new Error("Unable to start the V2 history consumer.");
       }
@@ -545,6 +596,7 @@ function createHistoryConsumerRunner({
 
   function stop() {
     if (stopPromise) return stopPromise;
+    stopDeadline();
     stopRequested = true;
     if (admissionController) admissionController.close(CLOSE_REASONS.SHUTDOWN);
     cancellationController.abort();
@@ -601,6 +653,17 @@ function createHistoryConsumerRunner({
     waitForTerminalFailure: () => terminalFailureSignal,
     getAdmissionSnapshot: () => admissionController
       ? admissionController.snapshot()
+      : null,
+    getRuntimeSnapshot: () => admissionController
+      ? Object.freeze({
+        started: smokeStartedAt !== null,
+        elapsedMs: smokeStartedAt === null
+          ? 0
+          : smokeStoppedElapsedMs === null
+            ? Math.max(0, performance.now() - smokeStartedAt)
+            : smokeStoppedElapsedMs,
+        deadlineExpired,
+      })
       : null,
   };
 }

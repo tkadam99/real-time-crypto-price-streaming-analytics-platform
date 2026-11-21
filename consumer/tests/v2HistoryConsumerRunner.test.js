@@ -342,6 +342,7 @@ describe("dependency-injected V2 history consumer runner", () => {
         topic: V2_TOPIC, partition: 1, offset: "31",
       }]);
       expect(harness.consumer.stop).not.toHaveBeenCalled();
+      await harness.runner.stop();
     });
 
     test("snapshots are frozen, reflect reservations, and retain the shutdown reason", async () => {
@@ -386,6 +387,7 @@ describe("dependency-injected V2 history consumer runner", () => {
       expect(harness.runner.getAdmissionSnapshot().admittedRecords).toBe(3);
       await harness.getRunOptions().eachBatch(batchContext({ offsets: ["14"] }));
       expect(harness.consumer.commitOffsets).toHaveBeenCalledTimes(1);
+      await harness.runner.stop();
     });
 
     test("failed admitted writes fence later commits and do not refund capacity", async () => {
@@ -404,6 +406,7 @@ describe("dependency-injected V2 history consumer runner", () => {
         classification: "persistence-failed", offset: "21",
       });
       expect(harness.runner.getAdmissionSnapshot().admittedRecords).toBe(3);
+      await harness.runner.stop();
     });
 
     test("rejects a core result that tries to commit an unreserved record", async () => {
@@ -431,6 +434,7 @@ describe("dependency-injected V2 history consumer runner", () => {
         classification: "invalid-history-processing-result",
       });
       expect(harness.runner.getAdmissionSnapshot().admittedRecords).toBe(1);
+      await harness.runner.stop();
     });
 
     test("shutdown cancels admitted work and preserves its reservation without committing", async () => {
@@ -483,6 +487,7 @@ describe("dependency-injected V2 history consumer runner", () => {
         classification: "heartbeat-failed",
       });
       expect(harness.runner.getAdmissionSnapshot().admittedRecords).toBe(1);
+      await harness.runner.stop();
     });
 
     test("stale admitted batches are not committed and keep their reservations", async () => {
@@ -494,6 +499,7 @@ describe("dependency-injected V2 history consumer runner", () => {
       }));
       expect(harness.consumer.commitOffsets).not.toHaveBeenCalled();
       expect(harness.runner.getAdmissionSnapshot().admittedRecords).toBe(1);
+      await harness.runner.stop();
     });
 
     test("commit errors remain terminal after an admitted prefix", async () => {
@@ -511,6 +517,282 @@ describe("dependency-injected V2 history consumer runner", () => {
         admittedRecords: 1, closeReason: "limit-reached",
       });
       expect(JSON.stringify(harness.onFailure.mock.calls)).not.toContain("private");
+      await harness.runner.stop();
+    });
+  });
+
+  describe("smoke runtime deadline", () => {
+    beforeEach(() => {
+      jest.useFakeTimers();
+    });
+
+    afterEach(() => {
+      persistHistoryEvent.mockReset();
+      jest.useRealTimers();
+    });
+
+    test("normal mode does not start a smoke deadline timer", async () => {
+      const harness = createHarness();
+      await harness.runner.start();
+      expect(harness.runner.getRuntimeSnapshot()).toBeNull();
+      expect(jest.getTimerCount()).toBe(0);
+      await harness.runner.stop();
+    });
+
+    test("starts the monotonic deadline at execution, not construction or subscription", async () => {
+      const harness = createHarness({ config: { firstRunSmoke: smokeSettings() } });
+      let finishSubscribe;
+      harness.consumer.subscribe.mockImplementation(() => new Promise((resolve) => {
+        finishSubscribe = resolve;
+      }));
+      const before = harness.runner.getRuntimeSnapshot();
+      expect(Object.isFrozen(before)).toBe(true);
+      expect(before).toEqual({ started: false, elapsedMs: 0, deadlineExpired: false });
+      await jest.advanceTimersByTimeAsync(5000);
+      const starting = harness.runner.start();
+      await jest.advanceTimersByTimeAsync(5000);
+      expect(harness.runner.getRuntimeSnapshot()).toEqual(before);
+      expect(jest.getTimerCount()).toBe(0);
+      finishSubscribe();
+      await starting;
+      expect(jest.getTimerCount()).toBe(1);
+      await jest.advanceTimersByTimeAsync(400);
+      const running = harness.runner.getRuntimeSnapshot();
+      expect(Object.isFrozen(running)).toBe(true);
+      expect(running).toEqual({ started: true, elapsedMs: 400, deadlineExpired: false });
+      jest.setSystemTime(Date.now() + 10000000);
+      expect(harness.runner.getRuntimeSnapshot().elapsedMs).toBe(400);
+      await jest.advanceTimersByTimeAsync(600);
+      expect(harness.runner.getRuntimeSnapshot()).toEqual({
+        started: true, elapsedMs: 1000, deadlineExpired: true,
+      });
+      expect(harness.runner.getAdmissionSnapshot().closeReason).toBe("deadline");
+      expect(harness.runner.getTerminalFailure()).toBeNull();
+      expect(harness.onFailure).not.toHaveBeenCalled();
+      expect(jest.getTimerCount()).toBe(0);
+      await harness.runner.stop();
+    });
+
+    test("deadline cancels unstarted transactions and drains the active one before stop", async () => {
+      let finishTransaction;
+      let transactionStarted;
+      const started = new Promise((resolve) => { transactionStarted = resolve; });
+      persistHistoryEvent.mockImplementation(async ({ envelope: item }) => {
+        transactionStarted();
+        await new Promise((resolve) => { finishTransaction = resolve; });
+        return { status: "inserted", eventIdentity: deriveEventIdentity(item) };
+      });
+      const persistBatch = (envelopes) => persistHistoryBatch({
+        client: {},
+        historyCollection: {},
+        receiptCollection: {},
+        envelopes,
+        batchSize: envelopes.length,
+        concurrency: 1,
+      });
+      const harness = createHarness({
+        config: { firstRunSmoke: smokeSettings(5) },
+        persistBatch,
+      });
+      await harness.runner.start();
+      let batchSettled = false;
+      const processing = harness.getRunOptions().eachBatch(batchContext({
+        offsets: ["10", "11", "12"],
+      })).then(() => { batchSettled = true; });
+      await started;
+      await jest.advanceTimersByTimeAsync(1000);
+      expect(harness.runner.getRuntimeSnapshot().deadlineExpired).toBe(true);
+      expect(harness.runner.getAdmissionSnapshot()).toMatchObject({
+        admittedRecords: 3, closeReason: "deadline",
+      });
+      expect(batchSettled).toBe(false);
+      expect(persistHistoryEvent).toHaveBeenCalledTimes(1);
+      await harness.getRunOptions().eachBatch(batchContext({ offsets: ["13"] }));
+      expect(persistHistoryEvent).toHaveBeenCalledTimes(1);
+      const stopping = harness.runner.stop();
+      await Promise.resolve();
+      expect(harness.consumer.stop).not.toHaveBeenCalled();
+      finishTransaction();
+      await Promise.all([processing, stopping]);
+      expect(persistHistoryEvent).toHaveBeenCalledTimes(1);
+      expect(harness.consumer.commitOffsets).not.toHaveBeenCalled();
+      expect(harness.consumer.stop).toHaveBeenCalledTimes(1);
+      expect(jest.getTimerCount()).toBe(0);
+    });
+
+    test("observes a late transaction rejection after the deadline and drains safely", async () => {
+      let rejectTransaction;
+      persistHistoryEvent.mockImplementation(() => new Promise((_resolve, reject) => {
+        rejectTransaction = reject;
+      }));
+      const persistBatch = (envelopes) => persistHistoryBatch({
+        client: {},
+        historyCollection: {},
+        receiptCollection: {},
+        envelopes,
+        concurrency: 1,
+      });
+      const harness = createHarness({
+        config: { firstRunSmoke: smokeSettings(2) },
+        persistBatch,
+      });
+      await harness.runner.start();
+      const processing = harness.getRunOptions().eachBatch(batchContext({ offsets: ["15"] }));
+      await jest.advanceTimersByTimeAsync(1000);
+      const stopping = harness.runner.stop();
+      rejectTransaction(new Error("private MongoDB failure"));
+      await expect(Promise.all([processing, stopping])).resolves.toBeDefined();
+      expect(harness.consumer.commitOffsets).not.toHaveBeenCalled();
+      expect(harness.runner.getRuntimeSnapshot().deadlineExpired).toBe(true);
+      expect(JSON.stringify(harness.onFailure.mock.calls)).not.toContain("private");
+      expect(jest.getTimerCount()).toBe(0);
+    });
+
+    test("a reached record cap does not hide a later deadline during persistence", async () => {
+      let finish;
+      let signal;
+      const processBatch = jest.fn(({ signal: inputSignal }) => {
+        signal = inputSignal;
+        return new Promise((resolve) => { finish = resolve; });
+      });
+      const harness = createHarness({
+        config: { firstRunSmoke: smokeSettings(1) },
+        processBatch,
+      });
+      await harness.runner.start();
+      const processing = harness.getRunOptions().eachBatch(batchContext({ offsets: ["20"] }));
+      expect(harness.runner.getAdmissionSnapshot().closeReason).toBe("limit-reached");
+      await jest.advanceTimersByTimeAsync(1000);
+      expect(signal.aborted).toBe(true);
+      expect(harness.runner.getAdmissionSnapshot().closeReason).toBe("limit-reached");
+      expect(harness.runner.getRuntimeSnapshot().deadlineExpired).toBe(true);
+      finish({ cancelled: true });
+      await processing;
+      expect(harness.consumer.commitOffsets).not.toHaveBeenCalled();
+      await harness.runner.stop();
+      expect(jest.getTimerCount()).toBe(0);
+    });
+
+    test("a delayed timer cannot allow a commit after monotonic deadline", async () => {
+      const harness = createHarness({ config: { firstRunSmoke: smokeSettings(1) } });
+      await harness.runner.start();
+      const now = performance.now();
+      const clock = jest.spyOn(performance, "now").mockReturnValue(now + 1000);
+      await harness.getRunOptions().eachBatch(batchContext({ offsets: ["30"] }));
+      expect(harness.persistBatch).not.toHaveBeenCalled();
+      expect(harness.consumer.commitOffsets).not.toHaveBeenCalled();
+      expect(harness.runner.getRuntimeSnapshot().deadlineExpired).toBe(true);
+      clock.mockRestore();
+      await harness.runner.stop();
+      expect(jest.getTimerCount()).toBe(0);
+    });
+
+    test("checks the monotonic deadline immediately before issuing a commit", async () => {
+      const harness = createHarness({ config: { firstRunSmoke: smokeSettings(1) } });
+      await harness.runner.start();
+      const now = performance.now();
+      const clock = jest.spyOn(performance, "now");
+      const context = batchContext({
+        offsets: ["31"],
+        isStale: jest.fn().mockImplementationOnce(() => false).mockImplementationOnce(() => {
+          clock.mockReturnValue(now + 1000);
+          return false;
+        }),
+      });
+      await harness.getRunOptions().eachBatch(context);
+      expect(harness.persistBatch).toHaveBeenCalledTimes(1);
+      expect(harness.consumer.commitOffsets).not.toHaveBeenCalled();
+      expect(harness.runner.getRuntimeSnapshot().deadlineExpired).toBe(true);
+      clock.mockRestore();
+      await harness.runner.stop();
+      expect(jest.getTimerCount()).toBe(0);
+    });
+
+    test("terminal failure remains intact if the deadline subsequently expires", async () => {
+      const harness = createHarness({ config: { firstRunSmoke: smokeSettings(2) } });
+      await harness.runner.start();
+      await harness.getRunOptions().eachBatch(batchContext({
+        offsets: ["40"],
+        values: [Buffer.from("{private")],
+      }));
+      const failure = harness.runner.getTerminalFailure();
+      expect(failure.classification).toBe("malformed-json");
+      await jest.advanceTimersByTimeAsync(1000);
+      expect(harness.runner.getRuntimeSnapshot().deadlineExpired).toBe(true);
+      expect(harness.runner.getTerminalFailure()).toBe(failure);
+      expect(harness.onFailure).toHaveBeenCalledTimes(1);
+      await harness.runner.stop();
+      expect(jest.getTimerCount()).toBe(0);
+    });
+
+    test("repeated start and stop do not create or leave deadline timers", async () => {
+      const harness = createHarness({ config: { firstRunSmoke: smokeSettings() } });
+      await Promise.all([harness.runner.start(), harness.runner.start()]);
+      expect(harness.consumer.run).toHaveBeenCalledTimes(1);
+      expect(jest.getTimerCount()).toBe(1);
+      await jest.advanceTimersByTimeAsync(250);
+      const stopping = harness.runner.stop();
+      expect(harness.runner.stop()).toBe(stopping);
+      await stopping;
+      expect(jest.getTimerCount()).toBe(0);
+      await jest.advanceTimersByTimeAsync(5000);
+      expect(harness.runner.getRuntimeSnapshot()).toEqual({
+        started: true, elapsedMs: 250, deadlineExpired: false,
+      });
+      expect(harness.runner.getAdmissionSnapshot().closeReason).toBe("shutdown");
+      expect(harness.onFailure).not.toHaveBeenCalled();
+      await expect(harness.runner.start()).rejects.toThrow("History consumer is stopping.");
+    });
+
+    test.each(["fulfilled", "rejected"])(
+      "observes an already issued commit that settles %s after the deadline",
+      async (outcome) => {
+        let settleCommit;
+        let commitStarted;
+        const started = new Promise((resolve) => { commitStarted = resolve; });
+        const commitOffsets = jest.fn(() => {
+          commitStarted();
+          return new Promise((resolve, reject) => {
+            settleCommit = () => outcome === "fulfilled"
+              ? resolve()
+              : reject(new Error("private commit failure"));
+          });
+        });
+        const harness = createHarness({
+          config: { firstRunSmoke: smokeSettings(1) },
+          commitOffsets,
+        });
+        await harness.runner.start();
+        const processing = harness.getRunOptions().eachBatch(batchContext({ offsets: ["50"] }));
+        await started;
+        await jest.advanceTimersByTimeAsync(1000);
+        expect(harness.runner.getRuntimeSnapshot().deadlineExpired).toBe(true);
+        expect(harness.runner.getAdmissionSnapshot().closeReason).toBe("limit-reached");
+        const stopping = harness.runner.stop();
+        await Promise.resolve();
+        expect(harness.consumer.stop).not.toHaveBeenCalled();
+        settleCommit();
+        await Promise.all([processing, stopping]);
+        expect(commitOffsets).toHaveBeenCalledTimes(1);
+        if (outcome === "rejected") {
+          expect(harness.runner.getTerminalFailure()).toMatchObject({
+            classification: "offset-commit-failed", offset: "51",
+          });
+          expect(JSON.stringify(harness.onFailure.mock.calls)).not.toContain("private");
+        } else {
+          expect(harness.runner.getTerminalFailure()).toBeNull();
+        }
+        expect(jest.getTimerCount()).toBe(0);
+      },
+    );
+
+    test("clears the deadline timer if consumer.run throws during startup", async () => {
+      const harness = createHarness({ config: { firstRunSmoke: smokeSettings() } });
+      harness.consumer.run.mockImplementation(() => { throw new Error("private"); });
+      await expect(harness.runner.start()).rejects.toThrow("Unable to start the V2 history consumer.");
+      expect(jest.getTimerCount()).toBe(0);
+      await expect(harness.runner.stop()).rejects.toThrow("history consumer startup");
+      expect(jest.getTimerCount()).toBe(0);
     });
   });
 
