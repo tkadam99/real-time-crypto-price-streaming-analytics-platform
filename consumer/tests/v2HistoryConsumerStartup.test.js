@@ -12,6 +12,7 @@ const {
 const { HISTORY_COLLECTION_NAMES } = require("../v2/historyCollectionInspection");
 const {
   createHistoryConsumerStartup,
+  createHistorySmokeSupervisor,
 } = require("../v2/historyConsumerStartup");
 
 const config = loadHistoryConsumerConfig({
@@ -141,6 +142,10 @@ function createHarness({
   const terminalSignal = new Promise((resolve) => {
     resolveTerminal = resolve;
   });
+  const smokeSignal = createDeferred();
+  let smokeCompletion = Object.freeze({ status: "pending" });
+  let smokeRuntime = Object.freeze({ started: true, elapsedMs: 1, deadlineExpired: false });
+  let runnerFailure = null;
   const adminDatabase = {
     command: jest.fn(async (command) => {
       if (command.hello === 1) {
@@ -238,6 +243,10 @@ function createHarness({
       if (runnerConsumer) await runnerConsumer.stop();
     }),
     waitForTerminalFailure: jest.fn(() => terminalSignal),
+    getTerminalFailure: jest.fn(() => runnerFailure),
+    getSmokeCompletionSnapshot: jest.fn(() => smokeCompletion),
+    waitForSmokeCompletion: jest.fn(() => smokeSignal.promise),
+    getRuntimeSnapshot: jest.fn(() => smokeRuntime),
   };
   const createRunner = jest.fn((options) => {
     events.push("runner.create");
@@ -283,7 +292,17 @@ function createHarness({
     mongoCloseStarted,
     onFailure,
     persistHistoryBatchImpl,
-    resolveTerminal,
+    resolveTerminal: (failure) => {
+      runnerFailure = failure;
+      resolveTerminal(failure);
+    },
+    resolveSmoke: (result) => {
+      smokeCompletion = result;
+      smokeSignal.resolve(result);
+    },
+    rejectSmoke: smokeSignal.reject,
+    setRunnerFailure: (failure) => { runnerFailure = failure; },
+    setSmokeRuntime: (runtime) => { smokeRuntime = runtime; },
     receiptCollection,
     runner,
     verifyOwnership: verifyOwnershipImpl,
@@ -902,7 +921,8 @@ test("terminal failure followed by shutdown drains and cleans up only once", asy
 test("runs smoke preflights in order, rechecks the group twice, and blocks consumption", async () => {
   const harness = createHarness({ startupConfig: smokeConfig });
 
-  await expect(harness.startup.start()).rejects.toThrow(
+  const error = await harness.startup.start().catch((failure) => failure);
+  expect(error.message).toBe(
     "V2 history smoke execution is unavailable until bounded runner controls are installed.",
   );
 
@@ -937,6 +957,7 @@ test("runs smoke preflights in order, rechecks the group twice, and blocks consu
     .toBeLessThan(harness.events.indexOf("smoke.group.verify:2"));
   expect(harness.ensureIndexes).not.toHaveBeenCalled();
   expect(harness.createConsumer).not.toHaveBeenCalled();
+  expect(harness.createRunner).not.toHaveBeenCalled();
   expect(harness.consumer.connect).not.toHaveBeenCalled();
   expect(harness.consumer.subscribe).not.toHaveBeenCalled();
 });
@@ -1108,4 +1129,278 @@ test("smoke preflight cleanup is idempotent and does not expose verifier errors"
   expect(harness.admin.disconnect).toHaveBeenCalledTimes(1);
   expect(harness.mongoClient.close).toHaveBeenCalledTimes(1);
   expect(harness.createConsumer).not.toHaveBeenCalled();
+});
+
+describe("offline smoke completion supervision", () => {
+  function observe(harness) {
+    return createHistorySmokeSupervisor({
+      runner: harness.runner,
+      stop: harness.startup.stop,
+      getSupervisorFailure: harness.startup.getTerminalFailure,
+    });
+  }
+
+  test("a mutable timeout signal cannot change the latched non-success outcome", async () => {
+    const runnerDrain = createDeferred();
+    const stopStarted = createDeferred();
+    const harness = createHarness({
+      runnerStop: jest.fn(() => {
+        stopStarted.resolve();
+        return runnerDrain.promise;
+      }),
+    });
+    await harness.startup.start();
+    const supervisor = observe(harness);
+    const signal = { status: "timeout" };
+    harness.resolveSmoke(signal);
+    await stopStarted.promise;
+    signal.status = "cap-completed";
+    runnerDrain.resolve();
+    await expect(supervisor.waitForSmokeOutcome()).resolves.toEqual({ status: "timeout" });
+  });
+
+  test("normal startup has no smoke outcome", async () => {
+    const harness = createHarness();
+    await harness.startup.start();
+    expect(harness.startup.getSmokeOutcomeSnapshot()).toBeNull();
+    await expect(harness.startup.waitForSmokeOutcome()).resolves.toBeNull();
+    expect(harness.runner.waitForSmokeCompletion).not.toHaveBeenCalled();
+    await harness.startup.stop();
+  });
+
+  test("cap success waits for runner drain and tracked persistence before closing MongoDB", async () => {
+    const runnerDrain = createDeferred();
+    const stopStarted = createDeferred();
+    const transaction = createDeferred();
+    const harness = createHarness({
+      runnerStop: jest.fn(() => {
+        stopStarted.resolve();
+        return runnerDrain.promise;
+      }),
+      persistHistoryBatchImpl: jest.fn(() => transaction.promise),
+    });
+    await harness.startup.start();
+    const persistence = harness.createRunner.mock.calls[0][0].persistBatch([{}]);
+    const supervisor = observe(harness);
+    const waiting = supervisor.waitForSmokeOutcome();
+    expect(supervisor.waitForSmokeOutcome()).toBe(waiting);
+    expect(Object.isFrozen(supervisor.getSmokeOutcomeSnapshot())).toBe(true);
+    harness.resolveSmoke(Object.freeze({ status: "cap-completed" }));
+    await stopStarted.promise;
+    expect(supervisor.getSmokeOutcomeSnapshot()).toEqual({ status: "pending" });
+    expect(harness.mongoClient.close).not.toHaveBeenCalled();
+    runnerDrain.resolve();
+    await harness.consumerDisconnectStarted;
+    expect(harness.mongoClient.close).not.toHaveBeenCalled();
+    expect(supervisor.getSmokeOutcomeSnapshot()).toEqual({ status: "pending" });
+    transaction.resolve();
+    await persistence;
+    const result = await waiting;
+    expect(result).toEqual({ status: "success" });
+    expect(Object.isFrozen(result)).toBe(true);
+    expect(supervisor.getSmokeOutcomeSnapshot()).toBe(result);
+    expect(harness.runner.stop).toHaveBeenCalledTimes(1);
+    expect(harness.consumer.stop).toHaveBeenCalledTimes(1);
+    expect(harness.consumer.disconnect).toHaveBeenCalledTimes(1);
+    expect(harness.admin.disconnect).toHaveBeenCalledTimes(1);
+    expect(harness.mongoClient.close).toHaveBeenCalledTimes(1);
+  });
+
+  test.each(["runner", "supervisor", "deadline"])(
+    "%s discovered after cap completion prevents final success",
+    async (kind) => {
+      const runnerDrain = createDeferred();
+      const stopStarted = createDeferred();
+      const harness = createHarness({
+        runnerStop: jest.fn(() => {
+          stopStarted.resolve();
+          return runnerDrain.promise;
+        }),
+      });
+      await harness.startup.start();
+      const supervisor = observe(harness);
+      harness.resolveSmoke({ status: "cap-completed" });
+      await stopStarted.promise;
+      const failure = {
+        classification: "heartbeat-failed", topic: HISTORY_TOPIC, partition: 1, offset: "10",
+      };
+      if (kind === "runner") harness.setRunnerFailure(failure);
+      if (kind === "supervisor") {
+        harness.resolveTerminal({ ...failure, payload: "private" });
+        await harness.startup.waitForTerminalFailure();
+        harness.setRunnerFailure(null);
+      }
+      if (kind === "deadline") {
+        harness.setSmokeRuntime({ started: true, elapsedMs: 1000, deadlineExpired: true });
+      }
+      const repeatedStop = harness.startup.stop();
+      runnerDrain.resolve();
+      await repeatedStop;
+      const result = await supervisor.waitForSmokeOutcome();
+      expect(result).toEqual(kind === "deadline"
+        ? { status: "timeout" }
+        : { status: "failed", reason: "runner-failure" });
+      expect(JSON.stringify(result)).not.toContain("private");
+      expect(harness.runner.stop).toHaveBeenCalledTimes(1);
+      expect(harness.consumer.stop).toHaveBeenCalledTimes(1);
+      expect(harness.consumer.disconnect).toHaveBeenCalledTimes(1);
+      expect(harness.admin.disconnect).toHaveBeenCalledTimes(1);
+      expect(harness.mongoClient.close).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  test.each([
+    [{ status: "timeout" }, { status: "timeout" }],
+    [{
+      status: "failed",
+      failure: {
+        classification: "heartbeat-failed", topic: HISTORY_TOPIC, partition: 0, offset: "1",
+      },
+    }, { status: "failed", reason: "runner-failure" }],
+    [{ status: "incomplete", reason: "batch-incomplete" },
+      { status: "incomplete", reason: "batch-incomplete" }],
+  ])("runner outcome %j remains non-success after cleanup", async (signal, expected) => {
+    const harness = createHarness();
+    await harness.startup.start();
+    const supervisor = observe(harness);
+    harness.resolveSmoke(signal);
+    const result = await supervisor.waitForSmokeOutcome();
+    expect(result).toEqual(expected);
+    expect(Object.isFrozen(result)).toBe(true);
+    expect(harness.runner.stop).toHaveBeenCalledTimes(1);
+    expect(harness.mongoClient.close).toHaveBeenCalledTimes(1);
+  });
+
+  test.each(["cap-completed", "timeout"])(
+    "cleanup failure after %s is incomplete and does not expose raw errors",
+    async (status) => {
+      const harness = createHarness({
+        runnerStop: jest.fn().mockRejectedValue(new Error("mongodb://private/credentials")),
+      });
+      await harness.startup.start();
+      const supervisor = observe(harness);
+      harness.resolveSmoke({ status });
+      const result = await supervisor.waitForSmokeOutcome();
+      expect(result).toEqual({
+        status: "incomplete", reason: "cleanup-failed", cause: status,
+      });
+      expect(JSON.stringify(result)).not.toContain("private");
+      expect(harness.mongoClient.close).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  test.each(["fulfilled", "rejected"])(
+    "runner stop timeout defers MongoDB close when the runner later %s",
+    async (outcome) => {
+      jest.useFakeTimers();
+      try {
+        const runnerDrain = createDeferred();
+        const stopStarted = createDeferred();
+        const transaction = createDeferred();
+        const harness = createHarness({
+          startupConfig: createShortShutdownConfig(),
+          runnerStop: jest.fn(() => {
+            stopStarted.resolve();
+            return runnerDrain.promise;
+          }),
+          persistHistoryBatchImpl: jest.fn(() => transaction.promise),
+        });
+        await harness.startup.start();
+        const persistence = harness.createRunner.mock.calls[0][0].persistBatch([{}]);
+        const supervisor = observe(harness);
+        harness.resolveSmoke({ status: "cap-completed" });
+        await stopStarted.promise;
+        await jest.advanceTimersByTimeAsync(7000);
+        const result = await supervisor.waitForSmokeOutcome();
+        expect(result).toEqual({
+          status: "incomplete", reason: "cleanup-failed", cause: "cap-completed",
+        });
+        expect(harness.mongoClient.close).not.toHaveBeenCalled();
+        if (outcome === "fulfilled") runnerDrain.resolve();
+        else runnerDrain.reject(new Error("private late runner failure"));
+        await harness.consumerDisconnectStarted;
+        expect(harness.mongoClient.close).not.toHaveBeenCalled();
+        transaction.resolve();
+        await persistence;
+        await harness.mongoCloseStarted;
+        expect(harness.mongoClient.close).toHaveBeenCalledTimes(1);
+        expect(supervisor.getSmokeOutcomeSnapshot()).toBe(result);
+        expect(harness.runner.stop).toHaveBeenCalledTimes(1);
+      } finally {
+        jest.useRealTimers();
+      }
+    },
+  );
+
+  test("operator shutdown during pending completion is idempotent and observes late rejection", async () => {
+    const harness = createHarness();
+    await harness.startup.start();
+    const supervisor = observe(harness);
+    await Promise.resolve();
+    const stop = harness.startup.stop();
+    supervisor.notifyStopRequested();
+    supervisor.notifyStopRequested();
+    expect(harness.startup.stop()).toBe(stop);
+    await stop;
+    const result = await supervisor.waitForSmokeOutcome();
+    expect(result).toEqual({ status: "incomplete", reason: "shutdown" });
+    harness.rejectSmoke(new Error("private completion failure"));
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(supervisor.getSmokeOutcomeSnapshot()).toBe(result);
+    expect(harness.runner.stop).toHaveBeenCalledTimes(1);
+    expect(harness.consumer.stop).toHaveBeenCalledTimes(1);
+    expect(harness.consumer.disconnect).toHaveBeenCalledTimes(1);
+    expect(harness.admin.disconnect).toHaveBeenCalledTimes(1);
+    expect(harness.mongoClient.close).toHaveBeenCalledTimes(1);
+  });
+
+  test.each(["signal", "runtime", "terminal", "interface"])(
+    "invalid %s is sanitized, fails closed, and still cleans up",
+    async (invalid) => {
+      const harness = createHarness();
+      await harness.startup.start();
+      if (invalid === "interface") harness.runner.getRuntimeSnapshot = null;
+      if (invalid === "runtime") {
+        harness.setSmokeRuntime({ started: true, elapsedMs: 1, deadlineExpired: "private" });
+      }
+      if (invalid === "terminal") harness.setRunnerFailure({ payload: "private" });
+      const supervisor = observe(harness);
+      harness.resolveSmoke(invalid === "signal"
+        ? { status: "cap-completed", payload: "private" }
+        : { status: "cap-completed" });
+      const result = await supervisor.waitForSmokeOutcome();
+      expect(result).toEqual({ status: "failed", reason: "invalid-runner-result" });
+      expect(JSON.stringify(result)).not.toContain("private");
+      expect(harness.runner.stop).toHaveBeenCalledTimes(1);
+      expect(harness.mongoClient.close).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  test("completion-monitor rejection is sanitized and initiates cleanup", async () => {
+    const harness = createHarness();
+    await harness.startup.start();
+    const supervisor = observe(harness);
+    await Promise.resolve();
+    harness.rejectSmoke(new Error("mongodb://private/credentials"));
+    const result = await supervisor.waitForSmokeOutcome();
+    expect(result).toEqual({ status: "failed", reason: "invalid-runner-result" });
+    expect(JSON.stringify(result)).not.toContain("private");
+    expect(harness.runner.stop).toHaveBeenCalledTimes(1);
+    expect(harness.mongoClient.close).toHaveBeenCalledTimes(1);
+  });
+
+  test("operator stop cannot turn a cap snapshot with an invalid monitor into success", async () => {
+    const harness = createHarness();
+    await harness.startup.start();
+    harness.resolveSmoke({ status: "cap-completed" });
+    harness.runner.waitForSmokeCompletion = null;
+    const supervisor = observe(harness);
+    supervisor.notifyStopRequested();
+    await expect(supervisor.waitForSmokeOutcome()).resolves.toEqual({
+      status: "failed", reason: "invalid-runner-result",
+    });
+    expect(harness.runner.stop).toHaveBeenCalledTimes(1);
+    expect(harness.mongoClient.close).toHaveBeenCalledTimes(1);
+  });
 });

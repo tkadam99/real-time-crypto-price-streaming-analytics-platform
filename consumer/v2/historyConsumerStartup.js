@@ -264,6 +264,194 @@ function sanitizeTerminalFailure(failure) {
   });
 }
 
+function isSmokeRunnerFailure(failure) {
+  const keys = ["classification", "topic", "partition", "offset"];
+  if (failure && Object.prototype.hasOwnProperty.call(failure, "errorName")) {
+    keys.push("errorName");
+  }
+  return hasExactKeys(failure, keys) &&
+    RUNNER_FAILURE_CLASSIFICATIONS.has(failure.classification) &&
+    failure.topic === HISTORY_TOPIC &&
+    (failure.partition === null || isBoundedInteger(failure.partition, 0, 5)) &&
+    (failure.offset === null ||
+      (typeof failure.offset === "string" &&
+        /^(0|[1-9][0-9]*)$/.test(failure.offset) &&
+        failure.offset.length <= 19 &&
+        BigInt(failure.offset) <= 9223372036854775807n)) &&
+    (!keys.includes("errorName") || SAFE_ERROR_NAMES.has(failure.errorName));
+}
+
+function isSmokeCompletion(result, allowPending) {
+  if (!result || typeof result !== "object") return false;
+  if (result.status === "pending") {
+    return allowPending && hasExactKeys(result, ["status"]);
+  }
+  if (result.status === "cap-completed" || result.status === "timeout") {
+    return hasExactKeys(result, ["status"]);
+  }
+  if (result.status === "failed") {
+    return hasExactKeys(result, ["status", "failure"]) &&
+      isSmokeRunnerFailure(result.failure);
+  }
+  return result.status === "incomplete" &&
+    hasExactKeys(result, ["status", "reason"]) &&
+    ["batch-incomplete", "shutdown", "startup-failed"].includes(result.reason);
+}
+
+function sameSmokeCompletion(first, second) {
+  if (!isSmokeCompletion(first, false) || !isSmokeCompletion(second, false) ||
+      first.status !== second.status) return false;
+  if (first.status === "incomplete") return first.reason === second.reason;
+  if (first.status !== "failed") return true;
+  return ["classification", "topic", "partition", "offset", "errorName"]
+    .every((key) => first.failure[key] === second.failure[key]);
+}
+
+function isSmokeRuntime(result) {
+  return hasExactKeys(result, ["started", "elapsedMs", "deadlineExpired"]) &&
+    typeof result.started === "boolean" &&
+    Number.isFinite(result.elapsedMs) && result.elapsedMs >= 0 &&
+    typeof result.deadlineExpired === "boolean";
+}
+
+function copySmokeTrigger(result) {
+  if (result.status === "failed") {
+    return { status: "failed", reason: "runner-failure" };
+  }
+  if (result.status === "incomplete") {
+    return { status: "incomplete", reason: result.reason };
+  }
+  return { status: result.status };
+}
+
+function createHistorySmokeSupervisor({
+  runner,
+  stop,
+  getSupervisorFailure = () => null,
+}) {
+  if (typeof stop !== "function" || typeof getSupervisorFailure !== "function") {
+    throw new Error("V2 history smoke supervisor cleanup is required.");
+  }
+
+  let outcome = Object.freeze({ status: "pending" });
+  let claimed = false;
+  let observedCompletion = null;
+  let observationInvalid = false;
+  let observationReady;
+  let resolveOutcome;
+  const outcomeSignal = new Promise((resolve) => { resolveOutcome = resolve; });
+
+  function finish(result) {
+    outcome = Object.freeze(result);
+    resolveOutcome(outcome);
+  }
+
+  function begin(result) {
+    if (claimed) return;
+    claimed = true;
+    Promise.resolve().then(async () => {
+      try {
+        const stopping = stop();
+        if (!stopping || typeof stopping.then !== "function") {
+          throw new Error("Invalid cleanup result.");
+        }
+        await stopping;
+      } catch {
+        finish({ status: "incomplete", reason: "cleanup-failed", cause: result.status });
+        return;
+      }
+
+      if (result.status === "cap-completed") {
+        try {
+          await observationReady;
+          const current = runner.getSmokeCompletionSnapshot();
+          const failure = runner.getTerminalFailure();
+          const supervisorFailure = getSupervisorFailure();
+          const runtime = runner.getRuntimeSnapshot();
+          if (observationInvalid || !sameSmokeCompletion(result, observedCompletion) ||
+              !sameSmokeCompletion(result, current) ||
+              !isSmokeRuntime(runtime) || !runtime.started ||
+              (failure !== null && !isSmokeRunnerFailure(failure)) ||
+              (supervisorFailure !== null &&
+                (typeof supervisorFailure !== "object" || Array.isArray(supervisorFailure)))) {
+            finish({ status: "failed", reason: "invalid-runner-result" });
+          } else if (failure !== null || supervisorFailure !== null) {
+            finish({ status: "failed", reason: "runner-failure" });
+          } else if (runtime.deadlineExpired) {
+            finish({ status: "timeout" });
+          } else {
+            finish({ status: "success" });
+          }
+        } catch {
+          finish({ status: "failed", reason: "invalid-runner-result" });
+        }
+      } else if (result.status === "timeout") {
+        finish({ status: "timeout" });
+      } else if (result.status === "failed") {
+        finish({ status: "failed", reason: result.reason || "runner-failure" });
+      } else {
+        finish({ status: "incomplete", reason: result.reason });
+      }
+    }).catch(() => {
+      finish({ status: "failed", reason: "supervision-failed" });
+    });
+  }
+
+  function invalidRunnerResult() {
+    observationInvalid = true;
+    begin({ status: "failed", reason: "invalid-runner-result" });
+  }
+
+  function notifyStopRequested() {
+    if (claimed) return;
+    try {
+      const current = runner.getSmokeCompletionSnapshot();
+      if (!isSmokeCompletion(current, true)) return invalidRunnerResult();
+      begin(current.status === "pending"
+        ? { status: "incomplete", reason: "shutdown" }
+        : copySmokeTrigger(current));
+    } catch {
+      invalidRunnerResult();
+    }
+  }
+
+  observationReady = Promise.resolve().then(() => {
+    if (!runner || ["stop", "getSmokeCompletionSnapshot", "waitForSmokeCompletion",
+      "getRuntimeSnapshot", "getTerminalFailure"].some(
+      (method) => typeof runner[method] !== "function",
+    )) {
+      throw new Error("Invalid smoke runner.");
+    }
+    const current = runner.getSmokeCompletionSnapshot();
+    const signal = runner.waitForSmokeCompletion();
+    if (!signal || typeof signal.then !== "function") {
+      throw new Error("Invalid smoke completion signal.");
+    }
+    Promise.resolve(signal).then((result) => {
+      try {
+        if (!sameSmokeCompletion(result, runner.getSmokeCompletionSnapshot())) {
+          invalidRunnerResult();
+          return;
+        }
+        observedCompletion = copySmokeTrigger(result);
+        begin(observedCompletion);
+      } catch {
+        invalidRunnerResult();
+      }
+    }, invalidRunnerResult);
+    if (!isSmokeCompletion(current, true)) invalidRunnerResult();
+  }).catch(invalidRunnerResult);
+
+  // Frozen outcomes are pending, success, timeout, failed with a reason, or
+  // incomplete with a reason (and the original status on cleanup failure).
+  // The wait settles after bounded cleanup; deferred cleanup may continue.
+  return {
+    getSmokeOutcomeSnapshot: () => outcome,
+    waitForSmokeOutcome: () => outcomeSignal,
+    notifyStopRequested,
+  };
+}
+
 function createHistoryConsumerStartup({
   config,
   admin,
@@ -332,6 +520,7 @@ function createHistoryConsumerStartup({
   let terminalFailure = null;
   let terminalCleanupFailure = null;
   let terminalMonitorPromise;
+  let smokeSupervisor;
   let resolveTerminalFailure;
   const terminalFailureSignal = new Promise((resolve) => {
     resolveTerminalFailure = resolve;
@@ -809,6 +998,7 @@ function createHistoryConsumerStartup({
               config.consumer.partitionsConsumedConcurrently,
             heartbeatIntervalMs: config.consumer.heartbeatIntervalMs,
             heartbeatTimeoutMs: config.consumer.heartbeatTimeoutMs,
+            ...(config.firstRunSmoke ? { firstRunSmoke: config.firstRunSmoke } : {}),
           },
           onFailure,
         });
@@ -836,6 +1026,13 @@ function createHistoryConsumerStartup({
         );
         checkCancellation();
         superviseRunnerTerminalFailure();
+        if (config.firstRunSmoke) {
+          smokeSupervisor = createHistorySmokeSupervisor({
+            runner,
+            stop,
+            getSupervisorFailure: () => terminalFailure,
+          });
+        }
         return runner;
       } catch {
         const cleanupFailures = await cleanup();
@@ -874,6 +1071,7 @@ function createHistoryConsumerStartup({
         throw new Error(`V2 history shutdown cleanup failed: ${failures.join(", ")}.`);
       }
     })();
+    if (smokeSupervisor) smokeSupervisor.notifyStopRequested();
     return stopPromise;
   }
 
@@ -892,9 +1090,16 @@ function createHistoryConsumerStartup({
     getTerminalFailure: () => terminalFailure,
     waitForTerminalFailure: () => terminalFailureSignal,
     waitForTerminalCleanup,
+    getSmokeOutcomeSnapshot: () => smokeSupervisor
+      ? smokeSupervisor.getSmokeOutcomeSnapshot()
+      : null,
+    waitForSmokeOutcome: () => smokeSupervisor
+      ? smokeSupervisor.waitForSmokeOutcome()
+      : Promise.resolve(null),
   };
 }
 
 module.exports = {
   createHistoryConsumerStartup,
+  createHistorySmokeSupervisor,
 };
