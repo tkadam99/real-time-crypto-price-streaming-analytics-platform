@@ -1,0 +1,150 @@
+name: crypto-v2
+
+services:
+  v2-kafka:
+    image: apache/kafka:3.9.1
+    depends_on:
+      v2-kafka-data-init:
+        condition: service_completed_successfully
+    environment:
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,HOST:PLAINTEXT
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:29092,HOST://0.0.0.0:19092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://v2-kafka:29092,HOST://127.0.0.1:19092
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@v2-kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_DIRS: /tmp/kraft-combined-logs
+      CLUSTER_ID: 4L6g3nShT-eMCtK--X86sw
+    ports:
+      - "127.0.0.1:19092:19092"
+    volumes:
+      - kafka_v2_data:/tmp/kraft-combined-logs
+    networks:
+      - v2_network
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server v2-kafka:29092 >/dev/null 2>&1
+      interval: 10s
+      timeout: 15s
+      retries: 18
+      start_period: 30s
+
+  v2-kafka-data-init:
+    image: apache/kafka:3.9.1
+    user: "0:0"
+    entrypoint: ["bash", "-ec"]
+    command:
+      - chown 1000:1000 /tmp/kraft-combined-logs
+    volumes:
+      - kafka_v2_data:/tmp/kraft-combined-logs
+    networks:
+      - v2_network
+    restart: "no"
+
+  v2-mongodb:
+    image: mongo:7.0.16
+    command: ["mongod", "--replSet", "rs-v2", "--bind_ip_all"]
+    ports:
+      - "127.0.0.1:27019:27017"
+    volumes:
+      - mongo_v2_data:/data/db
+    networks:
+      - v2_network
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          mongosh --quiet --eval
+          'try { const s = rs.status(); quit(s.ok === 1 && s.members.some((m) => m.self && m.stateStr === "PRIMARY") ? 0 : 1); }
+          catch (e) { quit(1); }'
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+
+  v2-mongo-init:
+    image: mongo:7.0.16
+    depends_on:
+      v2-mongodb:
+        condition: service_started
+    entrypoint: ["bash", "-ec"]
+    command:
+      - |
+        until mongosh "mongodb://v2-mongodb:27017/admin" --quiet --eval 'quit(db.adminCommand({ping: 1}).ok === 1 ? 0 : 1)' >/dev/null 2>&1; do
+          sleep 1
+        done
+        mongosh "mongodb://v2-mongodb:27017/admin" --quiet --eval '
+          const expectedSet = "rs-v2";
+          const expectedHost = "v2-mongodb:27017";
+          let status;
+          try {
+            status = rs.status();
+          } catch (error) {
+            if (error.code !== 94 && error.codeName !== "NotYetInitialized") throw error;
+            rs.initiate({ _id: expectedSet, members: [{ _id: 0, host: expectedHost }] });
+            quit(0);
+          }
+          if (status.set !== expectedSet ||
+              status.members.length !== 1 ||
+              status.members[0].name !== expectedHost) {
+            throw new Error("Existing MongoDB replica-set configuration does not match rs-v2.");
+          }
+        '
+    restart: "no"
+    networks:
+      - v2_network
+
+  v2-topic-init:
+    image: apache/kafka:3.9.1
+    depends_on:
+      v2-kafka:
+        condition: service_healthy
+    entrypoint: ["bash", "-ec"]
+    command:
+      - |
+        set -o pipefail
+        bootstrap="v2-kafka:29092"
+        topics="/opt/kafka/bin/kafka-topics.sh"
+        topic="crypto-prices-v2"
+        existing=$$("$$topics" --bootstrap-server "$$bootstrap" --list)
+        if grep -Fqx "$$topic" <<<"$$existing"; then
+          summary=$$("$$topics" --bootstrap-server "$$bootstrap" --describe --topic "$$topic")
+        else
+          "$$topics" --bootstrap-server "$$bootstrap" --create --if-not-exists \
+            --topic "$$topic" --partitions 6 --replication-factor 1
+          summary=$$("$$topics" --bootstrap-server "$$bootstrap" --describe --topic "$$topic")
+        fi
+        if [[ "$$summary" =~ PartitionCount:[[:space:]]*([0-9]+)([[:space:]]|$$) ]]; then
+          partition_count="$${BASH_REMATCH[1]}"
+        else
+          echo "Unable to parse partition count for $$topic: $$summary" >&2
+          exit 1
+        fi
+        if [[ "$$summary" =~ ReplicationFactor:[[:space:]]*([0-9]+)([[:space:]]|$$) ]]; then
+          replication_factor="$${BASH_REMATCH[1]}"
+        else
+          echo "Unable to parse replication factor for $$topic: $$summary" >&2
+          exit 1
+        fi
+        if (( 10#$$partition_count != 6 || 10#$$replication_factor != 1 )); then
+          echo "Refusing unexpected $$topic configuration: $$summary" >&2
+          exit 1
+        fi
+    restart: "no"
+    networks:
+      - v2_network
+
+networks:
+  v2_network:
+
+volumes:
+  kafka_v2_data:
+  mongo_v2_data:
