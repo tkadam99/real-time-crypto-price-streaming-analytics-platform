@@ -6,8 +6,11 @@ const {
   HISTORY_MONGO_URI,
   HISTORY_TOPIC,
   LIVE_START_ACKNOWLEDGEMENT,
+  FIRST_RUN_SMOKE_ACKNOWLEDGEMENT,
+  FIRST_RUN_SMOKE_EXPECTED_TOPIC_ID,
 } = require("../v2/historyConsumerConfig");
 const { HISTORY_COLLECTION_NAMES } = require("../v2/historyCollectionInspection");
+const { createHistoryConsumerStartup } = require("../v2/historyConsumerStartup");
 const {
   createHistoryConsumerApplication,
   runHistoryConsumer,
@@ -16,6 +19,14 @@ const {
 const enabledEnv = {
   V2_HISTORY_CONSUMER_ENABLED: "true",
   V2_HISTORY_LIVE_START_ACK: LIVE_START_ACKNOWLEDGEMENT,
+};
+const smokeEnv = {
+  ...enabledEnv,
+  V2_HISTORY_FIRST_RUN_SMOKE_ENABLED: "true",
+  V2_HISTORY_FIRST_RUN_SMOKE_ACK: FIRST_RUN_SMOKE_ACKNOWLEDGEMENT,
+  V2_HISTORY_FIRST_RUN_SMOKE_MAX_RECORDS: "3",
+  V2_HISTORY_FIRST_RUN_SMOKE_MAX_RUNTIME_MS: "1000",
+  V2_HISTORY_TOPIC_ID: FIRST_RUN_SMOKE_EXPECTED_TOPIC_ID,
 };
 
 function createDeferred() {
@@ -139,11 +150,19 @@ function createHarness({
     events.push("startup.start");
     notifyStartupStarted();
   });
+  const smokeSignal = createDeferred();
+  const smokeObservationStarted = createDeferred();
+  let smokeSnapshot = { status: "pending" };
   const startup = {
     start: startupStart || defaultStartupStart,
     stop: startupStop,
     waitForTerminalCleanup,
     getTerminalFailure,
+    getSmokeOutcomeSnapshot: jest.fn(() => smokeSnapshot),
+    waitForSmokeOutcome: jest.fn(() => {
+      smokeObservationStarted.resolve();
+      return smokeSignal.promise;
+    }),
   };
   const createStartup = startupFactory || jest.fn((options) => {
     events.push("startup.create");
@@ -184,6 +203,13 @@ function createHarness({
     receiptCollection,
     startup,
     startupStarted,
+    smokeObservationStarted: smokeObservationStarted.promise,
+    resolveSmokeOutcome: (result) => {
+      smokeSnapshot = result;
+      smokeSignal.resolve(result);
+    },
+    rejectSmokeOutcome: smokeSignal.reject,
+    setSmokeSnapshot: (snapshot) => { smokeSnapshot = snapshot; },
     startupOptions: () => startupOptions,
     KafkaConstructor: KafkaCtor,
   };
@@ -582,4 +608,370 @@ test("repeated application shutdown calls share one supervisor cleanup", async (
   await Promise.all([firstStop, secondStop]);
   expect(harness.startup.stop).toHaveBeenCalledTimes(1);
   application.installSignalHandlers().remove();
+});
+
+describe("smoke outcome entry-point supervision", () => {
+  test("normal mode does not observe smoke outcomes", async () => {
+    const harness = createHarness();
+    const running = runHistoryConsumer(harness.dependencies);
+    await harness.startupStarted;
+    await Promise.resolve();
+    harness.processObject.emit("SIGINT");
+    await running;
+    expect(harness.startup.getSmokeOutcomeSnapshot).not.toHaveBeenCalled();
+    expect(harness.startup.waitForSmokeOutcome).not.toHaveBeenCalled();
+    expect(harness.processObject.exitCode).toBe(130);
+  });
+
+  test("only final supervisor success sets exit code zero, not runner cap completion", async () => {
+    const runner = { getSmokeCompletionSnapshot: jest.fn(() => ({ status: "cap-completed" })) };
+    const harness = createHarness({
+      env: smokeEnv,
+      startupStart: jest.fn(async () => runner),
+    });
+    const running = runHistoryConsumer(harness.dependencies);
+    await harness.smokeObservationStarted;
+    expect(harness.processObject.exitCode).toBeUndefined();
+    expect(runner.getSmokeCompletionSnapshot).not.toHaveBeenCalled();
+    harness.resolveSmokeOutcome({ status: "success" });
+    expect(await running).toBeDefined();
+    expect(harness.processObject.exitCode).toBe(0);
+    expect(harness.startup.stop).not.toHaveBeenCalled();
+    expect(harness.processObject.listenerCount("SIGINT")).toBe(0);
+    expect(harness.processObject.exit).not.toHaveBeenCalled();
+  });
+
+  test("does not observe outcomes until startup has succeeded", async () => {
+    const start = createDeferred();
+    const harness = createHarness({ env: smokeEnv, startupStart: jest.fn(() => start.promise) });
+    const running = runHistoryConsumer(harness.dependencies);
+    harness.resolveSmokeOutcome({ status: "success" });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(harness.startup.getSmokeOutcomeSnapshot).not.toHaveBeenCalled();
+    expect(harness.startup.waitForSmokeOutcome).not.toHaveBeenCalled();
+    expect(harness.processObject.exitCode).toBeUndefined();
+    start.resolve({});
+    await running;
+    expect(harness.processObject.exitCode).toBe(0);
+  });
+
+  test("direct outcome observation also waits for successful startup", async () => {
+    const start = createDeferred();
+    const harness = createHarness({ env: smokeEnv, startupStart: jest.fn(() => start.promise) });
+    const application = createHistoryConsumerApplication(harness.dependencies);
+    await expect(application.waitForSmokeOutcome()).rejects.toThrow(
+      "V2 history smoke startup has not completed.",
+    );
+    const starting = application.start();
+    const observing = application.waitForSmokeOutcome();
+    await Promise.resolve();
+    expect(harness.startup.getSmokeOutcomeSnapshot).not.toHaveBeenCalled();
+    start.resolve({});
+    await starting;
+    await harness.smokeObservationStarted;
+    harness.resolveSmokeOutcome({ status: "success" });
+    await expect(observing).resolves.toEqual({ status: "success" });
+    application.installSignalHandlers().remove();
+  });
+
+  test.each([
+    [{ status: "timeout" }],
+    [{ status: "failed", reason: "runner-failure" }],
+    [{ status: "incomplete", reason: "batch-incomplete" }],
+    [{ status: "incomplete", reason: "cleanup-failed", cause: "timeout" }],
+  ])("final smoke outcome %j sets exit code one", async (outcome) => {
+    const harness = createHarness({ env: smokeEnv });
+    const running = runHistoryConsumer(harness.dependencies);
+    await harness.smokeObservationStarted;
+    harness.resolveSmokeOutcome(outcome);
+    await running;
+    expect(harness.processObject.exitCode).toBe(1);
+    expect(harness.startup.stop).not.toHaveBeenCalled();
+    expect(harness.logger.error).toHaveBeenCalledWith(
+      `V2 history smoke outcome: status=${outcome.status}.`,
+    );
+    expect(harness.processObject.exit).not.toHaveBeenCalled();
+  });
+
+  test.each([
+    null,
+    { status: "cap-completed" },
+    { status: "pending" },
+    { status: "success", payload: "mongodb://private/credentials" },
+    { status: "failed", reason: "private" },
+    { status: "incomplete", reason: "cleanup-failed", cause: "private" },
+  ])("invalid final smoke outcome %j fails closed", async (outcome) => {
+    const harness = createHarness({ env: smokeEnv });
+    const running = runHistoryConsumer(harness.dependencies);
+    await harness.smokeObservationStarted;
+    harness.resolveSmokeOutcome(outcome);
+    await running;
+    expect(harness.processObject.exitCode).toBe(1);
+    expect(harness.startup.stop).toHaveBeenCalledTimes(1);
+    expect(harness.logger.error.mock.calls.flat().join(" ")).not.toContain("private");
+  });
+
+  test.each(["snapshot", "wait", "terminal"])(
+    "missing smoke supervisor %s API fails closed after startup",
+    async (missing) => {
+      const harness = createHarness({ env: smokeEnv });
+      if (missing === "snapshot") harness.startup.getSmokeOutcomeSnapshot = null;
+      if (missing === "wait") harness.startup.waitForSmokeOutcome = null;
+      if (missing === "terminal") harness.startup.getTerminalFailure = undefined;
+      await runHistoryConsumer(harness.dependencies);
+      expect(harness.processObject.exitCode).toBe(1);
+      expect(harness.startup.stop).toHaveBeenCalledTimes(1);
+      expect(harness.logger.error).toHaveBeenCalledWith(
+        "V2 history smoke outcome observation failed.",
+      );
+    },
+  );
+
+  test("rejecting outcome observation is sanitized and initiates cleanup", async () => {
+    const harness = createHarness({ env: smokeEnv });
+    const running = runHistoryConsumer(harness.dependencies);
+    await harness.smokeObservationStarted;
+    harness.rejectSmokeOutcome(new Error("mongodb://private/password"));
+    await running;
+    expect(harness.processObject.exitCode).toBe(1);
+    expect(harness.startup.stop).toHaveBeenCalledTimes(1);
+    expect(harness.logger.error.mock.calls.flat().join(" ")).not.toContain("private");
+  });
+
+  test("a final outcome inconsistent with the supervisor snapshot fails closed", async () => {
+    const harness = createHarness({ env: smokeEnv });
+    const running = runHistoryConsumer(harness.dependencies);
+    await harness.smokeObservationStarted;
+    harness.resolveSmokeOutcome({ status: "success" });
+    harness.setSmokeSnapshot({ status: "timeout" });
+    await running;
+    expect(harness.processObject.exitCode).toBe(1);
+    expect(harness.startup.stop).toHaveBeenCalledTimes(1);
+  });
+
+  test("a non-promise smoke outcome signal fails closed", async () => {
+    const harness = createHarness({ env: smokeEnv });
+    harness.startup.waitForSmokeOutcome.mockReturnValue({ status: "success" });
+    await runHistoryConsumer(harness.dependencies);
+    expect(harness.processObject.exitCode).toBe(1);
+    expect(harness.startup.stop).toHaveBeenCalledTimes(1);
+  });
+
+  test("a previously recorded terminal failure defeats later supervisor success", async () => {
+    const harness = createHarness({ env: smokeEnv });
+    const running = runHistoryConsumer(harness.dependencies);
+    await harness.smokeObservationStarted;
+    harness.startupOptions().onFailure({
+      classification: "heartbeat-failed", topic: HISTORY_TOPIC, partition: 0, offset: "1",
+    });
+    harness.resolveSmokeOutcome({ status: "success" });
+    await running;
+    expect(harness.processObject.exitCode).toBe(1);
+  });
+
+  test("late smoke success does not clear an already reported terminal failure", async () => {
+    const terminal = createDeferred();
+    const harness = createHarness({
+      env: smokeEnv,
+      waitForTerminalCleanup: jest.fn(() => terminal.promise),
+    });
+    const running = runHistoryConsumer(harness.dependencies);
+    await harness.smokeObservationStarted;
+    terminal.resolve({ failure: { classification: "heartbeat-failed" }, cleanupFailure: null });
+    await running;
+    expect(harness.processObject.exitCode).toBe(1);
+    harness.resolveSmokeOutcome({ status: "success" });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(harness.processObject.exitCode).toBe(1);
+  });
+
+  test("an existing nonzero exit code is not cleared by smoke success", async () => {
+    const harness = createHarness({ env: smokeEnv });
+    harness.processObject.exitCode = 1;
+    const running = runHistoryConsumer(harness.dependencies);
+    await harness.smokeObservationStarted;
+    harness.resolveSmokeOutcome({ status: "success" });
+    await running;
+    expect(harness.processObject.exitCode).toBe(1);
+  });
+
+  test.each([["SIGINT", 130], ["SIGTERM", 143]])(
+    "%s drains cleanly while smoke completion stays pending",
+    async (signal, code) => {
+      const harness = createHarness({ env: smokeEnv });
+      const running = runHistoryConsumer(harness.dependencies);
+      await harness.smokeObservationStarted;
+      harness.processObject.emit(signal);
+      await running;
+      expect(harness.processObject.exitCode).toBe(code);
+      expect(harness.startup.stop).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  test.each([["SIGINT", 130], ["SIGTERM", 143]])(
+    "%s wins over smoke success during shared pending cleanup",
+    async (signal, code) => {
+      const stopping = createDeferred();
+      const stopStarted = createDeferred();
+      const harness = createHarness({
+        env: smokeEnv,
+        startupStop: jest.fn(() => {
+          stopStarted.resolve();
+          return stopping.promise;
+        }),
+      });
+      harness.processObject.exitCode = 0;
+      const running = runHistoryConsumer(harness.dependencies);
+      await harness.smokeObservationStarted;
+      harness.processObject.emit(signal);
+      await stopStarted.promise;
+      harness.processObject.emit(signal === "SIGINT" ? "SIGTERM" : "SIGINT");
+      harness.resolveSmokeOutcome({ status: "success" });
+      await Promise.resolve();
+      expect(harness.startup.stop).toHaveBeenCalledTimes(1);
+      stopping.resolve();
+      await running;
+      expect(harness.processObject.exitCode).toBe(code);
+      expect(harness.startup.stop).toHaveBeenCalledTimes(1);
+      expect(harness.processObject.listenerCount("SIGINT")).toBe(0);
+      expect(harness.processObject.exit).not.toHaveBeenCalled();
+    },
+  );
+
+  test("signal cleanup failure overrides late smoke success", async () => {
+    const stopping = createDeferred();
+    const stopStarted = createDeferred();
+    const harness = createHarness({
+      env: smokeEnv,
+      startupStop: jest.fn(() => {
+        stopStarted.resolve();
+        return stopping.promise;
+      }),
+    });
+    const running = runHistoryConsumer(harness.dependencies);
+    await harness.smokeObservationStarted;
+    harness.processObject.emit("SIGTERM");
+    await stopStarted.promise;
+    harness.resolveSmokeOutcome({ status: "success" });
+    stopping.reject(new Error("mongodb://private/cleanup"));
+    await running;
+    expect(harness.processObject.exitCode).toBe(1);
+    expect(harness.startup.stop).toHaveBeenCalledTimes(1);
+    expect(harness.logger.error.mock.calls.flat().join(" ")).not.toContain("private");
+  });
+
+  test("terminal failure during signal cleanup overrides the signal and smoke success", async () => {
+    const stopping = createDeferred();
+    const stopStarted = createDeferred();
+    const harness = createHarness({
+      env: smokeEnv,
+      startupStop: jest.fn(() => {
+        stopStarted.resolve();
+        return stopping.promise;
+      }),
+    });
+    const running = runHistoryConsumer(harness.dependencies);
+    await harness.smokeObservationStarted;
+    harness.processObject.emit("SIGINT");
+    await stopStarted.promise;
+    harness.startupOptions().onFailure({
+      classification: "heartbeat-failed", topic: HISTORY_TOPIC, partition: 0, offset: "1",
+    });
+    harness.resolveSmokeOutcome({ status: "success" });
+    stopping.resolve();
+    await running;
+    expect(harness.processObject.exitCode).toBe(1);
+    expect(harness.startup.stop).toHaveBeenCalledTimes(1);
+  });
+
+  test("smoke success after signal shutdown cannot reset its exit code", async () => {
+    const harness = createHarness({ env: smokeEnv });
+    const running = runHistoryConsumer(harness.dependencies);
+    await harness.smokeObservationStarted;
+    harness.processObject.emit("SIGTERM");
+    await running;
+    expect(harness.processObject.exitCode).toBe(143);
+    harness.resolveSmokeOutcome({ status: "success" });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(harness.processObject.exitCode).toBe(143);
+    expect(harness.startup.stop).toHaveBeenCalledTimes(1);
+  });
+
+  test("a late smoke observation rejection after signal shutdown is observed", async () => {
+    const unhandled = [];
+    const onUnhandled = (reason) => unhandled.push(reason);
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      const harness = createHarness({ env: smokeEnv });
+      const running = runHistoryConsumer(harness.dependencies);
+      await harness.smokeObservationStarted;
+      harness.processObject.emit("SIGINT");
+      await running;
+      harness.rejectSmokeOutcome(new Error("mongodb://private/late"));
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(unhandled).toEqual([]);
+      expect(harness.processObject.exitCode).toBe(130);
+      expect(harness.startup.stop).toHaveBeenCalledTimes(1);
+    } finally {
+      process.removeListener("unhandledRejection", onUnhandled);
+    }
+  });
+
+  test("the real startup supervisor still blocks smoke before consumer construction", async () => {
+    let startup;
+    let startupError;
+    const harness = createHarness({
+      env: smokeEnv,
+      startupFactory: (options) => {
+        options.admin.listGroups = jest.fn();
+        options.admin.describeGroups = jest.fn();
+        options.admin.fetchOffsets = jest.fn();
+        startup = createHistoryConsumerStartup({
+          ...options,
+          verifyPreflights: jest.fn(async () => {}),
+          verifyHistorySmokeTopicIdentity: jest.fn(async () => ({
+            topic: HISTORY_TOPIC,
+            topicId: FIRST_RUN_SMOKE_EXPECTED_TOPIC_ID,
+            partitionCount: 6,
+            partitionIds: [0, 1, 2, 3, 4, 5],
+          })),
+          verifyHistorySmokeGroup: jest.fn(async () => ({
+            status: "absent", groupId: HISTORY_CONSUMER_GROUP_ID,
+          })),
+          executeHistorySmokeCommand: jest.fn(),
+          verifyOwnership: jest.fn(async () => ({
+            status: "verified",
+            databaseName: HISTORY_DATABASE_NAME,
+            collections: {
+              history: HISTORY_COLLECTION_NAMES.history,
+              receipts: HISTORY_COLLECTION_NAMES.receipts,
+            },
+            indexes: { historyTtl: "verified", receiptsTtl: "absent" },
+          })),
+        });
+        const start = startup.start;
+        startup.start = jest.fn(() => start().catch((error) => {
+          startupError = error;
+          throw error;
+        }));
+        startup.getSmokeOutcomeSnapshot = jest.fn(startup.getSmokeOutcomeSnapshot);
+        startup.waitForSmokeOutcome = jest.fn(startup.waitForSmokeOutcome);
+        return startup;
+      },
+    });
+    const application = await runHistoryConsumer(harness.dependencies);
+    expect(application).toBeNull();
+    expect(startupError.message).toBe(
+      "V2 history smoke execution is unavailable until bounded runner controls are installed.",
+    );
+    expect(harness.processObject.exitCode).toBe(1);
+    expect(harness.kafka.consumer).not.toHaveBeenCalled();
+    expect(harness.consumer.connect).not.toHaveBeenCalled();
+    expect(harness.consumer.subscribe).not.toHaveBeenCalled();
+    expect(startup.getSmokeOutcomeSnapshot).not.toHaveBeenCalled();
+    expect(startup.waitForSmokeOutcome).not.toHaveBeenCalled();
+  });
 });

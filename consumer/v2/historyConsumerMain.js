@@ -41,6 +41,40 @@ const SAFE_FAILURE_CLASSIFICATIONS = new Set([
 ]);
 const MAX_KAFKA_OFFSET = 9223372036854775807n;
 
+function hasExactKeys(value, expected) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const keys = Object.keys(value);
+  return keys.length === expected.length &&
+    expected.every((key) => Object.prototype.hasOwnProperty.call(value, key));
+}
+
+function isSmokeOutcome(result, allowPending) {
+  if (!result || typeof result !== "object") return false;
+  if (result.status === "pending") {
+    return allowPending && hasExactKeys(result, ["status"]);
+  }
+  if (result.status === "success" || result.status === "timeout") {
+    return hasExactKeys(result, ["status"]);
+  }
+  if (result.status === "failed") {
+    return hasExactKeys(result, ["status", "reason"]) &&
+      ["runner-failure", "invalid-runner-result", "supervision-failed"].includes(result.reason);
+  }
+  if (result.status !== "incomplete") return false;
+  if (result.reason === "cleanup-failed") {
+    return hasExactKeys(result, ["status", "reason", "cause"]) &&
+      ["cap-completed", "timeout", "failed", "incomplete"].includes(result.cause);
+  }
+  return hasExactKeys(result, ["status", "reason"]) &&
+    ["batch-incomplete", "shutdown", "startup-failed"].includes(result.reason);
+}
+
+function sameSmokeOutcome(first, second) {
+  return isSmokeOutcome(first, false) && isSmokeOutcome(second, false) &&
+    first.status === second.status && first.reason === second.reason &&
+    first.cause === second.cause;
+}
+
 function logError(logger, message) {
   try {
     if (logger && typeof logger.error === "function") logger.error(message);
@@ -178,7 +212,9 @@ function createHistoryConsumerApplication({
     heartbeatInterval: config.consumer.heartbeatIntervalMs,
     allowAutoTopicCreation: false,
   });
+  let terminalFailureObserved = false;
   const failureHandler = (failure) => {
+    terminalFailureObserved = true;
     const safeFailure = sanitizeFailure(failure, config.kafka.topic);
     if (onFailure) return onFailure(safeFailure);
     logTerminalFailure(logger, safeFailure);
@@ -248,15 +284,17 @@ function createHistoryConsumerApplication({
       shutdownPromise = (async () => {
         try {
           await stop();
-          if (typeof startup.getTerminalFailure === "function" &&
-              startup.getTerminalFailure()) {
+          if ((config.firstRunSmoke && terminalFailureObserved) ||
+              (typeof startup.getTerminalFailure === "function" &&
+                startup.getTerminalFailure())) {
             processObject.exitCode = 1;
           }
         } catch {
           logError(logger, "V2 history consumer shutdown failed.");
           processObject.exitCode = 1;
         } finally {
-          if (processObject.exitCode === undefined) {
+          if (processObject.exitCode === undefined ||
+              (config.firstRunSmoke && processObject.exitCode === 0)) {
             processObject.exitCode = receivedSignal === "SIGINT" ? 130 : 143;
           }
           remove();
@@ -312,11 +350,41 @@ function createHistoryConsumerApplication({
     return startup.waitForTerminalCleanup();
   }
 
+  function waitForSmokeOutcome() {
+    return Promise.resolve().then(() => {
+      if (!config.firstRunSmoke || config.firstRunSmoke.enabled !== true || !startPromise) {
+        throw new Error("V2 history smoke startup has not completed.");
+      }
+      return startPromise;
+    }).then(() => {
+      if (typeof startup.getSmokeOutcomeSnapshot !== "function" ||
+          typeof startup.waitForSmokeOutcome !== "function" ||
+          typeof startup.getTerminalFailure !== "function" ||
+          !isSmokeOutcome(startup.getSmokeOutcomeSnapshot(), true)) {
+        throw new Error("Invalid V2 history smoke supervisor.");
+      }
+      const signal = startup.waitForSmokeOutcome();
+      if (!signal || typeof signal.then !== "function") {
+        throw new Error("Invalid V2 history smoke outcome signal.");
+      }
+      return Promise.resolve(signal).then((outcome) => {
+        if (!sameSmokeOutcome(outcome, startup.getSmokeOutcomeSnapshot())) {
+          throw new Error("Invalid V2 history smoke outcome.");
+        }
+        return { status: outcome.status };
+      });
+    });
+  }
+
   return {
     config,
     start,
     stop,
     waitForTerminalCleanup,
+    waitForSmokeOutcome,
+    isShutdownRequested: () => shutdownRequested,
+    hasTerminalFailure: () => terminalFailureObserved ||
+      (typeof startup.getTerminalFailure === "function" && !!startup.getTerminalFailure()),
     installSignalHandlers,
   };
 }
@@ -367,15 +435,58 @@ async function runHistoryConsumer(options = {}) {
       return null;
     }
 
-    const terminalOutcome = await Promise.race([
+    const observations = [
       application.waitForTerminalCleanup().then(
         (result) => ({ type: "terminal", result }),
         () => ({ type: "supervision-failed" }),
       ),
       signals.waitForShutdown().then(() => ({ type: "signal" })),
-    ]);
+    ];
+    const smokeEnabled = application.config.firstRunSmoke &&
+      application.config.firstRunSmoke.enabled === true;
+    if (smokeEnabled) {
+      observations.push(application.waitForSmokeOutcome().then(
+        (result) => ({ type: "smoke", result }),
+        () => ({ type: "smoke-observation-failed" }),
+      ));
+    }
+    const terminalOutcome = await Promise.race(observations);
+    if (smokeEnabled && signals.signal) {
+      if (terminalOutcome.type === "terminal" ||
+          terminalOutcome.type === "supervision-failed") {
+        processObject.exitCode = 1;
+      }
+      await signals.waitForShutdown();
+      return application;
+    }
     if (terminalOutcome.type === "signal") {
       await signals.waitForShutdown();
+      return application;
+    }
+    if (terminalOutcome.type === "smoke-observation-failed") {
+      processObject.exitCode = 1;
+      logError(logger, "V2 history smoke outcome observation failed.");
+      try {
+        await application.stop();
+      } catch {
+        logError(logger, "V2 history consumer cleanup failed.");
+      }
+      signals.remove();
+      return application;
+    }
+    if (terminalOutcome.type === "smoke") {
+      if (terminalOutcome.result.status === "success" &&
+          !application.isShutdownRequested() && !application.hasTerminalFailure()) {
+        if (processObject.exitCode === undefined || processObject.exitCode === 0) {
+          processObject.exitCode = 0;
+        }
+      } else {
+        processObject.exitCode = 1;
+        logError(logger, terminalOutcome.result.status === "success"
+          ? "V2 history smoke success was rejected after shutdown or failure."
+          : `V2 history smoke outcome: status=${terminalOutcome.result.status}.`);
+      }
+      signals.remove();
       return application;
     }
     if (terminalOutcome.type === "supervision-failed") {
