@@ -10,6 +10,7 @@ const {
   loadHistoryConsumerConfig,
 } = require("../v2/historyConsumerConfig");
 const { HISTORY_COLLECTION_NAMES } = require("../v2/historyCollectionInspection");
+const { verifyHistorySmokeTopicIdentity } = require("../v2/historySmokeTopicPreflight");
 const {
   createHistoryConsumerStartup,
   createHistorySmokeSupervisor,
@@ -29,6 +30,7 @@ const smokeConfig = loadHistoryConsumerConfig({
   V2_HISTORY_TOPIC_ID: FIRST_RUN_SMOKE_EXPECTED_TOPIC_ID,
 });
 const smokeTopicResult = {
+  clusterId: HISTORY_KAFKA_CLUSTER_ID,
   topic: HISTORY_TOPIC,
   topicId: FIRST_RUN_SMOKE_EXPECTED_TOPIC_ID,
   partitionCount: 6,
@@ -62,7 +64,6 @@ function createShortShutdownConfig() {
 const topicMetadata = {
   topics: [{
     name: HISTORY_TOPIC,
-    topicId: FIRST_RUN_SMOKE_EXPECTED_TOPIC_ID,
     partitions: [0, 1, 2, 3, 4, 5].map((partitionId) => ({
       partitionId,
       leader: 1,
@@ -931,10 +932,10 @@ test("runs smoke preflights in order, rechecks the group twice, and blocks consu
     "mongo.connect",
     "kafka.describeCluster",
     "kafka.fetchTopicMetadata",
+    "smoke.topic.verify",
     "mongo.db:admin",
     "mongo.hello",
     "mongo.replSetGetStatus",
-    "smoke.topic.verify",
     "smoke.group.verify:1",
     "ownership.verify",
     "ownership.indexes.verify",
@@ -960,6 +961,39 @@ test("runs smoke preflights in order, rechecks the group twice, and blocks consu
   expect(harness.createRunner).not.toHaveBeenCalled();
   expect(harness.consumer.connect).not.toHaveBeenCalled();
   expect(harness.consumer.subscribe).not.toHaveBeenCalled();
+});
+
+test.each([
+  [HISTORY_KAFKA_CLUSTER_ID, "V2 history smoke execution is unavailable until bounded runner controls are installed."],
+  ["wrong-cluster", "V2 history startup failed during Kafka and MongoDB identity preflight."],
+])("combines KafkaJS metadata with real smoke topic verification for cluster %s", async (
+  clusterId,
+  expectedError,
+) => {
+  const stdout = [
+    `Topic: ${HISTORY_TOPIC} TopicId: ${FIRST_RUN_SMOKE_EXPECTED_TOPIC_ID} PartitionCount: 6 ReplicationFactor: 1 Configs:`,
+    ...[0, 1, 2, 3, 4, 5].map((partition) =>
+      `Topic: ${HISTORY_TOPIC} Partition: ${partition} Leader: 1 Replicas: 1 Isr: 1`),
+  ].join("\n");
+  const executeHistorySmokeCommand = jest.fn().mockResolvedValue({
+    clusterId, stdout, stderr: "", exitCode: 0,
+  });
+  const harness = createHarness({
+    startupConfig: smokeConfig,
+    verifyHistorySmokeTopicIdentity,
+    executeHistorySmokeCommand,
+  });
+
+  await expect(harness.startup.start()).rejects.toThrow(expectedError);
+  expect(executeHistorySmokeCommand).toHaveBeenCalledTimes(1);
+  expect(harness.createConsumer).not.toHaveBeenCalled();
+  expect(harness.consumer.subscribe).not.toHaveBeenCalled();
+  if (clusterId !== HISTORY_KAFKA_CLUSTER_ID) {
+    expect(harness.verifyHistorySmokeGroup).not.toHaveBeenCalled();
+    expect(harness.verifyOwnership).not.toHaveBeenCalled();
+  } else {
+    expect(harness.verifyHistorySmokeGroup).toHaveBeenCalledTimes(2);
+  }
 });
 
 test("fails closed when the smoke topic verifier is missing", () => {
@@ -996,7 +1030,7 @@ test("topic-ID mismatch prevents group checks, ownership, and consumer construct
   });
 
   await expect(harness.startup.start()).rejects.toThrow(
-    "V2 history startup failed during V2 history smoke topic-ID preflight.",
+    "V2 history startup failed during Kafka and MongoDB identity preflight.",
   );
   expect(harness.verifyHistorySmokeGroup).not.toHaveBeenCalled();
   expect(harness.verifyOwnership).not.toHaveBeenCalled();
@@ -1119,7 +1153,7 @@ test("smoke preflight cleanup is idempotent and does not expose verifier errors"
 
   const failure = await harness.startup.start().catch((error) => error);
   expect(failure.message)
-    .toBe("V2 history startup failed during V2 history smoke topic-ID preflight.");
+    .toBe("V2 history startup failed during Kafka and MongoDB identity preflight.");
   expect(failure.message).not.toContain("private");
 
   const firstStop = harness.startup.stop();

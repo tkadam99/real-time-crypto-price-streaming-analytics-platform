@@ -12,6 +12,7 @@ const {
 const { verifyHistoryConsumerPreflights } = require("./historyConsumerPreflight");
 const {
   verifyHistorySmokeTopicIdentity: defaultVerifyHistorySmokeTopicIdentity,
+  isHistorySmokeTopicIdentityResult,
 } = require("./historySmokeTopicPreflight");
 const {
   verifyHistorySmokeGroup: defaultVerifyHistorySmokeGroup,
@@ -184,22 +185,6 @@ function hasExactKeys(value, expectedKeys) {
   return keys.length === expectedKeys.length &&
     expectedKeys.every((key) => Object.prototype.hasOwnProperty.call(value, key)) &&
     keys.every((key) => expectedKeys.includes(key));
-}
-
-function isSmokeTopicIdentityResult(result, config) {
-  return hasExactKeys(result, [
-    "topic",
-    "topicId",
-    "partitionCount",
-    "partitionIds",
-  ]) &&
-    result.topic === HISTORY_TOPIC &&
-    result.topicId === config.kafka.expectedTopicId &&
-    result.partitionCount === HISTORY_PARTITION_IDS.length &&
-    Array.isArray(result.partitionIds) &&
-    result.partitionIds.length === HISTORY_PARTITION_IDS.length &&
-    result.partitionIds.every((partitionId, index) =>
-      partitionId === HISTORY_PARTITION_IDS[index]);
 }
 
 function isSmokeGroupResult(result) {
@@ -521,6 +506,7 @@ function createHistoryConsumerStartup({
   let terminalCleanupFailure = null;
   let terminalMonitorPromise;
   let smokeSupervisor;
+  let smokeTopicIdentityPromise;
   let resolveTerminalFailure;
   const terminalFailureSignal = new Promise((resolve) => {
     resolveTerminalFailure = resolve;
@@ -821,6 +807,19 @@ function createHistoryConsumerStartup({
     if (stopRequested) throw new Error("Startup cancelled.");
   }
 
+  function verifySmokeTopicIdentityOnce() {
+    if (!smokeTopicIdentityPromise) {
+      smokeTopicIdentityPromise = Promise.resolve().then(() => {
+        checkCancellation();
+        return verifyHistorySmokeTopicIdentity({
+          config,
+          executeCommand: executeHistorySmokeCommand,
+        });
+      });
+    }
+    return smokeTopicIdentityPromise;
+  }
+
   function start() {
     if (stopRequested) return Promise.reject(new Error("V2 history startup has been stopped."));
     if (startPromise) return startPromise;
@@ -849,7 +848,14 @@ function createHistoryConsumerStartup({
         stage = "Kafka and MongoDB identity preflight";
         await boundedCall(
           () => trackMongoAndKafkaStartupOperation(
-            () => verifyPreflights({ admin, mongoClient, config }),
+            () => verifyPreflights({
+              admin,
+              mongoClient,
+              config,
+              ...(config.firstRunSmoke
+                ? { verifySmokeTopicIdentity: verifySmokeTopicIdentityOnce }
+                : {}),
+            }),
           ),
           startupTimeoutMs,
           stage,
@@ -861,15 +867,12 @@ function createHistoryConsumerStartup({
           const topicResult = await boundedCall(
             () => trackMongoAndKafkaStartupOperation(() => {
               checkCancellation();
-              return verifyHistorySmokeTopicIdentity({
-                config,
-                executeCommand: executeHistorySmokeCommand,
-              });
+              return verifySmokeTopicIdentityOnce();
             }),
             startupTimeoutMs,
             stage,
           );
-          if (!isSmokeTopicIdentityResult(topicResult, config)) {
+          if (!isHistorySmokeTopicIdentityResult(topicResult, config)) {
             throw new Error("V2 history smoke topic-ID preflight returned an invalid result.");
           }
           checkCancellation();

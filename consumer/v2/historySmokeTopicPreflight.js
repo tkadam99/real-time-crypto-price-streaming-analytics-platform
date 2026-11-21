@@ -1,5 +1,6 @@
 const {
   FIRST_RUN_SMOKE_EXPECTED_TOPIC_ID,
+  HISTORY_KAFKA_CLUSTER_ID,
   HISTORY_TOPIC,
 } = require("./historyConsumerConfig");
 
@@ -24,6 +25,22 @@ const HISTORY_SMOKE_TOPIC_PREFLIGHT_TIMEOUT_MS = 15000;
 const HISTORY_SMOKE_TOPIC_PREFLIGHT_MAX_BUFFER = 65536;
 const TOPIC_ID_PATTERN = /^[A-Za-z0-9_-]{22}$/;
 const PARTITION_IDS = Object.freeze([0, 1, 2, 3, 4, 5]);
+
+function isHistorySmokeTopicIdentityResult(result, config) {
+  if (!result || typeof result !== "object" || Array.isArray(result)) return false;
+  const keys = ["clusterId", "topic", "topicId", "partitionCount", "partitionIds"];
+  return Object.keys(result).length === keys.length &&
+    keys.every((key) => Object.prototype.hasOwnProperty.call(result, key)) &&
+    config && config.kafka &&
+    result.clusterId === HISTORY_KAFKA_CLUSTER_ID &&
+    result.clusterId === config.kafka.clusterId &&
+    result.topic === HISTORY_TOPIC &&
+    result.topicId === config.kafka.expectedTopicId &&
+    result.partitionCount === PARTITION_IDS.length &&
+    Array.isArray(result.partitionIds) &&
+    result.partitionIds.length === PARTITION_IDS.length &&
+    result.partitionIds.every((partitionId, index) => partitionId === PARTITION_IDS[index]);
+}
 
 const SUMMARY_LINE_PATTERN =
   /^Topic:\s+(\S+)\s+TopicId:\s+(\S+)\s+PartitionCount:\s+(\d+)\s+ReplicationFactor:\s+(\d+)(?:\s+Configs:(?:\s+[A-Za-z0-9_.-]+=[A-Za-z0-9_.=,+-]+)?)?$/;
@@ -156,6 +173,7 @@ function validateSmokeConfiguration(config) {
       !config.firstRunSmoke ||
       config.firstRunSmoke.enabled !== true ||
       !config.kafka ||
+      config.kafka.clusterId !== HISTORY_KAFKA_CLUSTER_ID ||
       config.kafka.expectedTopicId !== FIRST_RUN_SMOKE_EXPECTED_TOPIC_ID) {
     throw new Error(
       "Invalid V2 history first-run smoke topic-ID preflight configuration.",
@@ -188,6 +206,7 @@ async function verifyHistorySmokeTopicIdentity({ config, executeCommand } = {}) 
   }
 
   if (!result || result.exitCode !== 0 ||
+      result.clusterId !== config.kafka.clusterId ||
       typeof result.stdout !== "string" ||
       result.stdout.length > HISTORY_SMOKE_TOPIC_PREFLIGHT_MAX_BUFFER ||
       typeof result.stderr !== "string" ||
@@ -204,6 +223,7 @@ async function verifyHistorySmokeTopicIdentity({ config, executeCommand } = {}) 
   }
 
   return Object.freeze({
+    clusterId: result.clusterId,
     topic: HISTORY_TOPIC,
     topicId: observed.topicId,
     partitionCount: PARTITION_IDS.length,
@@ -217,6 +237,7 @@ module.exports = {
   HISTORY_SMOKE_TOPIC_PREFLIGHT_MAX_BUFFER,
   HISTORY_SMOKE_TOPIC_PREFLIGHT_TIMEOUT_MS,
   isApprovedHistorySmokeTopicCommand,
+  isHistorySmokeTopicIdentityResult,
   parseHistorySmokeTopicMetadata,
   verifyHistorySmokeTopicIdentity,
 };

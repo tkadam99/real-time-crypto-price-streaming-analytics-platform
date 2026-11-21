@@ -8,6 +8,7 @@ const {
   HISTORY_REPLICA_SET_NAME,
   HISTORY_TOPIC,
 } = require("./historyConsumerConfig");
+const { isHistorySmokeTopicIdentityResult } = require("./historySmokeTopicPreflight");
 
 function validateConfig(config) {
   if (!config || config.enabled !== true ||
@@ -47,7 +48,7 @@ function validateKafkaAdmin(admin) {
   }
 }
 
-async function verifyHistoryKafkaIdentity({ admin, config }) {
+async function verifyHistoryKafkaIdentity({ admin, config, verifySmokeTopicIdentity }) {
   validateConfig(config);
   validateKafkaAdmin(admin);
 
@@ -77,13 +78,6 @@ async function verifyHistoryKafkaIdentity({ admin, config }) {
   }
 
   const topic = topics[0];
-  if (config.kafka.expectedTopicId !== null) {
-    if (typeof topic.topicId !== "string" ||
-        topic.topicId !== config.kafka.expectedTopicId) {
-      throw new Error("V2 history Kafka topic ID is missing or does not match the pinned ID.");
-    }
-  }
-
   const partitions = topic.partitions;
   const partitionIds = partitions.map((partition) =>
     partition && partition.partitionId);
@@ -96,6 +90,25 @@ async function verifyHistoryKafkaIdentity({ admin, config }) {
         !Number.isInteger(partition.leader) ||
         partition.leader < 0)) {
     throw new Error("V2 history Kafka topic must have six healthy partitions numbered 0 through 5.");
+  }
+
+  if (config.kafka.expectedTopicId !== null) {
+    if (topic.topicId === undefined &&
+        config.firstRunSmoke && config.firstRunSmoke.enabled === true &&
+        typeof verifySmokeTopicIdentity === "function") {
+      let smokeIdentity;
+      try {
+        smokeIdentity = await verifySmokeTopicIdentity();
+      } catch {
+        throw new Error("Unable to verify V2 history smoke Kafka topic identity.");
+      }
+      if (!isHistorySmokeTopicIdentityResult(smokeIdentity, config)) {
+        throw new Error("V2 history smoke Kafka topic identity is invalid.");
+      }
+    } else if (typeof topic.topicId !== "string" ||
+        topic.topicId !== config.kafka.expectedTopicId) {
+      throw new Error("V2 history Kafka topic ID is missing or does not match the pinned ID.");
+    }
   }
 
   return Object.freeze({
@@ -168,9 +181,10 @@ async function verifyHistoryConsumerPreflights({
   mongoClient,
   adminDatabase,
   config,
+  verifySmokeTopicIdentity,
 }) {
   validateConfig(config);
-  const kafka = await verifyHistoryKafkaIdentity({ admin, config });
+  const kafka = await verifyHistoryKafkaIdentity({ admin, config, verifySmokeTopicIdentity });
   const mongo = await verifyHistoryMongoIdentity({
     mongoClient,
     adminDatabase,

@@ -1,6 +1,7 @@
 const {
   FIRST_RUN_SMOKE_ACKNOWLEDGEMENT,
   FIRST_RUN_SMOKE_EXPECTED_TOPIC_ID,
+  HISTORY_KAFKA_CLUSTER_ID,
   LIVE_START_ACKNOWLEDGEMENT,
   loadHistoryConsumerConfig,
 } = require("../v2/historyConsumerConfig");
@@ -59,7 +60,7 @@ function createExecutor(result = {
   stderr: "",
   exitCode: 0,
 }) {
-  return jest.fn().mockResolvedValue(result);
+  return jest.fn().mockResolvedValue({ clusterId: HISTORY_KAFKA_CLUSTER_ID, ...result });
 }
 
 test("verifies the configured topic ID and six healthy Kafka 3.9.1 partitions using the fixed command", async () => {
@@ -69,6 +70,7 @@ test("verifies the configured topic ID and six healthy Kafka 3.9.1 partitions us
     config: smokeConfig,
     executeCommand,
   })).resolves.toEqual({
+    clusterId: HISTORY_KAFKA_CLUSTER_ID,
     topic: HISTORY_TOPIC,
     topicId: FIRST_RUN_SMOKE_EXPECTED_TOPIC_ID,
     partitionCount: 6,
@@ -102,6 +104,18 @@ test("verifies the configured topic ID and six healthy Kafka 3.9.1 partitions us
     },
   );
 });
+
+test.each([undefined, "different-cluster"])(
+  "rejects a missing or mismatched verified cluster ID: %s",
+  async (clusterId) => {
+    const executeCommand = createExecutor({
+      stdout: validOutput(), stderr: "", exitCode: 0, clusterId,
+    });
+    await expect(verifyHistorySmokeTopicIdentity({
+      config: smokeConfig, executeCommand,
+    })).rejects.toThrow("preflight command failed");
+  },
+);
 
 test("rejects a topic ID that differs from the configured expected identity", async () => {
   const executeCommand = createExecutor({

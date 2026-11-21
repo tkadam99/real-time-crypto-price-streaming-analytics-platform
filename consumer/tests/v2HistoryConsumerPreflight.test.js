@@ -1,4 +1,6 @@
 const {
+  FIRST_RUN_SMOKE_ACKNOWLEDGEMENT,
+  FIRST_RUN_SMOKE_EXPECTED_TOPIC_ID,
   HISTORY_KAFKA_CLUSTER_ID,
   HISTORY_TOPIC,
   LIVE_START_ACKNOWLEDGEMENT,
@@ -15,6 +17,22 @@ const config = loadHistoryConsumerConfig({
   V2_HISTORY_LIVE_START_ACK: LIVE_START_ACKNOWLEDGEMENT,
 });
 const topicId = "abcdefghijklmnopqrstuv";
+const smokeConfig = loadHistoryConsumerConfig({
+  V2_HISTORY_CONSUMER_ENABLED: "true",
+  V2_HISTORY_LIVE_START_ACK: LIVE_START_ACKNOWLEDGEMENT,
+  V2_HISTORY_FIRST_RUN_SMOKE_ENABLED: "true",
+  V2_HISTORY_FIRST_RUN_SMOKE_ACK: FIRST_RUN_SMOKE_ACKNOWLEDGEMENT,
+  V2_HISTORY_FIRST_RUN_SMOKE_MAX_RECORDS: "5",
+  V2_HISTORY_FIRST_RUN_SMOKE_MAX_RUNTIME_MS: "1000",
+  V2_HISTORY_TOPIC_ID: FIRST_RUN_SMOKE_EXPECTED_TOPIC_ID,
+});
+const smokeIdentity = {
+  clusterId: HISTORY_KAFKA_CLUSTER_ID,
+  topic: HISTORY_TOPIC,
+  topicId: FIRST_RUN_SMOKE_EXPECTED_TOPIC_ID,
+  partitionCount: 6,
+  partitionIds: [0, 1, 2, 3, 4, 5],
+};
 
 function topicMetadata({
   name = HISTORY_TOPIC,
@@ -281,6 +299,53 @@ test("verifies a topic ID only when an independently provided expected ID is ava
     admin: createKafkaAdmin({ metadata: topicMetadata({ topicId: "zyxwvutsrqponmlkjihgfe" }) }),
     config: pinnedConfig,
   })).rejects.toThrow("topic ID is missing or does not match");
+});
+
+test("verifies KafkaJS metadata without topic ID using the bound smoke identity verifier", async () => {
+  const verifySmokeTopicIdentity = jest.fn().mockResolvedValue(smokeIdentity);
+  await expect(verifyHistoryKafkaIdentity({
+    admin: createKafkaAdmin(),
+    config: smokeConfig,
+    verifySmokeTopicIdentity,
+  })).resolves.toMatchObject({ clusterId: HISTORY_KAFKA_CLUSTER_ID, topicIdVerified: true });
+  expect(verifySmokeTopicIdentity).toHaveBeenCalledTimes(1);
+});
+
+test.each([
+  null,
+  { ...smokeIdentity, clusterId: "different-cluster" },
+  { ...smokeIdentity, topicId: topicId },
+  { ...smokeIdentity, partitionIds: [0, 1, 2, 3, 4, 4] },
+])("rejects an invalid independently verified smoke identity", async (result) => {
+  await expect(verifyHistoryKafkaIdentity({
+    admin: createKafkaAdmin(),
+    config: smokeConfig,
+    verifySmokeTopicIdentity: jest.fn().mockResolvedValue(result),
+  })).rejects.toThrow("smoke Kafka topic identity is invalid");
+});
+
+test("fails closed if the smoke verifier is missing or fails", async () => {
+  await expect(verifyHistoryKafkaIdentity({
+    admin: createKafkaAdmin(), config: smokeConfig,
+  })).rejects.toThrow("topic ID is missing or does not match");
+  await expect(verifyHistoryKafkaIdentity({
+    admin: createKafkaAdmin(),
+    config: smokeConfig,
+    verifySmokeTopicIdentity: jest.fn().mockRejectedValue(new Error("private secret")),
+  })).rejects.toThrow("Unable to verify V2 history smoke Kafka topic identity.");
+});
+
+test("rejects mismatched Admin topic IDs and partition layouts without invoking the smoke verifier", async () => {
+  const verifySmokeTopicIdentity = jest.fn().mockResolvedValue(smokeIdentity);
+  for (const metadata of [
+    topicMetadata({ topicId: topicId }),
+    topicMetadata({ partitionOverrides: { 5: { partitionId: 4 } } }),
+  ]) {
+    await expect(verifyHistoryKafkaIdentity({
+      admin: createKafkaAdmin({ metadata }), config: smokeConfig, verifySmokeTopicIdentity,
+    })).rejects.toThrow();
+  }
+  expect(verifySmokeTopicIdentity).not.toHaveBeenCalled();
 });
 
 test.each([

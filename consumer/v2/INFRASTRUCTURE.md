@@ -90,11 +90,15 @@ start. It pins the Kafka broker, cluster, topic, group, MongoDB loopback URI,
 replica-set identity, the `crypto_analytics_v2` database, and the approved
 collection names above.
 
-The repository does not contain an independently established UUID for
-`crypto-prices-v2`. `V2_HISTORY_TOPIC_ID` is optional and is checked only when
-provided; without it, preflight still requires the pinned Kafka cluster and
-the exact six-partition topic metadata, but cannot detect replacement of the
-topic by another topic with the same name and layout. MongoDB integration
+For normal mode, `V2_HISTORY_TOPIC_ID` is optional; without it, preflight
+cannot detect replacement of a topic with the same name and layout. When an ID
+is provided in normal mode, preflight fails closed if KafkaJS cannot expose it.
+First-run smoke requires the configured pinned topic ID. Since KafkaJS 2.2.4
+does not expose it through `fetchTopicMetadata`, smoke verifies it using the
+restricted Docker topic command after checking that the Docker-side Kafka
+cluster ID matches the pinned ID also checked by the host Admin client.
+These checks are point-in-time and depend on the trusted Docker environment;
+the smoke execution block remains in place. MongoDB integration
 tests continue to use generated disposable databases; their collection data
 is separate from the approved production database.
 

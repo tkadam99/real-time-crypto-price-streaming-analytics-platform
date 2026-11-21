@@ -3,6 +3,7 @@ const {
   HISTORY_CONSUMER_GROUP_ID,
   HISTORY_DATABASE_NAME,
   HISTORY_KAFKA_BROKER,
+  HISTORY_KAFKA_CLUSTER_ID,
   HISTORY_MONGO_URI,
   HISTORY_TOPIC,
   LIVE_START_ACKNOWLEDGEMENT,
@@ -933,6 +934,7 @@ describe("smoke outcome entry-point supervision", () => {
           ...options,
           verifyPreflights: jest.fn(async () => {}),
           verifyHistorySmokeTopicIdentity: jest.fn(async () => ({
+            clusterId: HISTORY_KAFKA_CLUSTER_ID,
             topic: HISTORY_TOPIC,
             topicId: FIRST_RUN_SMOKE_EXPECTED_TOPIC_ID,
             partitionCount: 6,

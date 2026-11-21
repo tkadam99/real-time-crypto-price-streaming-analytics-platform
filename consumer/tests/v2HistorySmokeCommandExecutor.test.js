@@ -1,6 +1,7 @@
 const childProcess = require("child_process");
 const fs = require("fs");
 const path = require("path");
+const { HISTORY_KAFKA_CLUSTER_ID } = require("../v2/historyConsumerConfig");
 const {
   HISTORY_SMOKE_TOPIC_PREFLIGHT_ARGS,
   HISTORY_SMOKE_TOPIC_PREFLIGHT_COMMAND,
@@ -41,6 +42,17 @@ const expectedOptions = {
   timeout: HISTORY_SMOKE_TOPIC_PREFLIGHT_TIMEOUT_MS,
 };
 const topicStdout = "verified topic metadata";
+const clusterStdout = `Cluster ID: ${HISTORY_KAFKA_CLUSTER_ID}\n`;
+
+function commandKind(args) {
+  if (args[0] === "--context") return "daemon";
+  return args.includes("/opt/kafka/bin/kafka-cluster.sh") ? "cluster" : "topic";
+}
+
+function successfulOutput(args) {
+  const kind = commandKind(args);
+  return kind === "daemon" ? `${DAEMON_ID}\n` : kind === "cluster" ? clusterStdout : topicStdout;
+}
 
 let execFileSpy;
 let lstatSyncSpy;
@@ -78,7 +90,7 @@ beforeEach(() => {
 
   execFileSpy = jest.spyOn(childProcess, "execFile").mockImplementation(
     (_command, args, _options, callback) => {
-      callback(null, args[0] === "--context" ? `${DAEMON_ID}\n` : topicStdout, "");
+      callback(null, successfulOutput(args), "");
     },
   );
   lstatSyncSpy = jest.spyOn(fs, "lstatSync").mockReturnValue(regularExecutableStats());
@@ -98,17 +110,24 @@ test("uses the approved executable, daemon identity, context, and fixed topic co
     stdout: topicStdout,
     stderr: "",
     exitCode: 0,
+    clusterId: HISTORY_KAFKA_CLUSTER_ID,
   });
 
   expect(REPOSITORY_ROOT).toBe(path.resolve(__dirname, "..", ".."));
   expect(COMPOSE_FILE_PATH).toBe(path.join(REPOSITORY_ROOT, "docker-compose.v2.yml"));
   expect(lstatSyncSpy).toHaveBeenCalledWith(DOCKER_EXECUTABLE);
   expect(existsSyncSpy).toHaveBeenCalledWith(COMPOSE_FILE_PATH);
-  expect(execFileSpy).toHaveBeenCalledTimes(2);
+  expect(execFileSpy).toHaveBeenCalledTimes(3);
 
-  const [daemonCall, topicCall] = execFileSpy.mock.calls;
+  const [daemonCall, clusterCall, topicCall] = execFileSpy.mock.calls;
   expect(daemonCall[0]).toBe(DOCKER_EXECUTABLE);
   expect(daemonCall[1]).toEqual(DAEMON_ARGS);
+  expect(clusterCall[0]).toBe(DOCKER_EXECUTABLE);
+  expect(clusterCall[1]).toEqual([
+    "compose", "-p", "crypto-v2", "-f", "docker-compose.v2.yml",
+    "exec", "-T", "v2-kafka", "/opt/kafka/bin/kafka-cluster.sh",
+    "cluster-id", "--bootstrap-server", "v2-kafka:29092",
+  ]);
   expect(topicCall[0]).toBe(DOCKER_EXECUTABLE);
   expect(topicCall[1]).toEqual([
     "compose",
@@ -145,13 +164,36 @@ test("uses the approved executable, daemon identity, context, and fixed topic co
 test("verifies the daemon before issuing the topic-description command", async () => {
   const executionOrder = [];
   execFileSpy.mockImplementation((_command, args, _options, callback) => {
-    executionOrder.push(args[0] === "--context" ? "daemon" : "topic");
-    callback(null, args[0] === "--context" ? DAEMON_ID : topicStdout, "");
+    executionOrder.push(commandKind(args));
+    callback(null, successfulOutput(args), "");
   });
 
   await invoke();
 
-  expect(executionOrder).toEqual(["daemon", "topic"]);
+  expect(executionOrder).toEqual(["daemon", "cluster", "topic"]);
+});
+
+test.each(["", "Cluster ID: another-cluster\n", `${clusterStdout}extra\n`])(
+  "rejects invalid cluster identity before querying the topic: %j",
+  async (output) => {
+    execFileSpy.mockImplementation((_command, args, _options, callback) => {
+      callback(null, commandKind(args) === "cluster" ? output : successfulOutput(args), "");
+    });
+    await expect(invoke()).rejects.toThrow("Kafka cluster identity does not match");
+    expect(execFileSpy).toHaveBeenCalledTimes(2);
+  },
+);
+
+test("sanitizes cluster command failure and never queries the topic", async () => {
+  execFileSpy.mockImplementation((_command, args, _options, callback) => {
+    if (commandKind(args) === "cluster") {
+      callback(new Error("private cluster error"), "", "");
+    } else {
+      callback(null, successfulOutput(args), "");
+    }
+  });
+  await expect(invoke()).rejects.toThrow("V2 history smoke cluster identity command failed.");
+  expect(execFileSpy).toHaveBeenCalledTimes(2);
 });
 
 test("rejects a daemon identity mismatch without running the topic command", async () => {
@@ -260,30 +302,31 @@ test.each([
   ],
 ])("sanitizes %s", async (_label, error, message) => {
   execFileSpy.mockImplementation((_command, args, _options, callback) => {
+    const isTopic = commandKind(args) === "topic";
     callback(
-      args[0] === "--context" ? null : error,
-      args[0] === "--context" ? `${DAEMON_ID}\n` : "private output",
-      args[0] === "--context" ? "" : "password=secret",
+      isTopic ? error : null,
+      isTopic ? "private output" : successfulOutput(args),
+      isTopic ? "password=secret" : "",
     );
   });
 
   await expect(invoke()).rejects.toThrow(message);
-  expect(execFileSpy).toHaveBeenCalledTimes(2);
+  expect(execFileSpy).toHaveBeenCalledTimes(3);
 });
 
 test("rejects nonempty topic stderr without exposing it", async () => {
   execFileSpy.mockImplementation((_command, args, _options, callback) => {
     callback(
       null,
-      args[0] === "--context" ? `${DAEMON_ID}\n` : topicStdout,
-      args[0] === "--context" ? "" : "password=secret",
+      successfulOutput(args),
+      commandKind(args) === "topic" ? "password=secret" : "",
     );
   });
 
   await expect(invoke()).rejects.toThrow(
     "V2 history smoke topic command returned invalid output.",
   );
-  expect(execFileSpy).toHaveBeenCalledTimes(2);
+  expect(execFileSpy).toHaveBeenCalledTimes(3);
 });
 
 test("rejects nonempty daemon stderr without exposing it", async () => {

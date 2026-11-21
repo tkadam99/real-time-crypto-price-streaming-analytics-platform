@@ -1,6 +1,7 @@
 const childProcess = require("child_process");
 const fs = require("fs");
 const path = require("path");
+const { HISTORY_KAFKA_CLUSTER_ID } = require("./historyConsumerConfig");
 const {
   HISTORY_SMOKE_TOPIC_PREFLIGHT_ARGS,
   HISTORY_SMOKE_TOPIC_PREFLIGHT_COMMAND,
@@ -21,6 +22,20 @@ const DAEMON_ID_ARGS = Object.freeze([
   "info",
   "--format",
   "{{.ID}}",
+]);
+const CLUSTER_ID_ARGS = Object.freeze([
+  "compose",
+  "-p",
+  "crypto-v2",
+  "-f",
+  "docker-compose.v2.yml",
+  "exec",
+  "-T",
+  "v2-kafka",
+  "/opt/kafka/bin/kafka-cluster.sh",
+  "cluster-id",
+  "--bootstrap-server",
+  "v2-kafka:29092",
 ]);
 const EXECUTOR_OPTIONS = Object.freeze({
   encoding: "utf8",
@@ -120,7 +135,9 @@ function validateDockerExecutable() {
 function executionFailure(error, operation) {
   const action = operation === "daemon"
     ? "Docker daemon identity check"
-    : "V2 history smoke topic command";
+    : operation === "cluster"
+      ? "V2 history smoke cluster identity command"
+      : "V2 history smoke topic command";
   if (error && error.code === "ETIMEDOUT") {
     return new Error(`${action} timed out.`);
   }
@@ -150,9 +167,12 @@ function runDockerCommand(args, environment, operation) {
           if (typeof stdout !== "string" ||
               typeof stderr !== "string" ||
               stderr !== "") {
-            reject(new Error(`${operation === "daemon"
+            const action = operation === "daemon"
               ? "Docker daemon identity check"
-              : "V2 history smoke topic command"} returned invalid output.`));
+              : operation === "cluster"
+                ? "V2 history smoke cluster identity command"
+                : "V2 history smoke topic command";
+            reject(new Error(`${action} returned invalid output.`));
             return;
           }
           resolve({ stdout, stderr, exitCode: 0 });
@@ -198,13 +218,21 @@ async function executeHistorySmokeCommand(command, args, options) {
     throw new Error("Docker daemon identity does not match the approved host.");
   }
 
+  const clusterResult = await runDockerCommand(CLUSTER_ID_ARGS, environment, "cluster");
+  const expectedClusterLine = `Cluster ID: ${HISTORY_KAFKA_CLUSTER_ID}`;
+  if (![expectedClusterLine, `${expectedClusterLine}\n`, `${expectedClusterLine}\r\n`]
+    .includes(clusterResult.stdout)) {
+    throw new Error("V2 history smoke Kafka cluster identity does not match the pinned cluster.");
+  }
+
   // This is a point-in-time identity check; it cannot eliminate a daemon change
   // between the check and the subsequent Compose command.
-  return runDockerCommand(
+  const topicResult = await runDockerCommand(
     HISTORY_SMOKE_TOPIC_PREFLIGHT_ARGS,
     environment,
     "topic",
   );
+  return { ...topicResult, clusterId: HISTORY_KAFKA_CLUSTER_ID };
 }
 
 module.exports = {
