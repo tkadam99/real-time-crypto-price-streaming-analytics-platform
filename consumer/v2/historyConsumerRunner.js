@@ -293,6 +293,13 @@ function createHistoryConsumerRunner({
   const smokeMaxRuntimeMs = settings.firstRunSmoke
     ? settings.firstRunSmoke.maxRuntimeMs
     : null;
+  if (admissionController &&
+      (typeof consumer.on !== "function" || !consumer.events ||
+        typeof consumer.events.STOP !== "string" ||
+        typeof consumer.events.CRASH !== "string" ||
+        consumer.events.STOP === consumer.events.CRASH)) {
+    throw new Error("Kafka history smoke lifecycle events are required.");
+  }
 
   let startPromise;
   let stopPromise;
@@ -307,11 +314,27 @@ function createHistoryConsumerRunner({
   let smokeStoppedElapsedMs = null;
   let deadlineExpired = false;
   let deadlineTimer = null;
+  let admittedBatchesInFlight = 0;
+  let smokeCompletion = admissionController
+    ? Object.freeze({ status: "pending" })
+    : null;
+  let resolveSmokeCompletion;
+  const smokeCompletionSignal = admissionController
+    ? new Promise((resolve) => { resolveSmokeCompletion = resolve; })
+    : Promise.resolve(null);
+  const smokeListenerRemovers = [];
+  let smokeListenerCleanupFailed = false;
   let resolveTerminalFailure;
   const terminalFailureSignal = new Promise((resolve) => {
     resolveTerminalFailure = resolve;
   });
   const inFlight = new Set();
+
+  function finishSmokeCompletion(result) {
+    if (!smokeCompletion || smokeCompletion.status !== "pending") return;
+    smokeCompletion = Object.freeze(result);
+    resolveSmokeCompletion(smokeCompletion);
+  }
 
   function clearDeadlineTimer() {
     if (deadlineTimer !== null) {
@@ -330,6 +353,7 @@ function createHistoryConsumerRunner({
       clearDeadlineTimer();
       admissionController.close(CLOSE_REASONS.DEADLINE);
       cancellationController.abort();
+      finishSmokeCompletion({ status: "timeout" });
     }
     return deadlineExpired;
   }
@@ -347,6 +371,46 @@ function createHistoryConsumerRunner({
     checkDeadline();
     smokeStoppedElapsedMs = Math.max(0, performance.now() - smokeStartedAt);
     clearDeadlineTimer();
+  }
+
+  function maybeCompleteSmoke() {
+    if (!admissionController || smokeCompletion.status !== "pending" ||
+        admittedBatchesInFlight !== 0 ||
+        admissionController.snapshot().closeReason !== CLOSE_REASONS.LIMIT_REACHED ||
+        stopRequested || terminalFailure || cancellationController.signal.aborted) {
+      return;
+    }
+    if (checkDeadline()) return;
+    stopDeadline();
+    if (!deadlineExpired) finishSmokeCompletion({ status: "cap-completed" });
+  }
+
+  function removeSmokeListeners() {
+    let failed = false;
+    while (smokeListenerRemovers.length > 0) {
+      const remove = smokeListenerRemovers.pop();
+      try {
+        remove();
+      } catch {
+        failed = true;
+      }
+    }
+    if (failed) smokeListenerCleanupFailed = true;
+    return !failed;
+  }
+
+  function installSmokeListeners() {
+    for (const event of [consumer.events.STOP, consumer.events.CRASH]) {
+      const remove = consumer.on(event, () => {
+        if (!stopRequested) {
+          reportTerminalFailure(createFailure("kafka-consumer-run-failed"));
+        }
+      });
+      if (typeof remove !== "function") {
+        throw new Error("Invalid Kafka history smoke lifecycle listener.");
+      }
+      smokeListenerRemovers.push(remove);
+    }
   }
 
   function reportTerminalFailure(failure) {
@@ -370,6 +434,7 @@ function createHistoryConsumerRunner({
         : {}),
     });
     cancellationController.abort();
+    finishSmokeCompletion({ status: "failed", failure: terminalFailure });
     resolveTerminalFailure(terminalFailure);
 
     try {
@@ -400,7 +465,19 @@ function createHistoryConsumerRunner({
     }
   }
 
-  async function handleBatch(batchContext) {
+  function reportCoreFailure(failure, partition) {
+    reportTerminalFailure({
+      classification: failure.classification,
+      topic: V2_TOPIC,
+      partition,
+      offset: typeof failure.offset === "string" ? failure.offset : null,
+      ...(failure.errorName
+        ? { errorName: SAFE_ERROR_NAMES.has(failure.errorName) ? failure.errorName : "Error" }
+        : {}),
+    });
+  }
+
+  async function handleBatch(batchContext, smokeBatch) {
     const batch = batchContext && batchContext.batch;
     const partition = batch && batch.partition;
     const firstOffset = batch && batch.messages && batch.messages[0]
@@ -437,6 +514,8 @@ function createHistoryConsumerRunner({
     if (admissionController) {
       const reservation = admissionController.reserve(partition, messages.length);
       if (reservation.admittedRecords === 0) return;
+      smokeBatch.admitted = true;
+      admittedBatchesInFlight += 1;
       messages = messages.slice(0, reservation.admittedRecords);
     }
 
@@ -501,8 +580,10 @@ function createHistoryConsumerRunner({
     }
 
     if (coreResult.nextOffset !== null) {
-      if (!assignmentIsCurrent(batchContext)) return;
-      if (!assignmentIsCurrent(batchContext)) return;
+      if (!assignmentIsCurrent(batchContext) || !assignmentIsCurrent(batchContext)) {
+        if (smokeBatch && coreResult.failure) reportCoreFailure(coreResult.failure, partition);
+        return;
+      }
       if (checkDeadline()) return;
 
       try {
@@ -512,6 +593,7 @@ function createHistoryConsumerRunner({
           offset: coreResult.nextOffset,
         }]);
       } catch (error) {
+        checkDeadline();
         reportTerminalFailure(
           createFailure(
             "offset-commit-failed",
@@ -522,34 +604,46 @@ function createHistoryConsumerRunner({
         );
         return;
       }
+      if (smokeBatch && !assignmentIsCurrent(batchContext)) {
+        if (coreResult.failure) reportCoreFailure(coreResult.failure, partition);
+        return;
+      }
     }
 
     if (coreResult.failure) {
-      reportTerminalFailure({
-        classification: coreResult.failure.classification,
-        topic: V2_TOPIC,
-        partition,
-        offset: typeof coreResult.failure.offset === "string"
-          ? coreResult.failure.offset
-          : null,
-        ...(coreResult.failure.errorName
-          ? {
-            errorName: SAFE_ERROR_NAMES.has(coreResult.failure.errorName)
-              ? coreResult.failure.errorName
-              : "Error",
-          }
-          : {}),
-      });
+      reportCoreFailure(coreResult.failure, partition);
+      return;
     }
+    if (smokeBatch && coreResult.nextOffset !== null) smokeBatch.succeeded = true;
   }
 
   async function eachBatch(batchContext) {
-    const processing = handleBatch(batchContext);
-    inFlight.add(processing);
+    const smokeBatch = admissionController
+      ? { admitted: false, succeeded: false }
+      : null;
+    let resolveTracked;
+    const tracked = new Promise((resolve) => { resolveTracked = resolve; });
+    inFlight.add(tracked);
+    const processing = handleBatch(batchContext, smokeBatch);
     try {
       await processing;
+    } catch (error) {
+      if (smokeBatch && !terminalFailure && !stopRequested && !deadlineExpired) {
+        reportTerminalFailure(createFailure("history-processing-failed", null, null, error));
+      }
+      throw error;
     } finally {
-      inFlight.delete(processing);
+      inFlight.delete(tracked);
+      resolveTracked();
+      if (smokeBatch && smokeBatch.admitted) {
+        admittedBatchesInFlight -= 1;
+        checkDeadline();
+        if (!smokeBatch.succeeded && smokeCompletion.status === "pending") {
+          cancellationController.abort();
+          finishSmokeCompletion({ status: "incomplete", reason: "batch-incomplete" });
+        }
+        maybeCompleteSmoke();
+      }
     }
   }
 
@@ -562,23 +656,34 @@ function createHistoryConsumerRunner({
       try {
         await consumer.subscribe({ topic: V2_TOPIC, fromBeginning: true });
       } catch {
+        finishSmokeCompletion({ status: "incomplete", reason: "startup-failed" });
         throw new Error("Unable to subscribe the V2 history consumer.");
       }
       if (stopRequested) return;
 
+      if (admissionController) {
+        try {
+          installSmokeListeners();
+        } catch {
+          removeSmokeListeners();
+          finishSmokeCompletion({ status: "incomplete", reason: "startup-failed" });
+          throw new Error("Unable to observe V2 history smoke consumer lifecycle.");
+        }
+      }
       runStarted = true;
       if (admissionController) {
         smokeStartedAt = performance.now();
         scheduleDeadline();
       }
       try {
+        // KafkaJS resolves run() after startup; STOP and CRASH report termination.
         runPromise = Promise.resolve(consumer.run({
           autoCommit: false,
           eachBatchAutoResolve: false,
           partitionsConsumedConcurrently: settings.partitionsConsumedConcurrently,
           eachBatch,
         })).then(
-          () => undefined,
+          () => {},
           () => {
             if (!stopRequested) {
               reportTerminalFailure(createFailure("kafka-consumer-run-failed"));
@@ -587,6 +692,10 @@ function createHistoryConsumerRunner({
         );
       } catch {
         stopDeadline();
+        removeSmokeListeners();
+        if (admissionController) {
+          reportTerminalFailure(createFailure("kafka-consumer-run-failed"));
+        }
         runStarted = false;
         throw new Error("Unable to start the V2 history consumer.");
       }
@@ -598,6 +707,7 @@ function createHistoryConsumerRunner({
     if (stopPromise) return stopPromise;
     stopDeadline();
     stopRequested = true;
+    finishSmokeCompletion({ status: "incomplete", reason: "shutdown" });
     if (admissionController) admissionController.close(CLOSE_REASONS.SHUTDOWN);
     cancellationController.abort();
     stopPromise = (async () => {
@@ -637,6 +747,8 @@ function createHistoryConsumerRunner({
           failures.push("history consumer run");
         }
       }
+      removeSmokeListeners();
+      if (smokeListenerCleanupFailed) failures.push("history consumer lifecycle listeners");
       if (terminalPauseFailed) failures.push("terminal failure pause");
       if (failureHandlerFailed) failures.push("history consumer failure handler");
       if (failures.length > 0) {
@@ -665,6 +777,13 @@ function createHistoryConsumerRunner({
         deadlineExpired,
       })
       : null,
+    // Frozen snapshots: {status:"pending"}, {status:"cap-completed"},
+    // {status:"timeout"}, {status:"failed", failure}, or
+    // {status:"incomplete", reason}. The wait resolves once with a final
+    // snapshot (or null in normal mode); it does not guarantee cleanup/drain.
+    // Timeout, failure and shutdown can be signaled while work is still settling.
+    getSmokeCompletionSnapshot: () => smokeCompletion,
+    waitForSmokeCompletion: () => smokeCompletionSignal,
   };
 }
 

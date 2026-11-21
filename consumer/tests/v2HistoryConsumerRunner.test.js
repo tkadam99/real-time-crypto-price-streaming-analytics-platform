@@ -88,17 +88,33 @@ function createHarness({
   config = {},
   commitOffsets = jest.fn().mockResolvedValue(),
   onFailure = jest.fn().mockResolvedValue(),
+  deferRun = false,
 } = {}) {
   let runOptions;
+  let fulfillRun;
+  let rejectRun;
+  const smokeRun = new Promise((resolve, reject) => {
+    fulfillRun = resolve;
+    rejectRun = reject;
+  });
+  const listeners = new Map();
   const consumer = {
     subscribe: jest.fn().mockResolvedValue(),
     run: jest.fn((options) => {
       runOptions = options;
-      return Promise.resolve();
+      return deferRun ? smokeRun : Promise.resolve();
     }),
     commitOffsets,
     pause: jest.fn(),
-    stop: jest.fn().mockResolvedValue(),
+    stop: jest.fn(() => {
+      fulfillRun();
+      return Promise.resolve();
+    }),
+    events: { STOP: "consumer.stop", CRASH: "consumer.crash" },
+    on: jest.fn((event, listener) => {
+      listeners.set(event, listener);
+      return jest.fn(() => listeners.delete(event));
+    }),
   };
   const runner = createHistoryConsumerRunner({
     consumer,
@@ -116,6 +132,12 @@ function createHarness({
     onFailure,
     persistBatch,
     getRunOptions: () => runOptions,
+    fulfillRun,
+    rejectRun,
+    emitConsumerEvent: (event, payload) => {
+      const listener = listeners.get(event);
+      if (listener) listener(payload);
+    },
   };
 }
 
@@ -518,6 +540,499 @@ describe("dependency-injected V2 history consumer runner", () => {
       });
       expect(JSON.stringify(harness.onFailure.mock.calls)).not.toContain("private");
       await harness.runner.stop();
+    });
+  });
+
+  describe("smoke completion signaling", () => {
+    beforeEach(() => {
+      jest.useFakeTimers();
+    });
+
+    afterEach(() => {
+      jest.useRealTimers();
+    });
+
+    test("normal mode has no smoke completion", async () => {
+      const harness = createHarness();
+      expect(harness.runner.getSmokeCompletionSnapshot()).toBeNull();
+      await expect(harness.runner.waitForSmokeCompletion()).resolves.toBeNull();
+      await harness.runner.start();
+      expect(harness.consumer.on).not.toHaveBeenCalled();
+      await harness.runner.stop();
+    });
+
+    test("waits for all admitted batches and their exact commits, including partial admission", async () => {
+      const writes = [];
+      const commits = [];
+      let notifyBothCommits;
+      const bothCommitsStarted = new Promise((resolve) => { notifyBothCommits = resolve; });
+      let harness;
+      const persistBatch = jest.fn((events) => {
+        expect(harness.runner.getSmokeCompletionSnapshot()).toEqual({ status: "pending" });
+        return new Promise((resolve) => writes.push({ events, resolve }));
+      });
+      const commitOffsets = jest.fn((offsets) => new Promise((resolve) => {
+        commits.push({ offsets, resolve });
+        if (commits.length === 2) notifyBothCommits();
+      }));
+      harness = createHarness({
+        config: { firstRunSmoke: smokeSettings(3), partitionsConsumedConcurrently: 2 },
+        persistBatch,
+        commitOffsets,
+      });
+      const wait = harness.runner.waitForSmokeCompletion();
+      expect(harness.runner.waitForSmokeCompletion()).toBe(wait);
+      await harness.runner.start();
+      await harness.consumer.run.mock.results[0].value;
+      expect(harness.runner.getTerminalFailure()).toBeNull();
+      const first = harness.getRunOptions().eachBatch(batchContext({
+        partition: 0,
+        offsets: ["10", "11"],
+      }));
+      const second = harness.getRunOptions().eachBatch(batchContext({
+        partition: 1,
+        offsets: ["30", "31"],
+        events: [envelope("1000", "ETH-USD"), envelope("1001", "ETH-USD")],
+      }));
+      await harness.getRunOptions().eachBatch(batchContext({ partition: 2, offsets: ["80"] }));
+      expect(writes).toHaveLength(2);
+      expect(writes[1].events).toHaveLength(1);
+      expect(harness.runner.getSmokeCompletionSnapshot()).toEqual({ status: "pending" });
+      expect(commitOffsets).not.toHaveBeenCalled();
+
+      writes[0].resolve(persistenceResult(writes[0].events));
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(harness.runner.getSmokeCompletionSnapshot()).toEqual({ status: "pending" });
+      writes[1].resolve(persistenceResult(writes[1].events));
+      await bothCommitsStarted;
+      expect(commits.map(({ offsets }) => offsets)).toEqual([
+        [{ topic: V2_TOPIC, partition: 0, offset: "12" }],
+        [{ topic: V2_TOPIC, partition: 1, offset: "31" }],
+      ]);
+      expect(harness.runner.getSmokeCompletionSnapshot()).toEqual({ status: "pending" });
+      commits[0].resolve();
+      await first;
+      expect(harness.runner.getSmokeCompletionSnapshot()).toEqual({ status: "pending" });
+      commits[1].resolve();
+      await second;
+      const completion = await wait;
+      expect(completion).toEqual({ status: "cap-completed" });
+      expect(Object.isFrozen(completion)).toBe(true);
+      expect(harness.runner.getSmokeCompletionSnapshot()).toBe(completion);
+      expect(harness.consumer.stop).not.toHaveBeenCalled();
+      await harness.runner.stop();
+      expect(harness.runner.getSmokeCompletionSnapshot()).toBe(completion);
+      expect(jest.getTimerCount()).toBe(0);
+    });
+
+    test.each(["malformed", "persistence"])(
+      "%s admitted record produces failure after committing only the safe prefix",
+      async (kind) => {
+        const persistBatch = jest.fn(async (events) =>
+          persistenceResult(events, kind === "persistence" ? ["inserted", "failed"] : []));
+        const harness = createHarness({
+          config: { firstRunSmoke: smokeSettings(2) },
+          persistBatch,
+        });
+        await harness.runner.start();
+        await harness.getRunOptions().eachBatch(batchContext({
+          offsets: ["10", "11"],
+          ...(kind === "malformed" ? {
+            values: [Buffer.from(JSON.stringify(envelope())), Buffer.from("{private")],
+          } : {}),
+        }));
+        const outcome = await harness.runner.waitForSmokeCompletion();
+        expect(outcome).toMatchObject({
+          status: "failed",
+          failure: { classification: kind === "malformed" ? "malformed-json" : "persistence-failed" },
+        });
+        expect(Object.isFrozen(outcome)).toBe(true);
+        expect(Object.isFrozen(outcome.failure)).toBe(true);
+        expect(JSON.stringify(outcome)).not.toContain("private");
+        expect(harness.consumer.commitOffsets).toHaveBeenCalledWith([{
+          topic: V2_TOPIC, partition: 0, offset: "11",
+        }]);
+        await harness.runner.stop();
+      },
+    );
+
+    test.each([
+      ["stale", { isStale: jest.fn(() => true) }],
+      ["not running", { isRunning: jest.fn(() => false) }],
+    ])("%s assignment yields incomplete rather than successful completion", async (_label, checks) => {
+      const harness = createHarness({ config: { firstRunSmoke: smokeSettings(1) } });
+      await harness.runner.start();
+      await harness.getRunOptions().eachBatch(batchContext({ offsets: ["20"], ...checks }));
+      await expect(harness.runner.waitForSmokeCompletion()).resolves.toEqual({
+        status: "incomplete", reason: "batch-incomplete",
+      });
+      expect(harness.consumer.commitOffsets).not.toHaveBeenCalled();
+      await harness.runner.stop();
+    });
+
+    test("assignment becoming stale during an issued commit prevents cap completion", async () => {
+      let settleCommit;
+      let notifyCommit;
+      const commitStarted = new Promise((resolve) => { notifyCommit = resolve; });
+      const harness = createHarness({
+        config: { firstRunSmoke: smokeSettings(1) },
+        commitOffsets: jest.fn(() => {
+          notifyCommit();
+          return new Promise((resolve) => { settleCommit = resolve; });
+        }),
+      });
+      let stale = false;
+      await harness.runner.start();
+      const processing = harness.getRunOptions().eachBatch(batchContext({
+        offsets: ["20"], isStale: () => stale,
+      }));
+      await commitStarted;
+      stale = true;
+      settleCommit();
+      await processing;
+      await expect(harness.runner.waitForSmokeCompletion()).resolves.toEqual({
+        status: "incomplete", reason: "batch-incomplete",
+      });
+      await harness.runner.stop();
+    });
+
+    test("a failed prefix remains a failure when staleness suppresses its commit", async () => {
+      const harness = createHarness({ config: { firstRunSmoke: smokeSettings(2) } });
+      await harness.runner.start();
+      await harness.getRunOptions().eachBatch(batchContext({
+        offsets: ["20", "21"],
+        values: [Buffer.from(JSON.stringify(envelope())), Buffer.from("{private")],
+        isStale: () => true,
+      }));
+      await expect(harness.runner.waitForSmokeCompletion()).resolves.toMatchObject({
+        status: "failed", failure: { classification: "malformed-json" },
+      });
+      expect(harness.consumer.commitOffsets).not.toHaveBeenCalled();
+      await harness.runner.stop();
+    });
+
+    test("commit rejection is a sanitized failure, not cap completion", async () => {
+      const harness = createHarness({
+        config: { firstRunSmoke: smokeSettings(1) },
+        commitOffsets: jest.fn().mockRejectedValue(new Error("private commit")),
+      });
+      await harness.runner.start();
+      await harness.getRunOptions().eachBatch(batchContext({ offsets: ["30"] }));
+      const completion = await harness.runner.waitForSmokeCompletion();
+      expect(completion).toMatchObject({
+        status: "failed", failure: { classification: "offset-commit-failed", offset: "31" },
+      });
+      expect(JSON.stringify(completion)).not.toContain("private");
+      await harness.runner.stop();
+    });
+
+    test("deadline resolves timeout while persistence remains pending; late settlement cannot change it", async () => {
+      let finish;
+      const processBatch = jest.fn(() => new Promise((resolve) => { finish = resolve; }));
+      const harness = createHarness({
+        config: { firstRunSmoke: smokeSettings(1) },
+        processBatch,
+      });
+      await harness.runner.start();
+      const processing = harness.getRunOptions().eachBatch(batchContext({ offsets: ["40"] }));
+      expect(harness.runner.getAdmissionSnapshot().closeReason).toBe("limit-reached");
+      expect(harness.runner.getSmokeCompletionSnapshot().status).toBe("pending");
+      await jest.advanceTimersByTimeAsync(1000);
+      const outcome = await harness.runner.waitForSmokeCompletion();
+      expect(outcome).toEqual({ status: "timeout" });
+      expect(Object.isFrozen(outcome)).toBe(true);
+      finish({
+        topic: V2_TOPIC,
+        partition: 0,
+        committablePrefix: [{ offset: "40", status: "inserted" }],
+        committableCount: 1,
+        nextOffset: "41",
+        failure: null,
+      });
+      await processing;
+      expect(harness.runner.getSmokeCompletionSnapshot()).toBe(outcome);
+      expect(harness.consumer.commitOffsets).not.toHaveBeenCalled();
+      await harness.runner.stop();
+    });
+
+    test.each(["fulfilled", "rejected"])(
+      "issued commit settles %s after timeout without changing the timeout signal",
+      async (outcome) => {
+        let settle;
+        let notifyCommit;
+        const commitStarted = new Promise((resolve) => { notifyCommit = resolve; });
+        const commitOffsets = jest.fn(() => {
+          notifyCommit();
+          return new Promise((resolve, reject) => {
+            settle = outcome === "fulfilled" ? resolve : () => reject(new Error("private"));
+          });
+        });
+        const harness = createHarness({ config: { firstRunSmoke: smokeSettings(1) }, commitOffsets });
+        await harness.runner.start();
+        const processing = harness.getRunOptions().eachBatch(batchContext({ offsets: ["50"] }));
+        await commitStarted;
+        await jest.advanceTimersByTimeAsync(1000);
+        const completion = await harness.runner.waitForSmokeCompletion();
+        expect(completion).toEqual({ status: "timeout" });
+        settle();
+        await processing;
+        expect(harness.runner.getSmokeCompletionSnapshot()).toBe(completion);
+        expect(commitOffsets).toHaveBeenCalledTimes(1);
+        if (outcome === "rejected") {
+          expect(harness.runner.getTerminalFailure().classification).toBe("offset-commit-failed");
+        }
+        await harness.runner.stop();
+      },
+    );
+
+    test("heartbeat failure is signaled before pending work settles and takes precedence over the cap", async () => {
+      let finish;
+      const harness = createHarness({
+        config: { firstRunSmoke: smokeSettings(1), heartbeatIntervalMs: 100 },
+        processBatch: jest.fn(() => new Promise((resolve) => { finish = resolve; })),
+      });
+      await harness.runner.start();
+      const processing = harness.getRunOptions().eachBatch(batchContext({
+        offsets: ["60"],
+        heartbeat: jest.fn().mockRejectedValue(new Error("private broker")),
+      }));
+      await jest.advanceTimersByTimeAsync(100);
+      const completion = await harness.runner.waitForSmokeCompletion();
+      expect(completion).toMatchObject({
+        status: "failed", failure: { classification: "heartbeat-failed" },
+      });
+      finish({ cancelled: true });
+      await processing;
+      expect(harness.runner.getSmokeCompletionSnapshot()).toBe(completion);
+      expect(JSON.stringify(completion)).not.toContain("private");
+      await harness.runner.stop();
+    });
+
+    test("explicit shutdown before the cap signals incomplete without waiting for additional batches", async () => {
+      const harness = createHarness({ config: { firstRunSmoke: smokeSettings(3) } });
+      await harness.runner.start();
+      await harness.getRunOptions().eachBatch(batchContext({ offsets: ["70"] }));
+      const stop = harness.runner.stop();
+      const result = await harness.runner.waitForSmokeCompletion();
+      expect(result).toEqual({ status: "incomplete", reason: "shutdown" });
+      await stop;
+      expect(harness.runner.getSmokeCompletionSnapshot()).toBe(result);
+    });
+
+    test("reentrant shutdown tracks and drains the already admitted batch", async () => {
+      let finish;
+      let stop;
+      let harness;
+      harness = createHarness({
+        config: { firstRunSmoke: smokeSettings(1) },
+        processBatch: jest.fn(() => {
+          stop = harness.runner.stop();
+          return new Promise((resolve) => { finish = resolve; });
+        }),
+      });
+      await harness.runner.start();
+      const processing = harness.getRunOptions().eachBatch(batchContext({ offsets: ["70"] }));
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(harness.consumer.stop).not.toHaveBeenCalled();
+      expect(await harness.runner.waitForSmokeCompletion()).toEqual({
+        status: "incomplete", reason: "shutdown",
+      });
+      finish({ cancelled: true });
+      await processing;
+      await stop;
+      expect(harness.consumer.stop).toHaveBeenCalledTimes(1);
+    });
+
+    test.each(["STOP", "CRASH"])(
+      "unexpected KafkaJS %s event signals failure before cap completion",
+      async (event) => {
+        let finish;
+        const harness = createHarness({
+          config: { firstRunSmoke: smokeSettings(1) },
+          processBatch: jest.fn(() => new Promise((resolve) => { finish = resolve; })),
+        });
+        await harness.runner.start();
+        const processing = harness.getRunOptions().eachBatch(batchContext({ offsets: ["80"] }));
+        harness.emitConsumerEvent(harness.consumer.events[event], { error: "private broker" });
+        const result = await harness.runner.waitForSmokeCompletion();
+        expect(result).toMatchObject({
+          status: "failed", failure: { classification: "kafka-consumer-run-failed" },
+        });
+        finish({ cancelled: true });
+        await processing;
+        expect(harness.runner.getSmokeCompletionSnapshot()).toBe(result);
+        expect(JSON.stringify(result)).not.toContain("private");
+        await harness.runner.stop();
+      },
+    );
+
+    test("a rejected consumer.run signals failure without reporting cap success", async () => {
+      const harness = createHarness({
+        config: { firstRunSmoke: smokeSettings(1) },
+        deferRun: true,
+      });
+      await harness.runner.start();
+      harness.rejectRun(new Error("private broker"));
+      const result = await harness.runner.waitForSmokeCompletion();
+      expect(result).toMatchObject({
+        status: "failed", failure: { classification: "kafka-consumer-run-failed" },
+      });
+      expect(JSON.stringify(result)).not.toContain("private");
+      await harness.runner.stop();
+    });
+
+    test("cap completes while run is pending and remains completed through deadline and stop", async () => {
+      const harness = createHarness({
+        config: { firstRunSmoke: smokeSettings(1) },
+        deferRun: true,
+      });
+      await harness.runner.start();
+      let runSettled = false;
+      harness.consumer.run.mock.results[0].value.then(() => { runSettled = true; });
+      await harness.getRunOptions().eachBatch(batchContext({ offsets: ["90"] }));
+      const completion = await harness.runner.waitForSmokeCompletion();
+      expect(completion).toEqual({ status: "cap-completed" });
+      expect(harness.consumer.commitOffsets).toHaveBeenCalledWith([{
+        topic: V2_TOPIC, partition: 0, offset: "91",
+      }]);
+      expect(runSettled).toBe(false);
+      expect(harness.consumer.stop).not.toHaveBeenCalled();
+      await jest.advanceTimersByTimeAsync(2000);
+      expect(runSettled).toBe(false);
+      expect(harness.runner.getRuntimeSnapshot().deadlineExpired).toBe(false);
+      expect(harness.runner.getSmokeCompletionSnapshot()).toBe(completion);
+      const stopping = harness.runner.stop();
+      expect(harness.runner.stop()).toBe(stopping);
+      await stopping;
+      expect(runSettled).toBe(true);
+      expect(harness.runner.getSmokeCompletionSnapshot()).toBe(completion);
+      expect(harness.runner.getTerminalFailure()).toBeNull();
+      expect(harness.consumer.stop).toHaveBeenCalledTimes(1);
+      expect(jest.getTimerCount()).toBe(0);
+    });
+
+    test("run fulfillment after cap completion preserves the outcome without failure", async () => {
+      const harness = createHarness({
+        config: { firstRunSmoke: smokeSettings(1) },
+        deferRun: true,
+      });
+      await harness.runner.start();
+      await harness.getRunOptions().eachBatch(batchContext({ offsets: ["90"] }));
+      const completion = await harness.runner.waitForSmokeCompletion();
+      harness.fulfillRun();
+      await harness.consumer.run.mock.results[0].value;
+      await Promise.resolve();
+      expect(harness.runner.getSmokeCompletionSnapshot()).toBe(completion);
+      expect(harness.runner.getTerminalFailure()).toBeNull();
+      await harness.runner.stop();
+    });
+
+    test(
+      "run rejection after the cap is reserved prevents success",
+      async () => {
+        let finish;
+        const harness = createHarness({
+          config: { firstRunSmoke: smokeSettings(1) },
+          deferRun: true,
+          processBatch: jest.fn(() => new Promise((resolve) => { finish = resolve; })),
+        });
+        await harness.runner.start();
+        const processing = harness.getRunOptions().eachBatch(batchContext({ offsets: ["90"] }));
+        expect(harness.runner.getAdmissionSnapshot().closeReason).toBe("limit-reached");
+        expect(harness.runner.getSmokeCompletionSnapshot()).toEqual({ status: "pending" });
+        harness.rejectRun(new Error("private broker"));
+        const completion = await harness.runner.waitForSmokeCompletion();
+        expect(completion).toMatchObject({
+          status: "failed", failure: { classification: "kafka-consumer-run-failed" },
+        });
+        finish({
+          topic: V2_TOPIC,
+          partition: 0,
+          committablePrefix: [{ offset: "90", status: "inserted" }],
+          committableCount: 1,
+          nextOffset: "91",
+          failure: null,
+        });
+        await processing;
+        expect(harness.runner.getSmokeCompletionSnapshot()).toBe(completion);
+        expect(harness.consumer.commitOffsets).not.toHaveBeenCalled();
+        expect(JSON.stringify(completion)).not.toContain("private");
+        await harness.runner.stop();
+      },
+    );
+
+    test("a synchronous consumer.run failure is sanitized and signals failure", async () => {
+      const harness = createHarness({ config: { firstRunSmoke: smokeSettings(1) } });
+      harness.consumer.run.mockImplementation(() => { throw new Error("private broker"); });
+      await expect(harness.runner.start()).rejects.toThrow("Unable to start the V2 history consumer.");
+      const result = await harness.runner.waitForSmokeCompletion();
+      expect(result).toMatchObject({
+        status: "failed", failure: { classification: "kafka-consumer-run-failed" },
+      });
+      expect(JSON.stringify(result)).not.toContain("private");
+      await expect(harness.runner.stop()).rejects.toThrow("history consumer startup");
+      expect(jest.getTimerCount()).toBe(0);
+    });
+
+    test("listener cleanup attempts all removers and reports sanitized errors", async () => {
+      const harness = createHarness({ config: { firstRunSmoke: smokeSettings(1) } });
+      const firstRemoval = jest.fn();
+      const secondRemoval = jest.fn(() => { throw new Error("private listener"); });
+      harness.consumer.on.mockReturnValueOnce(firstRemoval).mockReturnValueOnce(secondRemoval);
+      await harness.runner.start();
+      await expect(harness.runner.stop()).rejects.toThrow(
+        "History consumer cleanup failed: history consumer lifecycle listeners.",
+      );
+      expect(firstRemoval).toHaveBeenCalledTimes(1);
+      expect(secondRemoval).toHaveBeenCalledTimes(1);
+      expect(jest.getTimerCount()).toBe(0);
+    });
+
+    test("installs lifecycle listeners before run and removes them once after expected stop", async () => {
+      const harness = createHarness({ config: { firstRunSmoke: smokeSettings(1) } });
+      harness.consumer.stop.mockImplementation(async () => {
+        harness.emitConsumerEvent(harness.consumer.events.STOP);
+      });
+      await harness.runner.start();
+      expect(harness.consumer.on.mock.calls.map(([event]) => event)).toEqual([
+        "consumer.stop", "consumer.crash",
+      ]);
+      for (const order of harness.consumer.on.mock.invocationCallOrder) {
+        expect(order).toBeLessThan(harness.consumer.run.mock.invocationCallOrder[0]);
+      }
+      const removers = harness.consumer.on.mock.results.map(({ value }) => value);
+      const stopping = harness.runner.stop();
+      expect(harness.runner.stop()).toBe(stopping);
+      await stopping;
+      for (const remove of removers) expect(remove).toHaveBeenCalledTimes(1);
+      expect(harness.runner.getTerminalFailure()).toBeNull();
+      expect(harness.onFailure).not.toHaveBeenCalled();
+      expect(harness.runner.getSmokeCompletionSnapshot()).toEqual({
+        status: "incomplete", reason: "shutdown",
+      });
+      harness.emitConsumerEvent(harness.consumer.events.CRASH);
+      expect(harness.runner.getTerminalFailure()).toBeNull();
+    });
+
+    test("run fulfillment before the cap is startup acknowledgement, not failure", async () => {
+      const harness = createHarness({ config: { firstRunSmoke: smokeSettings(2) } });
+      await harness.runner.start();
+      await harness.consumer.run.mock.results[0].value;
+      await Promise.resolve();
+      expect(harness.runner.getTerminalFailure()).toBeNull();
+      expect(harness.runner.getSmokeCompletionSnapshot()).toEqual({ status: "pending" });
+      expect(harness.runner.getAdmissionSnapshot().admittedRecords).toBe(0);
+      await harness.getRunOptions().eachBatch(batchContext({ offsets: ["90", "91"] }));
+      const completion = await harness.runner.waitForSmokeCompletion();
+      expect(completion).toEqual({ status: "cap-completed" });
+      expect(harness.consumer.commitOffsets).toHaveBeenCalledWith([{
+        topic: V2_TOPIC, partition: 0, offset: "92",
+      }]);
+      await harness.runner.stop();
+      expect(harness.runner.getSmokeCompletionSnapshot()).toBe(completion);
     });
   });
 
