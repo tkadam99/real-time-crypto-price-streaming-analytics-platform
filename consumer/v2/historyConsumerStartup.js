@@ -1,4 +1,5 @@
 const {
+  FIRST_RUN_SMOKE_EXPECTED_TOPIC_ID,
   HISTORY_CONSUMER_GROUP_ID,
   HISTORY_DATABASE_NAME,
   HISTORY_KAFKA_BROKER,
@@ -9,12 +10,25 @@ const {
   HISTORY_TOPIC,
 } = require("./historyConsumerConfig");
 const { verifyHistoryConsumerPreflights } = require("./historyConsumerPreflight");
+const {
+  verifyHistorySmokeTopicIdentity: defaultVerifyHistorySmokeTopicIdentity,
+} = require("./historySmokeTopicPreflight");
+const {
+  verifyHistorySmokeGroup: defaultVerifyHistorySmokeGroup,
+} = require("./historySmokeGroupPreflight");
+const {
+  executeHistorySmokeCommand: defaultExecuteHistorySmokeCommand,
+} = require("./historySmokeCommandExecutor");
 const { createHistoryConsumerRunner } = require("./historyConsumerRunner");
 const { persistHistoryBatch } = require("./historyBatch");
 const { ensureHistoryIndexes } = require("./historyIndexes");
 const { verifyHistoryCollectionOwnership } =
   require("./historyCollectionOwnershipVerification");
 const { HISTORY_COLLECTION_NAMES } = require("./historyCollectionInspection");
+
+const SMOKE_EXECUTION_UNAVAILABLE =
+  "V2 history smoke execution is unavailable until bounded runner controls are installed.";
+const HISTORY_PARTITION_IDS = Object.freeze([0, 1, 2, 3, 4, 5]);
 
 const SAFE_ERROR_NAMES = new Set([
   "Error",
@@ -67,6 +81,16 @@ function validateConfig(config) {
     throw new Error("Invalid or disabled pinned V2 history startup configuration.");
   }
 
+  if (config.firstRunSmoke !== undefined) {
+    const smoke = config.firstRunSmoke;
+    if (!smoke || smoke.enabled !== true ||
+        !isBoundedInteger(smoke.maxRecords, 1, 100) ||
+        !isBoundedInteger(smoke.maxRuntimeMs, 1000, 300000) ||
+        config.kafka.expectedTopicId !== FIRST_RUN_SMOKE_EXPECTED_TOPIC_ID) {
+      throw new Error("Invalid V2 history first-run smoke startup configuration.");
+    }
+  }
+
   const mongoOptions = config.mongo.options;
   const kafkaOptions = config.kafka.options;
   if (!mongoOptions ||
@@ -99,6 +123,9 @@ function validateDependencies({
   ensureIndexes,
   verifyPreflights,
   verifyOwnership,
+  verifyHistorySmokeTopicIdentity,
+  verifyHistorySmokeGroup,
+  executeHistorySmokeCommand,
   persistHistoryBatchImpl,
   createRunner,
   onFailure,
@@ -134,12 +161,62 @@ function validateDependencies({
   if (typeof createConsumer !== "function" ||
       typeof ensureIndexes !== "function" ||
       typeof verifyPreflights !== "function" ||
-  typeof verifyOwnership !== "function" ||
+      typeof verifyOwnership !== "function" ||
       typeof persistHistoryBatchImpl !== "function" ||
       typeof createRunner !== "function" ||
       typeof onFailure !== "function") {
     throw new Error("Invalid V2 history startup factory or failure handler.");
   }
+  if (config.firstRunSmoke && config.firstRunSmoke.enabled === true &&
+      (typeof verifyHistorySmokeTopicIdentity !== "function" ||
+        typeof verifyHistorySmokeGroup !== "function" ||
+        typeof executeHistorySmokeCommand !== "function" ||
+        typeof admin.listGroups !== "function" ||
+        typeof admin.describeGroups !== "function" ||
+        typeof admin.fetchOffsets !== "function")) {
+    throw new Error("Invalid V2 history smoke preflight dependency.");
+  }
+}
+
+function hasExactKeys(value, expectedKeys) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const keys = Object.keys(value);
+  return keys.length === expectedKeys.length &&
+    expectedKeys.every((key) => Object.prototype.hasOwnProperty.call(value, key)) &&
+    keys.every((key) => expectedKeys.includes(key));
+}
+
+function isSmokeTopicIdentityResult(result, config) {
+  return hasExactKeys(result, [
+    "topic",
+    "topicId",
+    "partitionCount",
+    "partitionIds",
+  ]) &&
+    result.topic === HISTORY_TOPIC &&
+    result.topicId === config.kafka.expectedTopicId &&
+    result.partitionCount === HISTORY_PARTITION_IDS.length &&
+    Array.isArray(result.partitionIds) &&
+    result.partitionIds.length === HISTORY_PARTITION_IDS.length &&
+    result.partitionIds.every((partitionId, index) =>
+      partitionId === HISTORY_PARTITION_IDS[index]);
+}
+
+function isSmokeGroupResult(result) {
+  if (!result || typeof result !== "object" || Array.isArray(result) ||
+      result.groupId !== HISTORY_CONSUMER_GROUP_ID) {
+    return false;
+  }
+  if (result.status === "absent") {
+    return hasExactKeys(result, ["status", "groupId"]);
+  }
+  return result.status === "existing-empty-uncommitted" &&
+    hasExactKeys(result, ["status", "groupId", "topic", "partitionIds"]) &&
+    result.topic === HISTORY_TOPIC &&
+    Array.isArray(result.partitionIds) &&
+    result.partitionIds.length === HISTORY_PARTITION_IDS.length &&
+    result.partitionIds.every((partitionId, index) =>
+      partitionId === HISTORY_PARTITION_IDS[index]);
 }
 
 function boundedCall(operation, timeoutMs, label) {
@@ -197,6 +274,9 @@ function createHistoryConsumerStartup({
   ensureIndexes = ensureHistoryIndexes,
   verifyPreflights = verifyHistoryConsumerPreflights,
   verifyOwnership = verifyHistoryCollectionOwnership,
+  verifyHistorySmokeTopicIdentity = defaultVerifyHistorySmokeTopicIdentity,
+  verifyHistorySmokeGroup = defaultVerifyHistorySmokeGroup,
+  executeHistorySmokeCommand = defaultExecuteHistorySmokeCommand,
   persistHistoryBatchImpl = persistHistoryBatch,
   createRunner = createHistoryConsumerRunner,
   onFailure,
@@ -212,6 +292,9 @@ function createHistoryConsumerStartup({
     ensureIndexes,
     verifyPreflights,
     verifyOwnership,
+    verifyHistorySmokeTopicIdentity,
+    verifyHistorySmokeGroup,
+    executeHistorySmokeCommand,
     persistHistoryBatchImpl,
     createRunner,
     onFailure,
@@ -554,6 +637,7 @@ function createHistoryConsumerStartup({
     if (startPromise) return startPromise;
 
     startPromise = (async () => {
+      let smokeExecutionBlocked = false;
       let stage = "Kafka admin connection";
       try {
         adminConnectionAttempted = true;
@@ -583,6 +667,39 @@ function createHistoryConsumerStartup({
         );
         checkCancellation();
 
+        if (config.firstRunSmoke && config.firstRunSmoke.enabled === true) {
+          stage = "V2 history smoke topic-ID preflight";
+          const topicResult = await boundedCall(
+            () => trackMongoAndKafkaStartupOperation(() => {
+              checkCancellation();
+              return verifyHistorySmokeTopicIdentity({
+                config,
+                executeCommand: executeHistorySmokeCommand,
+              });
+            }),
+            startupTimeoutMs,
+            stage,
+          );
+          if (!isSmokeTopicIdentityResult(topicResult, config)) {
+            throw new Error("V2 history smoke topic-ID preflight returned an invalid result.");
+          }
+          checkCancellation();
+
+          stage = "V2 history smoke consumer-group preflight";
+          const groupResult = await boundedCall(
+            () => trackMongoAndKafkaStartupOperation(() => {
+              checkCancellation();
+              return verifyHistorySmokeGroup({ admin, config });
+            }),
+            startupTimeoutMs,
+            stage,
+          );
+          if (!isSmokeGroupResult(groupResult)) {
+            throw new Error("V2 history smoke consumer-group preflight returned an invalid result.");
+          }
+          checkCancellation();
+        }
+
         stage = "history collection ownership verification";
         const ownershipResult = await boundedCall(
           () => trackMongoOperation(() => verifyOwnership({
@@ -603,6 +720,35 @@ function createHistoryConsumerStartup({
           throw new Error("V2 history ownership verification returned an invalid result.");
         }
         checkCancellation();
+
+        if (config.firstRunSmoke && config.firstRunSmoke.enabled === true) {
+          stage = "V2 history smoke index verification";
+          const indexes = ownershipResult.indexes;
+          if (!hasExactKeys(indexes, ["historyTtl", "receiptsTtl"]) ||
+              indexes.historyTtl !== "verified" ||
+              indexes.receiptsTtl !== "absent") {
+            throw new Error("V2 history smoke indexes are missing or incompatible.");
+          }
+          checkCancellation();
+
+          stage = "V2 history smoke consumer-group recheck";
+          const groupResult = await boundedCall(
+            () => trackMongoAndKafkaStartupOperation(() => {
+              checkCancellation();
+              return verifyHistorySmokeGroup({ admin, config });
+            }),
+            startupTimeoutMs,
+            stage,
+          );
+          if (!isSmokeGroupResult(groupResult)) {
+            throw new Error("V2 history smoke consumer-group recheck returned an invalid result.");
+          }
+          checkCancellation();
+
+          stage = "V2 history smoke execution";
+          smokeExecutionBlocked = true;
+          throw new Error(SMOKE_EXECUTION_UNAVAILABLE);
+        }
 
         stage = "Kafka admin disconnect";
         await boundedCall(disconnectAdmin, config.kafka.options.requestTimeout, stage);
@@ -698,6 +844,9 @@ function createHistoryConsumerStartup({
           : "";
         if (stopRequested) {
           throw new Error(`V2 history startup cancelled.${details}`);
+        }
+        if (smokeExecutionBlocked) {
+          throw new Error(`${SMOKE_EXECUTION_UNAVAILABLE}${details}`);
         }
         throw new Error(`V2 history startup failed during ${stage}.${details}`);
       }

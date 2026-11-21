@@ -1,5 +1,7 @@
 const { Collection, Db, MongoClient } = require("mongodb");
 const {
+  FIRST_RUN_SMOKE_ACKNOWLEDGEMENT,
+  FIRST_RUN_SMOKE_EXPECTED_TOPIC_ID,
   HISTORY_CONSUMER_GROUP_ID,
   HISTORY_DATABASE_NAME,
   HISTORY_KAFKA_CLUSTER_ID,
@@ -16,6 +18,25 @@ const config = loadHistoryConsumerConfig({
   V2_HISTORY_CONSUMER_ENABLED: "true",
   V2_HISTORY_LIVE_START_ACK: LIVE_START_ACKNOWLEDGEMENT,
 });
+const smokeConfig = loadHistoryConsumerConfig({
+  V2_HISTORY_CONSUMER_ENABLED: "true",
+  V2_HISTORY_LIVE_START_ACK: LIVE_START_ACKNOWLEDGEMENT,
+  V2_HISTORY_FIRST_RUN_SMOKE_ENABLED: "true",
+  V2_HISTORY_FIRST_RUN_SMOKE_ACK: FIRST_RUN_SMOKE_ACKNOWLEDGEMENT,
+  V2_HISTORY_FIRST_RUN_SMOKE_MAX_RECORDS: "5",
+  V2_HISTORY_FIRST_RUN_SMOKE_MAX_RUNTIME_MS: "1000",
+  V2_HISTORY_TOPIC_ID: FIRST_RUN_SMOKE_EXPECTED_TOPIC_ID,
+});
+const smokeTopicResult = {
+  topic: HISTORY_TOPIC,
+  topicId: FIRST_RUN_SMOKE_EXPECTED_TOPIC_ID,
+  partitionCount: 6,
+  partitionIds: [0, 1, 2, 3, 4, 5],
+};
+const smokeGroupResult = {
+  status: "absent",
+  groupId: HISTORY_CONSUMER_GROUP_ID,
+};
 function createDeferred() {
   let resolve;
   let reject;
@@ -40,6 +61,7 @@ function createShortShutdownConfig() {
 const topicMetadata = {
   topics: [{
     name: HISTORY_TOPIC,
+    topicId: FIRST_RUN_SMOKE_EXPECTED_TOPIC_ID,
     partitions: [0, 1, 2, 3, 4, 5].map((partitionId) => ({
       partitionId,
       leader: 1,
@@ -64,6 +86,9 @@ function createHarness({
   historyCollectionOverride,
   receiptCollectionOverride,
   verifyOwnership,
+  verifyHistorySmokeTopicIdentity,
+  verifyHistorySmokeGroup,
+  executeHistorySmokeCommand,
   onMongoClose,
 } = {}) {
   const events = [];
@@ -72,7 +97,7 @@ function createHarness({
   const verifyOwnershipImpl = verifyOwnership ||
     jest.fn(async () => {
       events.push("ownership.verify");
-      return {
+      const result = {
         databaseName: HISTORY_DATABASE_NAME,
         status: "verified",
         collections: {
@@ -80,7 +105,38 @@ function createHarness({
           receipts: HISTORY_COLLECTION_NAMES.receipts,
         },
       };
+      if (startupConfig.firstRunSmoke) {
+        events.push("ownership.indexes.verify");
+        result.indexes = {
+          historyTtl: "verified",
+          receiptsTtl: "absent",
+        };
+      }
+      return result;
     });
+  let smokeGroupVerificationCount = 0;
+  const verifyHistorySmokeTopicIdentityImpl =
+    verifyHistorySmokeTopicIdentity === undefined
+      ? jest.fn(async ({ executeCommand }) => {
+        events.push("smoke.topic.verify");
+        if (typeof executeCommand !== "function") {
+          throw new Error("Missing command executor.");
+        }
+        return smokeTopicResult;
+      })
+      : verifyHistorySmokeTopicIdentity;
+  const verifyHistorySmokeGroupImpl =
+    verifyHistorySmokeGroup === undefined
+      ? jest.fn(async () => {
+        smokeGroupVerificationCount += 1;
+        events.push(`smoke.group.verify:${smokeGroupVerificationCount}`);
+        return smokeGroupResult;
+      })
+      : verifyHistorySmokeGroup;
+  const executeHistorySmokeCommandImpl =
+    executeHistorySmokeCommand === undefined
+      ? jest.fn(async () => ({ stdout: "", stderr: "", exitCode: 0 }))
+      : executeHistorySmokeCommand;
   let resolveTerminal;
   const terminalSignal = new Promise((resolve) => {
     resolveTerminal = resolve;
@@ -140,6 +196,9 @@ function createHarness({
       events.push("kafka.fetchTopicMetadata");
       return topicMetadata;
     }),
+    listGroups: jest.fn(async () => ({ groups: [] })),
+    describeGroups: jest.fn(async () => ({ groups: [] })),
+    fetchOffsets: jest.fn(async () => []),
   };
   const historyCollection = typeof historyCollectionOverride === "function"
     ? historyCollectionOverride({ mongoClient, historyDatabase })
@@ -161,6 +220,7 @@ function createHarness({
       notifyConsumerDisconnect();
     }),
     stop: jest.fn(async () => { events.push("consumer.stop"); }),
+    subscribe: jest.fn(async () => { events.push("consumer.subscribe"); }),
   };
   const createConsumer = jest.fn((options) => {
     events.push("consumer.create");
@@ -198,6 +258,9 @@ function createHarness({
       ensureIndexes: ensureIndexesImpl,
       verifyPreflights,
       verifyOwnership: verifyOwnershipImpl,
+      verifyHistorySmokeTopicIdentity: verifyHistorySmokeTopicIdentityImpl,
+      verifyHistorySmokeGroup: verifyHistorySmokeGroupImpl,
+      executeHistorySmokeCommand: executeHistorySmokeCommandImpl,
       persistHistoryBatchImpl,
       createRunner,
       onFailure,
@@ -224,6 +287,9 @@ function createHarness({
     receiptCollection,
     runner,
     verifyOwnership: verifyOwnershipImpl,
+    verifyHistorySmokeTopicIdentity: verifyHistorySmokeTopicIdentityImpl,
+    verifyHistorySmokeGroup: verifyHistorySmokeGroupImpl,
+    executeHistorySmokeCommand: executeHistorySmokeCommandImpl,
     startup,
     startupError,
   };
@@ -831,4 +897,215 @@ test("terminal failure followed by shutdown drains and cleans up only once", asy
   expect(harness.consumer.disconnect).toHaveBeenCalledTimes(1);
   expect(harness.admin.disconnect).toHaveBeenCalledTimes(1);
   expect(harness.mongoClient.close).toHaveBeenCalledTimes(1);
+});
+
+test("runs smoke preflights in order, rechecks the group twice, and blocks consumption", async () => {
+  const harness = createHarness({ startupConfig: smokeConfig });
+
+  await expect(harness.startup.start()).rejects.toThrow(
+    "V2 history smoke execution is unavailable until bounded runner controls are installed.",
+  );
+
+  expect(harness.events.slice(0, 12)).toEqual([
+    "kafka.admin.connect",
+    "mongo.connect",
+    "kafka.describeCluster",
+    "kafka.fetchTopicMetadata",
+    "mongo.db:admin",
+    "mongo.hello",
+    "mongo.replSetGetStatus",
+    "smoke.topic.verify",
+    "smoke.group.verify:1",
+    "ownership.verify",
+    "ownership.indexes.verify",
+    "smoke.group.verify:2",
+  ]);
+  expect(harness.events.slice(12).sort()).toEqual([
+    "kafka.admin.disconnect",
+    "mongo.close",
+  ].sort());
+  expect(harness.verifyHistorySmokeTopicIdentity).toHaveBeenCalledWith({
+    config: smokeConfig,
+    executeCommand: harness.executeHistorySmokeCommand,
+  });
+  expect(harness.verifyHistorySmokeGroup).toHaveBeenCalledTimes(2);
+  expect(harness.events.indexOf("smoke.topic.verify"))
+    .toBeLessThan(harness.events.indexOf("smoke.group.verify:1"));
+  expect(harness.events.indexOf("smoke.group.verify:1"))
+    .toBeLessThan(harness.events.indexOf("ownership.verify"));
+  expect(harness.events.indexOf("ownership.indexes.verify"))
+    .toBeLessThan(harness.events.indexOf("smoke.group.verify:2"));
+  expect(harness.ensureIndexes).not.toHaveBeenCalled();
+  expect(harness.createConsumer).not.toHaveBeenCalled();
+  expect(harness.consumer.connect).not.toHaveBeenCalled();
+  expect(harness.consumer.subscribe).not.toHaveBeenCalled();
+});
+
+test("fails closed when the smoke topic verifier is missing", () => {
+  const harness = createHarness({
+    startupConfig: smokeConfig,
+    verifyHistorySmokeTopicIdentity: null,
+  });
+
+  expect(harness.startupError.message)
+    .toBe("Invalid V2 history smoke preflight dependency.");
+  expect(harness.admin.connect).not.toHaveBeenCalled();
+  expect(harness.mongoClient.connect).not.toHaveBeenCalled();
+});
+
+test("fails closed when the smoke group verifier is missing", () => {
+  const harness = createHarness({
+    startupConfig: smokeConfig,
+    verifyHistorySmokeGroup: null,
+  });
+
+  expect(harness.startupError.message)
+    .toBe("Invalid V2 history smoke preflight dependency.");
+  expect(harness.admin.connect).not.toHaveBeenCalled();
+  expect(harness.mongoClient.connect).not.toHaveBeenCalled();
+});
+
+test("topic-ID mismatch prevents group checks, ownership, and consumer construction", async () => {
+  const verifyHistorySmokeTopicIdentity = jest.fn().mockRejectedValue(
+    new Error("topicId=private mismatch"),
+  );
+  const harness = createHarness({
+    startupConfig: smokeConfig,
+    verifyHistorySmokeTopicIdentity,
+  });
+
+  await expect(harness.startup.start()).rejects.toThrow(
+    "V2 history startup failed during V2 history smoke topic-ID preflight.",
+  );
+  expect(harness.verifyHistorySmokeGroup).not.toHaveBeenCalled();
+  expect(harness.verifyOwnership).not.toHaveBeenCalled();
+  expect(harness.createConsumer).not.toHaveBeenCalled();
+  expect(harness.consumer.connect).not.toHaveBeenCalled();
+});
+
+test.each([
+  ["committed offsets", "committed offset payload=private"],
+  ["active group members", "active member clientId=private"],
+])("%s prevent smoke startup from reaching ownership or consumer creation", async (
+  _label,
+  privateError,
+) => {
+  const verifyHistorySmokeGroup = jest.fn().mockRejectedValue(
+    new Error(privateError),
+  );
+  const harness = createHarness({
+    startupConfig: smokeConfig,
+    verifyHistorySmokeGroup,
+  });
+
+  const failure = await harness.startup.start().catch((error) => error);
+  expect(failure.message)
+    .toBe("V2 history startup failed during V2 history smoke consumer-group preflight.");
+  expect(failure.message).not.toContain("private");
+  expect(harness.verifyOwnership).not.toHaveBeenCalled();
+  expect(harness.createConsumer).not.toHaveBeenCalled();
+  expect(harness.consumer.connect).not.toHaveBeenCalled();
+});
+
+test("missing history TTL rejects smoke startup without index setup", async () => {
+  const verifyOwnership = jest.fn(async () => ({
+    databaseName: HISTORY_DATABASE_NAME,
+    status: "verified",
+    collections: {
+      history: HISTORY_COLLECTION_NAMES.history,
+      receipts: HISTORY_COLLECTION_NAMES.receipts,
+    },
+    indexes: {
+      historyTtl: "pending-setup",
+      receiptsTtl: "absent",
+    },
+  }));
+  const harness = createHarness({
+    startupConfig: smokeConfig,
+    verifyOwnership,
+  });
+
+  await expect(harness.startup.start()).rejects.toThrow(
+    "V2 history startup failed during V2 history smoke index verification.",
+  );
+  expect(harness.verifyHistorySmokeGroup).toHaveBeenCalledTimes(1);
+  expect(harness.ensureIndexes).not.toHaveBeenCalled();
+  expect(harness.createConsumer).not.toHaveBeenCalled();
+  expect(harness.consumer.connect).not.toHaveBeenCalled();
+});
+
+test("a failed final group recheck prevents smoke execution and consumer creation", async () => {
+  const verifyHistorySmokeGroup = jest.fn()
+    .mockResolvedValueOnce(smokeGroupResult)
+    .mockRejectedValueOnce(new Error("offset=private"));
+  const harness = createHarness({
+    startupConfig: smokeConfig,
+    verifyHistorySmokeGroup,
+  });
+
+  await expect(harness.startup.start()).rejects.toThrow(
+    "V2 history startup failed during V2 history smoke consumer-group recheck.",
+  );
+  expect(verifyHistorySmokeGroup).toHaveBeenCalledTimes(2);
+  expect(harness.ensureIndexes).not.toHaveBeenCalled();
+  expect(harness.createConsumer).not.toHaveBeenCalled();
+  expect(harness.consumer.connect).not.toHaveBeenCalled();
+});
+
+test("shutdown during a pending smoke preflight drains it before cleanup", async () => {
+  let releaseGroup;
+  let notifyGroup;
+  const groupStarted = new Promise((resolve) => {
+    notifyGroup = resolve;
+  });
+  const verifyHistorySmokeGroup = jest.fn(() => {
+    notifyGroup();
+    return new Promise((resolve) => {
+      releaseGroup = resolve;
+    });
+  });
+  const harness = createHarness({
+    startupConfig: smokeConfig,
+    verifyHistorySmokeGroup,
+  });
+
+  const starting = harness.startup.start();
+  await groupStarted;
+  const stopping = harness.startup.stop();
+  await Promise.resolve();
+  expect(harness.mongoClient.close).not.toHaveBeenCalled();
+
+  releaseGroup(smokeGroupResult);
+  await expect(starting).rejects.toThrow("V2 history startup cancelled.");
+  await expect(stopping).resolves.toBeUndefined();
+  expect(harness.verifyHistorySmokeGroup).toHaveBeenCalledTimes(1);
+  expect(harness.verifyOwnership).not.toHaveBeenCalled();
+  expect(harness.ensureIndexes).not.toHaveBeenCalled();
+  expect(harness.createConsumer).not.toHaveBeenCalled();
+  expect(harness.consumer.connect).not.toHaveBeenCalled();
+  expect(harness.admin.disconnect).toHaveBeenCalledTimes(1);
+  expect(harness.mongoClient.close).toHaveBeenCalledTimes(1);
+});
+
+test("smoke preflight cleanup is idempotent and does not expose verifier errors", async () => {
+  const verifyHistorySmokeTopicIdentity = jest.fn().mockRejectedValue(
+    new Error("mongodb://private/credentials"),
+  );
+  const harness = createHarness({
+    startupConfig: smokeConfig,
+    verifyHistorySmokeTopicIdentity,
+  });
+
+  const failure = await harness.startup.start().catch((error) => error);
+  expect(failure.message)
+    .toBe("V2 history startup failed during V2 history smoke topic-ID preflight.");
+  expect(failure.message).not.toContain("private");
+
+  const firstStop = harness.startup.stop();
+  const secondStop = harness.startup.stop();
+  expect(secondStop).toBe(firstStop);
+  await expect(firstStop).resolves.toBeUndefined();
+  expect(harness.admin.disconnect).toHaveBeenCalledTimes(1);
+  expect(harness.mongoClient.close).toHaveBeenCalledTimes(1);
+  expect(harness.createConsumer).not.toHaveBeenCalled();
 });
