@@ -164,6 +164,18 @@ function createMongoTestDatabase(client, prefix) {
   return database;
 }
 
+function getMongoTestDatabaseName(database) {
+  const generatedName = database && generatedDatabases.get(database);
+  if (
+    !generatedName
+    || generatedName !== database.databaseName
+    || !isGeneratedTestDatabaseName(generatedName)
+  ) {
+    throw new Error("MongoDB database was not generated for this test run.");
+  }
+  return generatedName;
+}
+
 async function dropMongoTestDatabase(database) {
   if (
     !database
@@ -180,6 +192,7 @@ async function dropMongoTestDatabase(database) {
 module.exports = {
   createMongoTestDatabase,
   dropMongoTestDatabase,
+  getMongoTestDatabaseName,
   getMongoIntegrationUri,
   isGeneratedTestDatabaseName,
 };

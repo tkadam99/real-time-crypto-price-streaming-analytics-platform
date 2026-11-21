@@ -7,7 +7,8 @@
     "start": "node src/index.js",
     "start:current-prices": "node src/currentPriceMain.js",
     "diagnose:kafka": "node scripts/kafkaTailDiagnostic.js",
-    "test": "jest --runInBand"
+    "test": "jest --runInBand",
+    "postinstall": "patch-package"
   },
   "keywords": [],
   "author": "",
@@ -16,7 +17,8 @@
   "dependencies": {
     "dotenv": "^17.3.1",
     "kafkajs": "^2.2.4",
-    "mongodb": "^7.1.0"
+    "mongodb": "^7.1.0",
+    "patch-package": "^8.0.1"
   },
   "devDependencies": {
     "jest": "^30.3.0"
