@@ -200,7 +200,9 @@ function createHistoryConsumerApplication({
   }
   if (!startup || typeof startup.start !== "function" ||
       typeof startup.stop !== "function" ||
-      typeof startup.waitForTerminalCleanup !== "function") {
+      typeof startup.waitForTerminalCleanup !== "function" ||
+      (startup.getTerminalFailure !== undefined &&
+        typeof startup.getTerminalFailure !== "function")) {
     throw new Error("Invalid V2 history startup supervisor.");
   }
 
@@ -246,6 +248,10 @@ function createHistoryConsumerApplication({
       shutdownPromise = (async () => {
         try {
           await stop();
+          if (typeof startup.getTerminalFailure === "function" &&
+              startup.getTerminalFailure()) {
+            processObject.exitCode = 1;
+          }
         } catch {
           logError(logger, "V2 history consumer shutdown failed.");
           processObject.exitCode = 1;
@@ -316,6 +322,7 @@ function createHistoryConsumerApplication({
 }
 
 async function runHistoryConsumer(options = {}) {
+  // Pending promises do not keep Node alive; external supervisors own termination grace periods.
   const processObject = options.processObject || process;
   const logger = options.logger === undefined ? console : options.logger;
   let application;

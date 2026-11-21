@@ -18,6 +18,16 @@ const enabledEnv = {
   V2_HISTORY_LIVE_START_ACK: LIVE_START_ACKNOWLEDGEMENT,
 };
 
+function createDeferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, reject, resolve };
+}
+
 function createHarness({
   env = enabledEnv,
   startupStart,
@@ -27,6 +37,7 @@ function createHarness({
   KafkaConstructor,
   MongoClientConstructor,
   startupFactory,
+  getTerminalFailure = jest.fn(() => null),
 } = {}) {
   const events = [];
   const kafkaOptions = [];
@@ -34,6 +45,12 @@ function createHarness({
   const databaseNames = [];
   const collectionNames = [];
   const processObject = new EventEmitter();
+  const addProcessListener = processObject.on.bind(processObject);
+  processObject.on = jest.fn((signal, listener) => {
+    events.push(`process.on:${signal}`);
+    return addProcessListener(signal, listener);
+  });
+  processObject.exit = jest.fn();
   const logger = { error: jest.fn() };
   const admin = {
     connect: jest.fn(),
@@ -126,6 +143,7 @@ function createHarness({
     start: startupStart || defaultStartupStart,
     stop: startupStop,
     waitForTerminalCleanup,
+    getTerminalFailure,
   };
   const createStartup = startupFactory || jest.fn((options) => {
     events.push("startup.create");
@@ -256,6 +274,8 @@ test("installs no startup side effects when the module is imported", () => {
   const KafkaConstructor = jest.fn();
   const MongoClientConstructor = jest.fn();
   const createStartup = jest.fn();
+  const sigintListeners = process.listenerCount("SIGINT");
+  const sigtermListeners = process.listenerCount("SIGTERM");
 
   try {
     jest.isolateModules(() => {
@@ -271,6 +291,8 @@ test("installs no startup side effects when the module is imported", () => {
       expect(KafkaConstructor).not.toHaveBeenCalled();
       expect(MongoClientConstructor).not.toHaveBeenCalled();
       expect(createStartup).not.toHaveBeenCalled();
+      expect(process.listenerCount("SIGINT")).toBe(sigintListeners);
+      expect(process.listenerCount("SIGTERM")).toBe(sigtermListeners);
     });
   } finally {
     jest.dontMock("kafkajs");
@@ -300,6 +322,11 @@ test.each([
 
   const running = runHistoryConsumer(harness.dependencies);
   await harness.startupStarted;
+  await Promise.resolve();
+  expect(harness.events.indexOf("process.on:SIGINT"))
+    .toBeLessThan(harness.events.indexOf("startup.start"));
+  expect(harness.events.indexOf("process.on:SIGTERM"))
+    .toBeLessThan(harness.events.indexOf("startup.start"));
   harness.processObject.emit(signal);
   await stopStarted;
   releaseStop();
@@ -310,9 +337,40 @@ test.each([
   expect(harness.processObject.exitCode).toBe(exitCode);
   expect(harness.processObject.listenerCount("SIGINT")).toBe(0);
   expect(harness.processObject.listenerCount("SIGTERM")).toBe(0);
+  expect(harness.processObject.exit).not.toHaveBeenCalled();
 });
 
-test("shutdown during pending startup cancels safely without duplicate cleanup", async () => {
+test("repeated signals share one supervisor cleanup operation", async () => {
+  const stopPending = createDeferred();
+  let notifyStop;
+  const stopStarted = new Promise((resolve) => {
+    notifyStop = resolve;
+  });
+  const harness = createHarness({
+    startupStop: jest.fn(() => {
+      notifyStop();
+      return stopPending.promise;
+    }),
+  });
+  const running = runHistoryConsumer(harness.dependencies);
+
+  await harness.startupStarted;
+  harness.processObject.emit("SIGINT");
+  await stopStarted;
+  harness.processObject.emit("SIGTERM");
+  harness.processObject.emit("SIGINT");
+  stopPending.resolve();
+
+  await running;
+  expect(harness.startup.stop).toHaveBeenCalledTimes(1);
+  expect(harness.processObject.exitCode).toBe(130);
+  expect(harness.processObject.exit).not.toHaveBeenCalled();
+});
+
+test.each([
+  ["SIGINT", 130],
+  ["SIGTERM", 143],
+])("%s during pending startup cancels safely without duplicate cleanup", async (signal, exitCode) => {
   let rejectStart;
   let notifyStart;
   const startStarted = new Promise((resolve) => {
@@ -329,13 +387,107 @@ test("shutdown during pending startup cancels safely without duplicate cleanup",
 
   const running = runHistoryConsumer(harness.dependencies);
   await startStarted;
-  harness.processObject.emit("SIGTERM");
+  harness.processObject.emit(signal);
 
   const application = await running;
   expect(application).toBeDefined();
   expect(harness.startup.stop).toHaveBeenCalledTimes(1);
   expect(harness.kafka.consumer).not.toHaveBeenCalled();
-  expect(harness.processObject.exitCode).toBe(143);
+  expect(harness.processObject.exitCode).toBe(exitCode);
+  expect(harness.processObject.exit).not.toHaveBeenCalled();
+});
+
+test("incomplete signal cleanup logs a sanitized failure and sets exit code 1", async () => {
+  const harness = createHarness({
+    startupStop: jest.fn().mockRejectedValue(
+      new Error("mongodb://private-user:private-password/secret"),
+    ),
+  });
+  const running = runHistoryConsumer(harness.dependencies);
+
+  await harness.startupStarted;
+  harness.processObject.emit("SIGTERM");
+  await running;
+
+  expect(harness.processObject.exitCode).toBe(1);
+  expect(harness.logger.error).toHaveBeenCalledWith(
+    "V2 history consumer shutdown failed.",
+  );
+  expect(harness.logger.error.mock.calls.flat().join(" "))
+    .not.toMatch(/mongodb:\/\/|private-password|secret/);
+  expect(harness.processObject.exit).not.toHaveBeenCalled();
+});
+
+test("terminal runner failure remains a failure when followed by a graceful signal", async () => {
+  let terminalFailure = null;
+  const harness = createHarness({
+    getTerminalFailure: () => terminalFailure,
+  });
+  const running = runHistoryConsumer(harness.dependencies);
+
+  await harness.startupStarted;
+  await Promise.resolve();
+  terminalFailure = {
+    classification: "malformed-json",
+    topic: HISTORY_TOPIC,
+    partition: 2,
+    offset: "17",
+  };
+  harness.processObject.emit("SIGINT");
+
+  await running;
+  expect(harness.processObject.exitCode).toBe(1);
+  expect(harness.processObject.exit).not.toHaveBeenCalled();
+});
+
+test("late deferred cleanup success never resets an incomplete-shutdown exit code", async () => {
+  const lateCleanup = createDeferred();
+  const harness = createHarness({
+    waitForTerminalCleanup: jest.fn(() => lateCleanup.promise),
+    startupStop: jest.fn().mockRejectedValue(
+      new Error("private driver timeout"),
+    ),
+  });
+  const running = runHistoryConsumer(harness.dependencies);
+
+  await harness.startupStarted;
+  await Promise.resolve();
+  harness.processObject.emit("SIGINT");
+  await running;
+  expect(harness.processObject.exitCode).toBe(1);
+
+  lateCleanup.resolve({ failure: null, cleanupFailure: null });
+  await lateCleanup.promise;
+  expect(harness.processObject.exitCode).toBe(1);
+  expect(harness.processObject.exit).not.toHaveBeenCalled();
+});
+
+test("observes rejected signal cleanup without unhandled rejections", async () => {
+  const unhandled = [];
+  const onUnhandled = (reason) => unhandled.push(reason);
+  process.on("unhandledRejection", onUnhandled);
+  try {
+    const lateCleanup = createDeferred();
+    const harness = createHarness({
+      waitForTerminalCleanup: jest.fn(() => lateCleanup.promise),
+      startupStop: jest.fn().mockRejectedValue(
+        new Error("mongodb://private/shutdown timeout"),
+      ),
+    });
+    const running = runHistoryConsumer(harness.dependencies);
+    await harness.startupStarted;
+    await Promise.resolve();
+    harness.processObject.emit("SIGTERM");
+    await running;
+    lateCleanup.reject(new Error("mongodb://private/late cleanup failure"));
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(unhandled).toEqual([]);
+    expect(harness.processObject.exitCode).toBe(1);
+    expect(harness.processObject.exit).not.toHaveBeenCalled();
+  } finally {
+    process.removeListener("unhandledRejection", onUnhandled);
+  }
 });
 
 test("terminal runner failure awaits cleanup and sets a nonzero exit code", async () => {
