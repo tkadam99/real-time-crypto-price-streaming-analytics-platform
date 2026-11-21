@@ -8,6 +8,9 @@ const HISTORY_DATABASE_NAME = "crypto_analytics_v2";
 const HISTORY_REPLICA_SET_NAME = "rs-v2";
 const HISTORY_MONGO_MEMBER = "v2-mongodb:27017";
 const LIVE_START_ACKNOWLEDGEMENT = "I_ACKNOWLEDGE_V2_HISTORY_BACKFILL";
+const FIRST_RUN_SMOKE_ACKNOWLEDGEMENT =
+  "I_ACKNOWLEDGE_V2_HISTORY_FIRST_RUN_SMOKE";
+const FIRST_RUN_SMOKE_EXPECTED_TOPIC_ID = "nkp4R5WtSYiGsowApEQ1nw";
 
 const BOUNDS = Object.freeze({
   mongoTimeoutMS: [1000, 60000],
@@ -22,6 +25,8 @@ const BOUNDS = Object.freeze({
   sessionTimeoutMs: [6000, 120000],
   heartbeatIntervalMs: [100, 30000],
   heartbeatTimeoutMs: [10, 30000],
+  firstRunSmokeMaxRecords: [1, 100],
+  firstRunSmokeMaxRuntimeMs: [1000, 300000],
 });
 
 function assertPinnedOverride(env, name, expected) {
@@ -42,6 +47,56 @@ function readBoundedInteger(env, name, defaultValue, [minimum, maximum]) {
   return number;
 }
 
+function loadFirstRunSmokeConfig(env) {
+  const enabled = env.V2_HISTORY_FIRST_RUN_SMOKE_ENABLED;
+  const hasSmokeSettings = [
+    "V2_HISTORY_FIRST_RUN_SMOKE_ACK",
+    "V2_HISTORY_FIRST_RUN_SMOKE_MAX_RECORDS",
+    "V2_HISTORY_FIRST_RUN_SMOKE_MAX_RUNTIME_MS",
+  ].some((name) => env[name] !== undefined);
+
+  if (enabled === undefined || enabled === "false") {
+    if (hasSmokeSettings) {
+      throw new Error(
+        "V2 history first-run smoke settings require V2_HISTORY_FIRST_RUN_SMOKE_ENABLED=true.",
+      );
+    }
+    return null;
+  }
+  if (enabled !== "true") {
+    throw new Error(
+      "V2_HISTORY_FIRST_RUN_SMOKE_ENABLED must be true or false.",
+    );
+  }
+  if (env.V2_HISTORY_FIRST_RUN_SMOKE_ACK !== FIRST_RUN_SMOKE_ACKNOWLEDGEMENT) {
+    throw new Error("V2 history first-run smoke acknowledgement is required.");
+  }
+
+  const maxRecords = readBoundedInteger(
+    env,
+    "V2_HISTORY_FIRST_RUN_SMOKE_MAX_RECORDS",
+    undefined,
+    BOUNDS.firstRunSmokeMaxRecords,
+  );
+  const maxRuntimeMs = readBoundedInteger(
+    env,
+    "V2_HISTORY_FIRST_RUN_SMOKE_MAX_RUNTIME_MS",
+    undefined,
+    BOUNDS.firstRunSmokeMaxRuntimeMs,
+  );
+  if (env.V2_HISTORY_TOPIC_ID !== FIRST_RUN_SMOKE_EXPECTED_TOPIC_ID) {
+    throw new Error(
+      "V2_HISTORY_TOPIC_ID must match the configured first-run smoke topic identity.",
+    );
+  }
+
+  return Object.freeze({
+    enabled: true,
+    maxRecords,
+    maxRuntimeMs,
+  });
+}
+
 function loadHistoryConsumerConfig(env = process.env) {
   if (!env || typeof env !== "object" || Array.isArray(env)) {
     throw new Error("V2 history configuration requires an environment object.");
@@ -52,6 +107,7 @@ function loadHistoryConsumerConfig(env = process.env) {
   if (env.V2_HISTORY_LIVE_START_ACK !== LIVE_START_ACKNOWLEDGEMENT) {
     throw new Error("V2 history live-start acknowledgement is required.");
   }
+  const firstRunSmoke = loadFirstRunSmokeConfig(env);
 
   assertPinnedOverride(env, "V2_HISTORY_KAFKA_BROKER", HISTORY_KAFKA_BROKER);
   assertPinnedOverride(env, "V2_HISTORY_KAFKA_CLUSTER_ID", HISTORY_KAFKA_CLUSTER_ID);
@@ -160,6 +216,7 @@ function loadHistoryConsumerConfig(env = process.env) {
   return Object.freeze({
     enabled: true,
     liveStartAcknowledged: true,
+    ...(firstRunSmoke ? { firstRunSmoke } : {}),
     kafka: Object.freeze({
       broker: HISTORY_KAFKA_BROKER,
       clusterId: HISTORY_KAFKA_CLUSTER_ID,
@@ -183,6 +240,8 @@ function loadHistoryConsumerConfig(env = process.env) {
 module.exports = {
   HISTORY_CONSUMER_GROUP_ID,
   HISTORY_DATABASE_NAME,
+  FIRST_RUN_SMOKE_ACKNOWLEDGEMENT,
+  FIRST_RUN_SMOKE_EXPECTED_TOPIC_ID,
   HISTORY_KAFKA_BROKER,
   HISTORY_KAFKA_CLUSTER_ID,
   HISTORY_MONGO_MEMBER,

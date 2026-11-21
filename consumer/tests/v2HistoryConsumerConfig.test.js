@@ -1,6 +1,8 @@
 const {
   HISTORY_CONSUMER_GROUP_ID,
   HISTORY_DATABASE_NAME,
+  FIRST_RUN_SMOKE_ACKNOWLEDGEMENT,
+  FIRST_RUN_SMOKE_EXPECTED_TOPIC_ID,
   HISTORY_KAFKA_BROKER,
   HISTORY_KAFKA_CLUSTER_ID,
   HISTORY_MONGO_MEMBER,
@@ -14,6 +16,15 @@ const {
 const enabledEnvironment = {
   V2_HISTORY_CONSUMER_ENABLED: "true",
   V2_HISTORY_LIVE_START_ACK: LIVE_START_ACKNOWLEDGEMENT,
+};
+
+const smokeEnvironment = {
+  ...enabledEnvironment,
+  V2_HISTORY_FIRST_RUN_SMOKE_ENABLED: "true",
+  V2_HISTORY_FIRST_RUN_SMOKE_ACK: FIRST_RUN_SMOKE_ACKNOWLEDGEMENT,
+  V2_HISTORY_FIRST_RUN_SMOKE_MAX_RECORDS: "10",
+  V2_HISTORY_FIRST_RUN_SMOKE_MAX_RUNTIME_MS: "60000",
+  V2_HISTORY_TOPIC_ID: FIRST_RUN_SMOKE_EXPECTED_TOPIC_ID,
 };
 
 test("loads pinned V2 identities and bounded defaults only after both acknowledgements", () => {
@@ -53,10 +64,26 @@ test("loads pinned V2 identities and bounded defaults only after both acknowledg
       concurrency: 2,
     },
   });
+  expect(config).not.toHaveProperty("firstRunSmoke");
   expect(config.kafka.options.connectionTimeout).toBe(5000);
   expect(config.kafka.options.requestTimeout).toBe(10000);
   expect(config).not.toHaveProperty("history.historyCollectionName");
   expect(config).not.toHaveProperty("history.receiptCollectionName");
+});
+
+test("loads separately authorized smoke limits and configured topic identity", () => {
+  expect(loadHistoryConsumerConfig(smokeEnvironment)).toMatchObject({
+    enabled: true,
+    liveStartAcknowledged: true,
+    firstRunSmoke: {
+      enabled: true,
+      maxRecords: 10,
+      maxRuntimeMs: 60000,
+    },
+    kafka: {
+      expectedTopicId: FIRST_RUN_SMOKE_EXPECTED_TOPIC_ID,
+    },
+  });
 });
 
 test.each([
@@ -69,6 +96,107 @@ test.each([
   }, "acknowledgement is required"],
 ])("fails closed for missing enablement or live-start acknowledgement", (env, message) => {
   expect(() => loadHistoryConsumerConfig(env)).toThrow(message);
+});
+
+test.each([
+  [{ V2_HISTORY_FIRST_RUN_SMOKE_ENABLED: "yes" }, "must be true or false"],
+  [{
+    V2_HISTORY_FIRST_RUN_SMOKE_ENABLED: "true",
+    V2_HISTORY_FIRST_RUN_SMOKE_ACK: "yes",
+  }, "acknowledgement is required"],
+  [{
+    V2_HISTORY_FIRST_RUN_SMOKE_ENABLED: "true",
+    V2_HISTORY_FIRST_RUN_SMOKE_ACK: FIRST_RUN_SMOKE_ACKNOWLEDGEMENT,
+    V2_HISTORY_FIRST_RUN_SMOKE_MAX_RUNTIME_MS: "60000",
+    V2_HISTORY_TOPIC_ID: FIRST_RUN_SMOKE_EXPECTED_TOPIC_ID,
+  }, "V2_HISTORY_FIRST_RUN_SMOKE_MAX_RECORDS must be an integer"],
+  [{
+    V2_HISTORY_FIRST_RUN_SMOKE_ENABLED: "true",
+    V2_HISTORY_FIRST_RUN_SMOKE_ACK: FIRST_RUN_SMOKE_ACKNOWLEDGEMENT,
+    V2_HISTORY_FIRST_RUN_SMOKE_MAX_RECORDS: "10",
+    V2_HISTORY_TOPIC_ID: FIRST_RUN_SMOKE_EXPECTED_TOPIC_ID,
+  }, "V2_HISTORY_FIRST_RUN_SMOKE_MAX_RUNTIME_MS must be an integer"],
+  [{
+    V2_HISTORY_FIRST_RUN_SMOKE_ENABLED: "true",
+    V2_HISTORY_FIRST_RUN_SMOKE_ACK: FIRST_RUN_SMOKE_ACKNOWLEDGEMENT,
+    V2_HISTORY_FIRST_RUN_SMOKE_MAX_RECORDS: "10",
+    V2_HISTORY_FIRST_RUN_SMOKE_MAX_RUNTIME_MS: "60000",
+  }, "configured first-run smoke topic identity"],
+  [{
+    V2_HISTORY_FIRST_RUN_SMOKE_ENABLED: "true",
+    V2_HISTORY_FIRST_RUN_SMOKE_ACK: FIRST_RUN_SMOKE_ACKNOWLEDGEMENT,
+    V2_HISTORY_FIRST_RUN_SMOKE_MAX_RECORDS: "10",
+    V2_HISTORY_FIRST_RUN_SMOKE_MAX_RUNTIME_MS: "60000",
+    V2_HISTORY_TOPIC_ID: "abcdefghijklmnopqrstuv",
+  }, "configured first-run smoke topic identity"],
+])("rejects incomplete or contradictory smoke configuration", (smokeEnv, message) => {
+  expect(() => loadHistoryConsumerConfig({
+    ...enabledEnvironment,
+    ...smokeEnv,
+  })).toThrow(message);
+});
+
+test.each([
+  ["V2_HISTORY_FIRST_RUN_SMOKE_MAX_RECORDS", "0"],
+  ["V2_HISTORY_FIRST_RUN_SMOKE_MAX_RECORDS", "101"],
+  ["V2_HISTORY_FIRST_RUN_SMOKE_MAX_RECORDS", "1.5"],
+  ["V2_HISTORY_FIRST_RUN_SMOKE_MAX_RECORDS", "nope"],
+  ["V2_HISTORY_FIRST_RUN_SMOKE_MAX_RUNTIME_MS", "999"],
+  ["V2_HISTORY_FIRST_RUN_SMOKE_MAX_RUNTIME_MS", "300001"],
+  ["V2_HISTORY_FIRST_RUN_SMOKE_MAX_RUNTIME_MS", "1.5"],
+  ["V2_HISTORY_FIRST_RUN_SMOKE_MAX_RUNTIME_MS", "nope"],
+])("rejects an invalid smoke bound for %s", (name, value) => {
+  expect(() => loadHistoryConsumerConfig({
+    ...smokeEnvironment,
+    [name]: value,
+  })).toThrow(`${name} must be an integer`);
+});
+
+test.each([
+  ["V2_HISTORY_FIRST_RUN_SMOKE_ACK", FIRST_RUN_SMOKE_ACKNOWLEDGEMENT],
+  ["V2_HISTORY_FIRST_RUN_SMOKE_MAX_RECORDS", "10"],
+  ["V2_HISTORY_FIRST_RUN_SMOKE_MAX_RUNTIME_MS", "60000"],
+])("rejects smoke settings without selecting smoke mode: %s", (name, value) => {
+  expect(() => loadHistoryConsumerConfig({
+    ...enabledEnvironment,
+    [name]: value,
+  })).toThrow("require V2_HISTORY_FIRST_RUN_SMOKE_ENABLED=true");
+});
+
+test("explicitly disabling smoke mode preserves normal configuration", () => {
+  expect(loadHistoryConsumerConfig({
+    ...enabledEnvironment,
+    V2_HISTORY_FIRST_RUN_SMOKE_ENABLED: "false",
+  })).not.toHaveProperty("firstRunSmoke");
+  expect(() => loadHistoryConsumerConfig({
+    ...enabledEnvironment,
+    V2_HISTORY_FIRST_RUN_SMOKE_ENABLED: "false",
+    V2_HISTORY_FIRST_RUN_SMOKE_ACK: FIRST_RUN_SMOKE_ACKNOWLEDGEMENT,
+  })).toThrow("require V2_HISTORY_FIRST_RUN_SMOKE_ENABLED=true");
+});
+
+test.each([
+  ["V2_HISTORY_FIRST_RUN_SMOKE_MAX_RECORDS", "1", 1],
+  ["V2_HISTORY_FIRST_RUN_SMOKE_MAX_RECORDS", "100", 100],
+  ["V2_HISTORY_FIRST_RUN_SMOKE_MAX_RUNTIME_MS", "1000", 1000],
+  ["V2_HISTORY_FIRST_RUN_SMOKE_MAX_RUNTIME_MS", "300000", 300000],
+])("accepts inclusive smoke bound %s=%s", (name, value, expected) => {
+  expect(loadHistoryConsumerConfig({
+    ...smokeEnvironment,
+    [name]: value,
+  }).firstRunSmoke[name.endsWith("MAX_RECORDS") ? "maxRecords" : "maxRuntimeMs"])
+    .toBe(expected);
+});
+
+test("smoke authorization does not bypass normal consumer authorization", () => {
+  expect(() => loadHistoryConsumerConfig({
+    ...smokeEnvironment,
+    V2_HISTORY_CONSUMER_ENABLED: "false",
+  })).toThrow("explicitly enable");
+  expect(() => loadHistoryConsumerConfig({
+    ...smokeEnvironment,
+    V2_HISTORY_LIVE_START_ACK: "incorrect",
+  })).toThrow("live-start acknowledgement is required");
 });
 
 test.each([
@@ -140,4 +268,23 @@ test("rejects heartbeat interval or timeout values that exceed the consumer sess
 
 test("does not accept a missing or malformed environment object", () => {
   expect(() => loadHistoryConsumerConfig(null)).toThrow("environment object");
+});
+
+test("loading smoke configuration has no startup side effects or input mutation", () => {
+  const env = { ...smokeEnvironment };
+  const originalEnv = { ...env };
+  const processOn = jest.spyOn(process, "on");
+  try {
+    jest.isolateModules(() => {
+      const { loadHistoryConsumerConfig: loadIsolatedConfig } =
+        require("../v2/historyConsumerConfig");
+      expect(loadIsolatedConfig(env).firstRunSmoke.enabled).toBe(true);
+    });
+
+    expect(env).toEqual(originalEnv);
+    expect(processOn).not.toHaveBeenCalled();
+    expect(loadHistoryConsumerConfig(env)).not.toHaveProperty("provisioning");
+  } finally {
+    processOn.mockRestore();
+  }
 });
