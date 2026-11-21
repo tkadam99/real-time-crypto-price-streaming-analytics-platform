@@ -9,15 +9,22 @@ const {
 const { deriveEventIdentity } = require("../v2/historyContract");
 const { persistHistoryEvent } = require("../v2/historyPersistence");
 const { persistHistoryBatch } = require("../v2/historyBatch");
+const { processHistoryPartitionBatch } = require("../v2/historyConsumerCore");
+const {
+  FIRST_RUN_SMOKE_ACKNOWLEDGEMENT,
+  FIRST_RUN_SMOKE_EXPECTED_TOPIC_ID,
+  LIVE_START_ACKNOWLEDGEMENT,
+  loadHistoryConsumerConfig,
+} = require("../v2/historyConsumerConfig");
 const {
   HISTORY_CONSUMER_GROUP_ID,
   V2_TOPIC,
   createHistoryConsumerRunner,
 } = require("../v2/historyConsumerRunner");
 
-function envelope(sourceOffset = "12345678901234567") {
+function envelope(sourceOffset = "12345678901234567", symbol = "BTC-USD") {
   return createEnvelope({
-    symbol: "BTC-USD",
+    symbol,
     price: 105.5,
     timestamp: "2026-01-01T00:01:00+00:00",
   }, {
@@ -27,6 +34,18 @@ function envelope(sourceOffset = "12345678901234567") {
     partition: 4,
     offset: sourceOffset,
   });
+}
+
+function smokeSettings(maxRecords = 3) {
+  return loadHistoryConsumerConfig({
+    V2_HISTORY_CONSUMER_ENABLED: "true",
+    V2_HISTORY_LIVE_START_ACK: LIVE_START_ACKNOWLEDGEMENT,
+    V2_HISTORY_FIRST_RUN_SMOKE_ENABLED: "true",
+    V2_HISTORY_FIRST_RUN_SMOKE_ACK: FIRST_RUN_SMOKE_ACKNOWLEDGEMENT,
+    V2_HISTORY_FIRST_RUN_SMOKE_MAX_RECORDS: String(maxRecords),
+    V2_HISTORY_FIRST_RUN_SMOKE_MAX_RUNTIME_MS: "1000",
+    V2_HISTORY_TOPIC_ID: FIRST_RUN_SMOKE_EXPECTED_TOPIC_ID,
+  }).firstRunSmoke;
 }
 
 function persistenceResult(events, statuses = []) {
@@ -242,6 +261,256 @@ describe("dependency-injected V2 history consumer runner", () => {
     expect(harness.runner.getTerminalFailure()).toMatchObject({
       classification: "heartbeat-failed",
       offset: "20",
+    });
+  });
+
+  describe("global smoke admission", () => {
+    afterEach(() => {
+      jest.useRealTimers();
+    });
+
+    test("normal mode does not enable admission and malformed smoke settings fail closed", () => {
+      expect(createHarness().runner.getAdmissionSnapshot()).toBeNull();
+      for (const firstRunSmoke of [
+        null,
+        { enabled: false, maxRecords: 3, maxRuntimeMs: 1000 },
+        { enabled: true, maxRecords: 3 },
+        { enabled: true, maxRecords: 101, maxRuntimeMs: 1000 },
+        { enabled: true, maxRecords: 3, maxRuntimeMs: 999 },
+      ]) {
+        expect(() => createHarness({ config: { firstRunSmoke } }))
+          .toThrow("Invalid V2 history first-run smoke runner configuration.");
+      }
+    });
+
+    test("concurrent partitions reserve one global cap before awaiting and commit only admitted prefixes", async () => {
+      const releases = [];
+      const persistBatch = jest.fn((events, { signal }) => new Promise((resolve) => {
+        releases.push({ events, signal, resolve });
+      }));
+      const processBatch = jest.fn(processHistoryPartitionBatch);
+      const harness = createHarness({
+        config: { firstRunSmoke: smokeSettings(3), partitionsConsumedConcurrently: 2 },
+        processBatch,
+        persistBatch,
+      });
+      await harness.runner.start();
+      const first = batchContext({
+        partition: 0,
+        offsets: ["10", "11"],
+        events: [envelope("1000"), envelope("1001")],
+      });
+      const second = batchContext({
+        partition: 1,
+        offsets: ["30", "31", "32"],
+        events: [envelope("2000", "ETH-USD"), envelope("2001", "ETH-USD"),
+          envelope("2002", "ETH-USD")],
+      });
+
+      const processingFirst = harness.getRunOptions().eachBatch(first);
+      const processingSecond = harness.getRunOptions().eachBatch(second);
+      expect(processBatch).toHaveBeenCalledTimes(2);
+      expect(processBatch.mock.calls[0][0].messages).toEqual(first.batch.messages);
+      expect(processBatch.mock.calls[1][0].messages).toEqual(second.batch.messages.slice(0, 1));
+      expect(harness.runner.getAdmissionSnapshot()).toEqual({
+        maxRecords: 3,
+        admittedRecords: 3,
+        remainingRecords: 0,
+        closed: true,
+        closeReason: "limit-reached",
+      });
+      expect(releases).toHaveLength(2);
+      expect(releases.every(({ signal }) => !signal.aborted)).toBe(true);
+      expect(harness.consumer.stop).not.toHaveBeenCalled();
+
+      const unadmitted = batchContext({ partition: 2, offsets: ["50"] });
+      await harness.getRunOptions().eachBatch(unadmitted);
+      expect(processBatch).toHaveBeenCalledTimes(2);
+      expect(persistBatch).toHaveBeenCalledTimes(2);
+      expect(harness.consumer.commitOffsets).not.toHaveBeenCalled();
+      expect(harness.onFailure).not.toHaveBeenCalled();
+
+      for (const pending of releases) {
+        pending.resolve(persistenceResult(pending.events));
+      }
+      await Promise.all([processingFirst, processingSecond]);
+      expect(harness.consumer.commitOffsets).toHaveBeenCalledTimes(2);
+      expect(harness.consumer.commitOffsets).toHaveBeenCalledWith([{
+        topic: V2_TOPIC, partition: 0, offset: "12",
+      }]);
+      expect(harness.consumer.commitOffsets).toHaveBeenCalledWith([{
+        topic: V2_TOPIC, partition: 1, offset: "31",
+      }]);
+      expect(harness.consumer.stop).not.toHaveBeenCalled();
+    });
+
+    test("snapshots are frozen, reflect reservations, and retain the shutdown reason", async () => {
+      const harness = createHarness({ config: { firstRunSmoke: smokeSettings(4) } });
+      const before = harness.runner.getAdmissionSnapshot();
+      await harness.runner.start();
+      await harness.getRunOptions().eachBatch(batchContext({ offsets: ["10"] }));
+      const after = harness.runner.getAdmissionSnapshot();
+      expect(Object.isFrozen(before)).toBe(true);
+      expect(Object.isFrozen(after)).toBe(true);
+      expect(before).toMatchObject({ admittedRecords: 0, remainingRecords: 4, closed: false });
+      expect(after).toMatchObject({ admittedRecords: 1, remainingRecords: 3, closed: false });
+      await harness.runner.stop();
+      expect(harness.runner.getAdmissionSnapshot()).toEqual({
+        maxRecords: 4,
+        admittedRecords: 1,
+        remainingRecords: 3,
+        closed: true,
+        closeReason: "shutdown",
+      });
+      expect(after.closed).toBe(false);
+    });
+
+    test("malformed admitted records fence commits and permanently consume reservations", async () => {
+      const harness = createHarness({ config: { firstRunSmoke: smokeSettings(3) } });
+      await harness.runner.start();
+      await harness.getRunOptions().eachBatch(batchContext({
+        offsets: ["10", "11", "12", "13"],
+        values: [
+          Buffer.from(JSON.stringify(envelope("900"))),
+          Buffer.from("{bad"),
+          Buffer.from(JSON.stringify(envelope("901"))),
+          Buffer.from(JSON.stringify(envelope("902"))),
+        ],
+      }));
+      expect(harness.consumer.commitOffsets).toHaveBeenCalledWith([{
+        topic: V2_TOPIC, partition: 0, offset: "11",
+      }]);
+      expect(harness.runner.getTerminalFailure()).toMatchObject({
+        classification: "malformed-json", offset: "11",
+      });
+      expect(harness.runner.getAdmissionSnapshot().admittedRecords).toBe(3);
+      await harness.getRunOptions().eachBatch(batchContext({ offsets: ["14"] }));
+      expect(harness.consumer.commitOffsets).toHaveBeenCalledTimes(1);
+    });
+
+    test("failed admitted writes fence later commits and do not refund capacity", async () => {
+      const persistBatch = jest.fn(async (events) =>
+        persistenceResult(events, ["inserted", "failed", "inserted"]));
+      const harness = createHarness({
+        config: { firstRunSmoke: smokeSettings(3) },
+        persistBatch,
+      });
+      await harness.runner.start();
+      await harness.getRunOptions().eachBatch(batchContext({ offsets: ["20", "21", "22", "23"] }));
+      expect(harness.consumer.commitOffsets).toHaveBeenCalledWith([{
+        topic: V2_TOPIC, partition: 0, offset: "21",
+      }]);
+      expect(harness.runner.getTerminalFailure()).toMatchObject({
+        classification: "persistence-failed", offset: "21",
+      });
+      expect(harness.runner.getAdmissionSnapshot().admittedRecords).toBe(3);
+    });
+
+    test("rejects a core result that tries to commit an unreserved record", async () => {
+      const processBatch = jest.fn(async () => ({
+        topic: V2_TOPIC,
+        partition: 0,
+        committablePrefix: [
+          { offset: "25", status: "inserted" },
+          { offset: "26", status: "inserted" },
+        ],
+        committableCount: 2,
+        nextOffset: "27",
+        failure: null,
+      }));
+      const harness = createHarness({
+        config: { firstRunSmoke: smokeSettings(1) },
+        processBatch,
+      });
+      await harness.runner.start();
+      await harness.getRunOptions().eachBatch(batchContext({ offsets: ["25", "26"] }));
+
+      expect(processBatch.mock.calls[0][0].messages).toHaveLength(1);
+      expect(harness.consumer.commitOffsets).not.toHaveBeenCalled();
+      expect(harness.runner.getTerminalFailure()).toMatchObject({
+        classification: "invalid-history-processing-result",
+      });
+      expect(harness.runner.getAdmissionSnapshot().admittedRecords).toBe(1);
+    });
+
+    test("shutdown cancels admitted work and preserves its reservation without committing", async () => {
+      let finish;
+      let signal;
+      const processBatch = jest.fn(({ signal: inputSignal }) => {
+        signal = inputSignal;
+        return new Promise((resolve) => { finish = resolve; });
+      });
+      const harness = createHarness({
+        config: { firstRunSmoke: smokeSettings(3) },
+        processBatch,
+      });
+      await harness.runner.start();
+      const processing = harness.getRunOptions().eachBatch(batchContext({ offsets: ["40"] }));
+      const stopping = harness.runner.stop();
+      expect(signal.aborted).toBe(true);
+      expect(harness.runner.getAdmissionSnapshot()).toMatchObject({
+        admittedRecords: 1, closeReason: "shutdown",
+      });
+      finish({ cancelled: true });
+      await Promise.all([processing, stopping]);
+      expect(harness.consumer.commitOffsets).not.toHaveBeenCalled();
+      expect(harness.runner.getTerminalFailure()).toBeNull();
+    });
+
+    test("heartbeat failure aborts admitted work and prevents a commit", async () => {
+      jest.useFakeTimers();
+      let finish;
+      let signal;
+      const processBatch = jest.fn(({ signal: inputSignal }) => {
+        signal = inputSignal;
+        return new Promise((resolve) => { finish = resolve; });
+      });
+      const harness = createHarness({
+        config: { firstRunSmoke: smokeSettings(2), heartbeatIntervalMs: 100 },
+        processBatch,
+      });
+      await harness.runner.start();
+      const processing = harness.getRunOptions().eachBatch(batchContext({
+        offsets: ["50"],
+        heartbeat: jest.fn().mockRejectedValue(new Error("private heartbeat")),
+      }));
+      await jest.advanceTimersByTimeAsync(100);
+      expect(signal.aborted).toBe(true);
+      finish({ cancelled: true });
+      await processing;
+      expect(harness.consumer.commitOffsets).not.toHaveBeenCalled();
+      expect(harness.runner.getTerminalFailure()).toMatchObject({
+        classification: "heartbeat-failed",
+      });
+      expect(harness.runner.getAdmissionSnapshot().admittedRecords).toBe(1);
+    });
+
+    test("stale admitted batches are not committed and keep their reservations", async () => {
+      const harness = createHarness({ config: { firstRunSmoke: smokeSettings(2) } });
+      await harness.runner.start();
+      await harness.getRunOptions().eachBatch(batchContext({
+        offsets: ["60"],
+        isStale: jest.fn(() => true),
+      }));
+      expect(harness.consumer.commitOffsets).not.toHaveBeenCalled();
+      expect(harness.runner.getAdmissionSnapshot().admittedRecords).toBe(1);
+    });
+
+    test("commit errors remain terminal after an admitted prefix", async () => {
+      const harness = createHarness({
+        config: { firstRunSmoke: smokeSettings(1) },
+        commitOffsets: jest.fn().mockRejectedValue(new Error("private commit")),
+      });
+      await harness.runner.start();
+      await harness.getRunOptions().eachBatch(batchContext({ offsets: ["70", "71"] }));
+      expect(harness.consumer.commitOffsets).toHaveBeenCalledTimes(1);
+      expect(harness.runner.getTerminalFailure()).toMatchObject({
+        classification: "offset-commit-failed", offset: "71",
+      });
+      expect(harness.runner.getAdmissionSnapshot()).toMatchObject({
+        admittedRecords: 1, closeReason: "limit-reached",
+      });
+      expect(JSON.stringify(harness.onFailure.mock.calls)).not.toContain("private");
     });
   });
 

@@ -2,6 +2,10 @@ const {
   processHistoryPartitionBatch,
   V2_TOPIC,
 } = require("./historyConsumerCore");
+const {
+  CLOSE_REASONS,
+  createHistorySmokeAdmissionController,
+} = require("./historySmokeAdmissionController");
 
 const HISTORY_CONSUMER_GROUP_ID = "crypto-v2-history-group";
 const DEFAULT_PARTITIONS_CONCURRENTLY = 1;
@@ -235,11 +239,24 @@ function validateConfiguration(config) {
     );
   }
 
+  const firstRunSmoke = config.firstRunSmoke;
+  if (firstRunSmoke !== undefined &&
+      (!firstRunSmoke || typeof firstRunSmoke !== "object" ||
+        Array.isArray(firstRunSmoke) || firstRunSmoke.enabled !== true ||
+        !Number.isInteger(firstRunSmoke.maxRecords) ||
+        firstRunSmoke.maxRecords < 1 || firstRunSmoke.maxRecords > 100 ||
+        !Number.isInteger(firstRunSmoke.maxRuntimeMs) ||
+        firstRunSmoke.maxRuntimeMs < 1000 ||
+        firstRunSmoke.maxRuntimeMs > 300000)) {
+    throw new Error("Invalid V2 history first-run smoke runner configuration.");
+  }
+
   return {
     groupId,
     partitionsConsumedConcurrently,
     heartbeatIntervalMs,
     heartbeatTimeoutMs,
+    firstRunSmoke,
   };
 }
 
@@ -268,6 +285,11 @@ function createHistoryConsumerRunner({
 }) {
   const settings = validateConfiguration(config);
   validateDependencies({ consumer, processBatch, persistBatch, onFailure });
+  const admissionController = settings.firstRunSmoke
+    ? createHistorySmokeAdmissionController({
+      maxRecords: settings.firstRunSmoke.maxRecords,
+    })
+    : null;
 
   let startPromise;
   let stopPromise;
@@ -367,6 +389,13 @@ function createHistoryConsumerRunner({
       return;
     }
 
+    let messages = batch.messages;
+    if (admissionController) {
+      const reservation = admissionController.reserve(partition, messages.length);
+      if (reservation.admittedRecords === 0) return;
+      messages = messages.slice(0, reservation.admittedRecords);
+    }
+
     const heartbeatPump = createHeartbeatPump(
       batchContext.heartbeat,
       settings.heartbeatIntervalMs,
@@ -385,7 +414,7 @@ function createHistoryConsumerRunner({
     try {
       coreResult = await processBatch({
         partition,
-        messages: batch.messages,
+        messages,
         persistBatch,
         signal: cancellationController.signal,
       });
@@ -419,7 +448,7 @@ function createHistoryConsumerRunner({
       );
       return;
     }
-    if (!isValidCoreProgress(coreResult, partition, batch.messages)) {
+    if (!isValidCoreProgress(coreResult, partition, messages)) {
       reportTerminalFailure(
         createFailure("invalid-history-processing-result", partition, firstOffset),
       );
@@ -517,6 +546,7 @@ function createHistoryConsumerRunner({
   function stop() {
     if (stopPromise) return stopPromise;
     stopRequested = true;
+    if (admissionController) admissionController.close(CLOSE_REASONS.SHUTDOWN);
     cancellationController.abort();
     stopPromise = (async () => {
       const failures = [];
@@ -569,6 +599,9 @@ function createHistoryConsumerRunner({
     stop,
     getTerminalFailure: () => terminalFailure,
     waitForTerminalFailure: () => terminalFailureSignal,
+    getAdmissionSnapshot: () => admissionController
+      ? admissionController.snapshot()
+      : null,
   };
 }
 
